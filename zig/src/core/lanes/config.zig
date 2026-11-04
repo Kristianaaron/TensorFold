@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! The round loop's constants from the model's attributes and the engine's settings (Python _family_setup).
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -34,6 +36,10 @@ pub const Model = struct {
     max_streams: u32 = 0, // a shared forward's streams at most (0: 32)
     shared_costs: []const Cost = &.{}, // shared forwards' ms by total rows (timed at load)
     draft_probabilities: bool = false, // the head gives each drafted node's chance of landing
+    granted_depth: bool = false, // with draft_probabilities: every stream drafts its last grant plus slack
+    draft_slack: u32 = 0, // drafts past a stream's last grant, short or not (0: core default)
+    copy_first: bool = false, // a copy ahead takes the round: the head holds no drafts for it
+    hold_costs: []const @import("hold_price.zig").HoldCost = &.{}, // drafter's hold-pass costs by streams and depth
     draft_streams: bool = false, // the head drafts every stream of a shared round in one batch
     head_trees: bool = false, // the head drafts trees of lanes (DraftRequest.lanes) and holds them
     join_tail: bool = false, // a prompt in pieces leaves its last token for the next shared round's window (Backend.join)
@@ -44,7 +50,10 @@ pub const Model = struct {
     lone_cost_tile: u32 = 0, // live lone-window pricing probes at these target row boundaries (0: off)
     context_copies: bool = false, // a lone head window shares its agreeing copy path and appends the rest
     copy_match: i64 = 8, // matching history tokens a copy needs
+    verify_widths: bool = false, // round chain drafts down to the GLM-5.3 verify widths (1..8, 12, 16 rows); glm_dsa only
     lone_copies: bool = true, // a lone stream proposes copies (false: only streams in shared rounds do)
+    copy_arbitrate: bool = false, // TF_GLM53_COPYD: copies priced against held drafts each round (lanes/copy_arbiter.zig)
+    copy_costs: []const Cost = &.{}, // full-round ms by window rows for that pricing
 };
 
 pub const Config = struct {
@@ -62,11 +71,13 @@ pub const Config = struct {
     batch_rows: u32,
     batch_streams: u32,
     node_probabilities: bool,
+    granted_depth: bool = false, // Model.granted_depth
     fill_lanes: u32 = 0, // rows a window may grow to with suffix-match branches (0: off; lanes/fill.zig)
     fill_match: u32 = 8, // context tokens a suffix-match branch must match (shorter ones are coincidental phrases)
     fill_floor: f64 = 0.35, // the share of grafted rows a stream must keep to go on reading its chain back every round
     draft_streams: bool,
     head_trees: bool,
+    verify_widths: bool = false, // Model.verify_widths
     /// a prompt in pieces leaves its last token as the pending row of its first shared round's window
     join_tail: bool = false,
     /// a round's pieces of several streams in one backend call (Backend.pieces), which may run them as one forward
@@ -90,6 +101,8 @@ pub const Config = struct {
     enter_match: i64 = 8, // matching tokens a copy needs (rejects coincidental indentation)
     copy_rate: f64 = 0.94, // a copied token's chance of landing in allocation
     lone_copies: bool = true, // Model.lone_copies
+    copy_arbitrate: bool = false,
+    copy_costs: Table = .{},
     k: Constants = .{},
 
     pub fn init(gpa: Allocator, m: Model, max_rows: u32, max_draft: u32) !Config {
@@ -128,6 +141,8 @@ pub const Config = struct {
             .context_copies = m.context_copies and m.copy_drafts,
             .enter_match = @max(1, m.copy_match),
             .lone_copies = m.lone_copies,
+            .copy_arbitrate = m.copy_arbitrate and m.copy_drafts,
+            .verify_widths = m.verify_widths,
             .lone_cost_tile = m.lone_cost_tile,
             .family_width = width,
             .max_copy = max_copy,
@@ -143,6 +158,7 @@ pub const Config = struct {
             .batch_rows = batch_rows,
             .batch_streams = if (streams) (if (m.max_streams != 0) m.max_streams else 32) else 1,
             .node_probabilities = m.draft_probabilities or m.draft_confidence != null,
+            .granted_depth = m.granted_depth and m.draft_probabilities,
             .draft_streams = m.draft_streams,
             .head_trees = m.head_trees,
             .join_tail = m.join_tail,
@@ -153,8 +169,9 @@ pub const Config = struct {
             .family_costs = family_costs,
             .shared_costs = try alloc.extendCosts(gpa, timed.items, batch_rows),
             .lane_costs = try alloc.extendCosts(gpa, m.lane_costs, 64),
+            .copy_costs = try alloc.extendCosts(gpa, m.copy_costs, width),
             .mtp_step_ms = m.mtp_step_ms,
-            .k = .{ .depth_rate = if (m.depth_rate > 0) m.depth_rate else (Constants{}).depth_rate },
+            .k = .{ .depth_rate = if (m.depth_rate > 0) m.depth_rate else (Constants{}).depth_rate, .draft_slack = if (m.draft_slack > 0) m.draft_slack else (Constants{}).draft_slack, .grant_slack = if (m.draft_slack > 0) m.draft_slack else (Constants{}).grant_slack, .short_slack = if (m.draft_slack > 0) m.draft_slack else (Constants{}).short_slack, .copy_first = m.copy_first, .copy_arbitrate = m.copy_arbitrate and m.copy_drafts, .hold_costs = m.hold_costs },
             .draft_step_ms = m.draft_step_ms,
         };
     }
@@ -164,6 +181,7 @@ pub const Config = struct {
         c.family_costs.deinit(gpa);
         c.shared_costs.deinit(gpa);
         c.lane_costs.deinit(gpa);
+        c.copy_costs.deinit(gpa);
     }
 };
 

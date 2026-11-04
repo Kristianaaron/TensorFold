@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! Loaded GPU code: cubin, fatbin or PTX images, their kernels by symbol name and their device globals.
 
 const std = @import("std");
@@ -43,7 +45,7 @@ pub const Module = struct {
             std.log.err("kernel symbol not in module: {s}", .{name});
             return e;
         };
-        return .{ .d = self.d, .handle = f };
+        return .{ .d = self.d, .handle = f, .name = name };
     }
 
     pub const Global = struct { ptr: abi.DevicePtr, len: usize };
@@ -64,6 +66,7 @@ pub const Module = struct {
 pub const Function = struct {
     d: *const Driver,
     handle: abi.Function,
+    name: []const u8 = "",
 
     pub fn attribute(self: Function, a: abi.FunctionAttribute) Error!c_int {
         var v: c_int = 0;

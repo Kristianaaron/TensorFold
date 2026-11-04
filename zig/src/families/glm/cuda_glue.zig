@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! GLM-5.3-Flash's glue on CUDA: the Python family's cuda/glue.py on glm_glue.cu, whose kernels keep Triton's bytes.
 
 const std = @import("std");
@@ -12,6 +14,8 @@ pub const Kernels = struct {
     rmsnorm_4096: cuda.Function,
     rmsnorm_1536: cuda.Function,
     rmsnorm_512: cuda.Function,
+    rmsnorm_6144: cuda.Function,
+    rmsnorm_2048: cuda.Function,
     residual_add: cuda.Function,
     stream_mean: cuda.Function,
     rank_sum: cuda.Function,
@@ -91,6 +95,8 @@ pub fn rmsnorm(set: Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u64, o
         4096 => .{ set.glue.rmsnorm_4096, 8 },
         1536 => .{ set.glue.rmsnorm_1536, 4 },
         512 => .{ set.glue.rmsnorm_512, 4 },
+        6144 => .{ set.glue.rmsnorm_6144, 8 },
+        2048 => .{ set.glue.rmsnorm_2048, 4 },
         else => return error.NoRmsnormWidth,
     };
     var a: cuda.Args = .{};
@@ -143,7 +149,7 @@ pub fn router(set: Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u64, ou
     var a: cuda.Args = .{};
     inline for (.{ x, w, part, i64of(m), i64of(x_stride), i64of(d), i64of(ne), @as(c_int, router_ks) }) |v| a.add(v);
     if (x % 16 == 0 and x_stride % 8 == 0) // rows on 16 bytes: 64-row tiles staged by cp.async (decode's rows past m load as zeros)
-        try cuda.launch.launch(set.glue.router_tile, .{ .grid = .{ .x = cdiv(m, 64), .y = cdiv(ne, 32), .z = router_ks }, .block = .{ .x = 128 } }, stream, &a)
+        try cuda.launch.launch(set.glue.router_tile, .{ .grid = .{ .x = cdiv(m, 64), .y = cdiv(ne, 32), .z = router_ks }, .block = .{ .x = 128 }, .shared = 27_648 }, stream, &a)
     else
         try cuda.launch.launch(set.glue.router_part, .{ .grid = .{ .x = cdiv(m, 16), .y = cdiv(ne, 32), .z = router_ks }, .block = .{ .x = 128 } }, stream, &a);
     try sliceSum(set, stream, part, out, m * ne, router_ks, true);

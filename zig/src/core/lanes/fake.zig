@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! A host-only test backend whose tokens depend on all fed history, so a rollback or position mistake changes them.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -57,6 +59,7 @@ pub const Fake = struct {
     cycle_after: ?usize = null,
     probe_prompt: usize = 0,
     pattern: []const u32 = &.{ 11, 12, 13 },
+    counter_at: ?usize = null,
     answer_cycles: bool = false,
     prefill_chunks: usize = 0,
     prefill_count: usize = 0,
@@ -214,7 +217,12 @@ pub const Fake = struct {
                 const answer = [_]u32{ 40, 41, 42, 96 };
                 return answer[@min(after, 3)];
             }
-            if (reply.len >= start) return x.pattern[(reply.len - start) % x.pattern.len];
+            if (reply.len >= start) {
+                const relative = reply.len - start;
+                const at = relative % x.pattern.len;
+                if (x.counter_at == at) return @intCast(1 + relative / x.pattern.len);
+                return x.pattern[at];
+            }
         };
         return next(history, sampling, position);
     }

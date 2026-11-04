@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! Kernel launches: argument values packed where cuLaunchKernel reads them, plus the extended launch attributes.
 
 const std = @import("std");
@@ -85,6 +87,7 @@ pub const Config = struct {
 /// cuLaunchKernel for plain launches, cuLaunchKernelEx when a cluster, PDL or cooperative attribute is set.
 pub fn launch(f: Function, cfg: Config, stream: Stream, args: *Args) Error!void {
     try cfg.validate();
+    if (try deferOrFlush(f, cfg, stream, args)) return;
     const d = f.d;
     const g = cfg.grid;
     const b = cfg.block;
@@ -106,6 +109,30 @@ pub fn launch(f: Function, cfg: Config, stream: Stream, args: *Args) Error!void 
         .num_attrs = @intCast(n),
     };
     try launched(f, cfg, d.api.cuLaunchKernelEx(&lc, f.handle, args.pointers(), null), "cuLaunchKernelEx");
+}
+
+/// Record a dispatchable launch, or flush the stream's pending segment before a normal launch.
+pub fn deferOrFlush(f: Function, cfg: Config, stream: Stream, args: *Args) Error!bool {
+    const sink = stream.deferred orelse return false;
+    // The deferred ABI carries only a grid, block, dynamic smem and kernel parameters.
+    // Launch attributes change CUDA execution semantics and cannot be represented there.
+    if (!cfg.plain()) {
+        try stream.flushDeferred();
+        return false;
+    }
+    const record = Stream.DeferredLaunch{
+        .name = f.name,
+        .grid = cfg.grid,
+        .block = cfg.block,
+        .shared = cfg.shared,
+        .params = args.storage[0..args.used],
+        .param_count = args.count,
+        .function = f.handle,
+        .offsets = args.offsets[0..args.count],
+    };
+    if (try sink.record_fn(sink.ctx, &record)) return true;
+    try stream.flushDeferred();
+    return false;
 }
 
 /// A launch's result; a failure names the kernel and its configuration with the code.
@@ -179,4 +206,75 @@ test "args keep C alignment and sizes" {
     const ptrs = a.pointers().?;
     try std.testing.expectEqual(@as(i32, -3), @as(*align(1) const i32, @ptrCast(ptrs[1].?)).*);
     try std.testing.expectEqual(@as(f64, 2.5), @as(*align(1) const f64, @ptrCast(ptrs[3].?)).*);
+}
+
+test "deferred launches retain packed ABI bytes and a boundary flushes first" {
+    const Recorder = struct {
+        const Self = @This();
+        order: [4]u8 = undefined,
+        count: usize = 0,
+        payload: [Args.max_bytes]u8 = undefined,
+        len: usize = 0,
+        fn record(raw: *anyopaque, launch_ptr: *const Stream.DeferredLaunch) Error!bool {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            const launch_ = launch_ptr.*;
+            if (!std.mem.eql(u8, launch_.name, "dispatchable")) return false;
+            self.order[self.count] = 'R';
+            self.count += 1;
+            self.len = launch_.params.len;
+            @memcpy(self.payload[0..launch_.params.len], launch_.params);
+            if (launch_.grid.x != 3 or launch_.param_count != 2) return error.Invalid;
+            if (!std.mem.eql(u16, launch_.offsets, &.{ 0, 8 })) return error.Invalid;
+            return true;
+        }
+        fn flush(raw: *anyopaque, _: Stream) Error!void {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            self.order[self.count] = 'F';
+            self.count += 1;
+        }
+    };
+    var recorder: Recorder = .{};
+    const sink: Stream.Deferred = .{ .ctx = &recorder, .record_fn = Recorder.record, .flush_fn = Recorder.flush };
+    const stream: Stream = .{ .d = undefined, .handle = null, .deferred = &sink };
+    var args: Args = .{};
+    args.add(@as(u64, 0x1122334455667788));
+    args.add(@as(i32, 17));
+    const f: Function = .{ .d = undefined, .handle = null, .name = "dispatchable" };
+    const cfg: Config = .{ .grid = .{ .x = 3, .y = 1, .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 } };
+    try std.testing.expect(try deferOrFlush(f, cfg, stream, &args));
+    try std.testing.expectEqualSlices(u8, args.storage[0..args.used], recorder.payload[0..recorder.len]);
+    const boundary: Function = .{ .d = undefined, .handle = null, .name = "boundary" };
+    try std.testing.expect(!try deferOrFlush(boundary, cfg, stream, &args));
+    try std.testing.expectEqualSlices(u8, "R F", &.{ recorder.order[0], ' ', recorder.order[1] });
+}
+
+test "launch attributes form a deferral boundary" {
+    const Recorder = struct {
+        flushes: usize = 0,
+        fn record(_: *anyopaque, _: *const Stream.DeferredLaunch) Error!bool {
+            return error.Invalid;
+        }
+        fn flush(raw: *anyopaque, _: Stream) Error!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.flushes += 1;
+        }
+    };
+    var recorder: Recorder = .{};
+    const sink: Stream.Deferred = .{ .ctx = &recorder, .record_fn = Recorder.record, .flush_fn = Recorder.flush };
+    const stream: Stream = .{ .d = undefined, .handle = null, .deferred = &sink };
+    const f: Function = .{ .d = undefined, .handle = null, .name = "clustered" };
+    const cfg: Config = .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 }, .cluster = .{ .x = 2, .y = 1, .z = 1 } };
+    var args: Args = .{};
+    args.add(@as(u32, 9));
+    try std.testing.expect(!try deferOrFlush(f, cfg, stream, &args));
+    try std.testing.expectEqual(@as(usize, 1), recorder.flushes);
+}
+
+test "launch declarations are fully analyzed" {
+    std.testing.refAllDecls(@This());
+    std.testing.refAllDecls(Args);
+    std.testing.refAllDecls(Config);
+    std.testing.refAllDecls(@import("module.zig").Module);
+    std.testing.refAllDecls(Function);
+    std.testing.refAllDecls(Stream);
 }

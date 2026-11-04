@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! Keyed CUDA graphs for any family: one captured executable per key, launched again when the key comes back.
 
 const std = @import("std");
@@ -32,6 +34,11 @@ pub const Settings = struct {
     max: u32 = 48, // graphs held at most
     min_keep: u32 = 8, // under the memory floor the cache evicts down to this many, then stops capturing
     hold: bool = false, // under the floor a miss runs eagerly with no eviction: held graphs cost next to no memory
+    /// Eager runs of a key before its capture. A body whose first run sets up state lazily (NCCL connects a peer or a
+    /// channel on its first send/recv or collective, modules load on first launch) must not do it inside a capture:
+    /// the capture would record a first-use path the replays then repeat. A family's code constant (not operator-set,
+    /// so `digest` leaves it out); every rank runs the same keys in the same order, so they warm and capture alike.
+    warm: u32 = 0,
 
     /// These settings under the operator's TF_GRAPH_CACHE value: `0` or `off` runs every step eagerly; else unchanged.
     pub fn operator(s: Settings, value: ?[]const u8) Settings {
@@ -87,7 +94,10 @@ pub fn Cache(comptime Key: type) type {
         room: ?*const fn () bool = null, // false when this rank is below its memory floor; null: always room
         meter: ?*const fn () ?f64 = null, // MemAvailable now in GiB, to log a capture's cost; null: not measured
         name: []const u8 = "graphs", // the cache's name in its log lines and snapshot
+        allowed: ?[]const Key = null, // set: keys outside it always run eager (never warmed or captured); every rank holds the same list
+        same_slot: ?*const fn (a: Key, b: Key) bool = null, // set: before a capture, free every held key in the same slot as the new key (one live graph per slot)
         entries: std.AutoArrayHashMapUnmanaged(Key, Entry) = .empty,
+        warmed: std.AutoArrayHashMapUnmanaged(Key, u32) = .empty, // eager runs per key so far (settings.warm)
         cap: u32,
         tick: u64 = 0,
         fingerprint: ?u64 = null,
@@ -96,7 +106,7 @@ pub fn Cache(comptime Key: type) type {
         under_eager: u64 = 0, // eager steps since `under` began
         slot: ?usize = null, // this cache's registry slot, claimed at its first step; null: every slot taken
         claimed: bool = false,
-        stats: struct { replayed: u64 = 0, captured: u64 = 0, eager: u64 = 0, evicted: u64 = 0, dropped: u64 = 0, floor_hits: u64 = 0, capture_mib: f64 = 0 } = .{},
+        stats: struct { replayed: u64 = 0, captured: u64 = 0, eager: u64 = 0, warmed: u64 = 0, evicted: u64 = 0, dropped: u64 = 0, floor_hits: u64 = 0, capture_mib: f64 = 0, outside: u64 = 0, slot_swaps: u64 = 0 } = .{},
 
         /// The cache with `settings.fromEnv()`: every rank sharing an `agree` must hold an equal `Settings.digest`.
         pub fn init(gpa: std.mem.Allocator, engine: Engine, settings: Settings) Self {
@@ -109,6 +119,7 @@ pub fn Cache(comptime Key: type) type {
             if (c.slot) |i| registry.release(i);
             c.dropAll();
             c.entries.deinit(c.gpa);
+            c.warmed.deinit(c.gpa);
         }
 
         pub fn count(c: *const Self) usize {
@@ -178,14 +189,48 @@ pub fn Cache(comptime Key: type) type {
         pub fn run(c: *Self, key: Key, stream: Stream, fingerprint: u64, body: Body) !Outcome {
             defer c.publish();
             if (!c.settings.on or c.failed or c.settings.max == 0) return c.eager(stream, body);
-            if (c.fingerprint != null and c.fingerprint.? != fingerprint) c.dropAll();
+            if (c.fingerprint != null and c.fingerprint.? != fingerprint) {
+                c.dropAll();
+                c.warmed.clearRetainingCapacity(); // new buffers: each key warms again before its capture
+            }
             c.fingerprint = fingerprint;
             c.tick += 1;
+            if (c.allowed) |keys| {
+                var found = false;
+                for (keys) |element| if (std.meta.eql(element, key)) {
+                    found = true;
+                    break;
+                };
+                if (!found) {
+                    c.stats.outside += 1;
+                    return c.eager(stream, body);
+                }
+            }
             if (c.entries.getPtr(key)) |e| {
                 e.used = c.tick;
                 try c.engine.launch(c.engine.ctx, e.exec, stream);
                 c.stats.replayed += 1;
                 return .replayed;
+            }
+            if (c.settings.warm > 0) {
+                const w = try c.warmed.getOrPut(c.gpa, key);
+                if (!w.found_existing) w.value_ptr.* = 0;
+                if (w.value_ptr.* < c.settings.warm) {
+                    w.value_ptr.* += 1;
+                    c.stats.warmed += 1;
+                    return c.eager(stream, body);
+                }
+            }
+            if (c.same_slot) |same| {
+                var i: usize = 0;
+                while (i < c.entries.count()) {
+                    if (same(c.entries.keys()[i], key)) {
+                        c.engine.free(c.engine.ctx, c.entries.values()[i].exec);
+                        c.entries.swapRemoveAt(i);
+                        c.stats.evicted += 1;
+                        c.stats.slot_swaps += 1;
+                    } else i += 1;
+                }
             }
             // a miss: room on every rank (a host map that cannot grow is none), else shed a quarter and lower the cap
             const reserved = if (c.entries.ensureUnusedCapacity(c.gpa, 1)) |_| true else |_| false;
@@ -529,6 +574,30 @@ test "graph cache: the meter prices a capture, replays never read it, a freed ca
         try std.testing.expectEqual(@as(u64, 1), mine.counts.replayed);
     }
     try std.testing.expectEqual(others, snapshots(&out));
+}
+
+test "graph cache: warm - a key's first runs are eager, its capture comes after them, then it replays" {
+    var f: Fake = .{};
+    var r: Ran = .{};
+    var c = Cache(u32).init(std.testing.allocator, f.engine(), .{ .warm = 1 });
+    defer c.deinit();
+    try std.testing.expectEqual(Outcome.eager, try c.run(1, no_stream, 7, r.body())); // first use: eager, no capture
+    try std.testing.expectEqual(@as(u32, 0), f.captures);
+    try std.testing.expectEqual(@as(u32, 1), r.n);
+    try std.testing.expectEqual(Outcome.eager, try c.run(2, no_stream, 7, r.body())); // each key warms on its own
+    try std.testing.expectEqual(Outcome.captured, try c.run(1, no_stream, 7, r.body()));
+    try std.testing.expectEqual(Outcome.replayed, try c.run(1, no_stream, 7, r.body()));
+    try std.testing.expectEqual(Outcome.captured, try c.run(2, no_stream, 7, r.body()));
+    try std.testing.expectEqual(@as(u32, 2), f.captures);
+    try std.testing.expectEqual(@as(u32, 2), r.n); // the body ran eagerly only for the two warm-ups
+    try std.testing.expectEqual(@as(u64, 2), c.stats.warmed);
+    // new buffers (fingerprint): every graph goes and every key warms again before it is captured
+    try std.testing.expectEqual(Outcome.eager, try c.run(1, no_stream, 8, r.body()));
+    try std.testing.expectEqual(Outcome.captured, try c.run(1, no_stream, 8, r.body()));
+    // the default (warm 0) captures on first use, as before
+    var c0 = Cache(u32).init(std.testing.allocator, f.engine(), .{});
+    defer c0.deinit();
+    try std.testing.expectEqual(Outcome.captured, try c0.run(1, no_stream, 7, r.body()));
 }
 
 test "graph cache: off runs every step eagerly" {

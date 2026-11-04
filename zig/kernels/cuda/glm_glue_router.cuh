@@ -1,5 +1,9 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 // glue._router_part by hand: tl.dot's chain of mma.m16n8k16 (bf16 in, fp32 accumulate) from zero, K ascending.
 #pragma once
+
+#include "tf_vblock.cuh"
 
 #include "glm_triton.cuh"
 
@@ -23,12 +27,11 @@ __device__ __forceinline__ void mma16816(float* c, const uint32_t* a, const uint
 }  // namespace glm_router
 
 // glue._router_part: part[s][m][e] = x[m] . w[e] over K slice s of ks (d / ks inputs), each warp one 16 x 8 tile.
-extern "C" __global__ void __launch_bounds__(128)
-    tf_glm_router_part(const __nv_bfloat16* x, const __nv_bfloat16* w, float* part, int64_t rows, int64_t x_stride,
-                       int64_t d, int64_t ne, int ks) {
+__device__ __forceinline__ void tf_glm_router_part_task(const __nv_bfloat16* x, const __nv_bfloat16* w, float* part,
+                                                        int64_t rows, int64_t x_stride, int64_t d, int64_t ne, int ks) {
   const int lane = threadIdx.x & 31, g = lane >> 2, q = lane & 3;
-  const int64_t m0 = (int64_t)blockIdx.x * 16, n = (int64_t)blockIdx.y * 32 + (threadIdx.x >> 5) * 8;
-  const int64_t s = blockIdx.z, span = d / ks, lo = s * span;
+  const int64_t m0 = (int64_t)TF_VBID.x * 16, n = (int64_t)TF_VBID.y * 32 + (threadIdx.x >> 5) * 8;
+  const int64_t s = TF_VBID.z, span = d / ks, lo = s * span;
   const int64_t ra = m0 + g, rb = ra + 8, e = n + g;
   const bool oka = ra < rows, okb = rb < rows, oke = e < ne;
   float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -47,4 +50,11 @@ extern "C" __global__ void __launch_bounds__(128)
       if (r < rows && col < ne) part[(s * rows + r) * ne + col] = c[h * 2 + j];
     }
   }
+}
+
+extern "C" __global__ void __launch_bounds__(128)
+    tf_glm_router_part(const __nv_bfloat16* x, const __nv_bfloat16* w, float* part, int64_t rows, int64_t x_stride,
+                       int64_t d, int64_t ne, int ks) {
+    TF_VBLOCK_ENTER();
+  tf_glm_router_part_task(x, w, part, rows, x_stride, d, ne, ks);
 }

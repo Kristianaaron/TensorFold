@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! Uploading core exl3_load groups to the device as the exl3 kernels' weights (the engine's load path).
 const std = @import("std");
 const driver = @import("driver.zig");
@@ -31,6 +33,9 @@ pub const Uploader = struct {
 
     /// One dense group: `parts` (exl3_load.Parts) and `g` (exl3_load.Group) as the Weight; the scales must be fp16.
     pub fn dense(u: *Uploader, parts: anytype, g: anytype) !exl3.Weight {
+        if (comptime std.meta.stringToEnum(@TypeOf(g.codebook), "mcg_e4m3")) |e4m3| {
+            if (g.codebook == e4m3) return error.UnsupportedCodebook;
+        }
         const mark = u.bufs.items.len;
         errdefer u.rollback(mark);
         const st = exl3.strides(g.k, g.n, g.halves, false);
@@ -42,11 +47,7 @@ pub const Uploader = struct {
             .k = @intCast(g.k),
             .n = @intCast(g.n),
             .halves = g.halves,
-            .codebook = switch (g.codebook) {
-                .inst3 => .inst3,
-                .mcg => .mcg,
-                .mul1 => .mul1,
-            },
+            .codebook = if (std.mem.eql(u8, @tagName(g.codebook), "inst3")) .inst3 else if (std.mem.eql(u8, @tagName(g.codebook), "mcg")) .mcg else if (std.mem.eql(u8, @tagName(g.codebook), "mul1")) .mul1 else return error.UnsupportedCodebook,
             .stride_k = st.k,
             .stride_nb = st.nb,
         };
@@ -68,6 +69,10 @@ pub const Uploader = struct {
         return u.dev(std.mem.sliceAsBytes(expanded));
     }
 };
+
+test {
+    std.testing.refAllDecls(@This());
+}
 
 /// One expert projection's tensors (fp16 scales) and half-bit width: the exl3_load Parts' bytes, the group's halves.
 pub const Proj = struct { trellis: []const u8, suh: []const u8, svh: []const u8, k2: u32, signs: bool = false };
@@ -227,6 +232,19 @@ test "expert upload retains independent projection widths and expands packed sca
     }
     try std.testing.expectEqual(@as(usize, 18), u.bufs.items.len);
     try std.testing.expectEqual(@as(u16, 0xbc00), std.mem.readInt(u16, mock.copied[0..2], .little));
+}
+
+test "generic EXL3 uploader refuses the GLM E4M3 marker" {
+    const mock = @import("exl3_mock.zig");
+    var d = mock.init();
+    var u: Uploader = .{ .d = &d, .gpa = std.testing.allocator, .max_buffers = 8 };
+    defer u.deinit();
+    const Tensor = struct { bytes: []const u8 };
+    const parts = .{ .trellis = Tensor{ .bytes = &.{ 0, 0 } }, .suh = Tensor{ .bytes = &.{ 0, 0 } }, .svh = Tensor{ .bytes = &.{ 0, 0 } }, .suh_packed = false, .bias = @as(?Tensor, null) };
+    const Codebook = enum { inst3, mcg, mul1, mcg_e4m3 };
+    const group = .{ .k = @as(usize, 128), .n = @as(usize, 128), .halves = @as(u16, 8), .codebook = Codebook.mcg_e4m3 };
+    try std.testing.expectError(error.UnsupportedCodebook, u.dense(parts, group));
+    try std.testing.expectEqual(@as(usize, 0), u.bufs.items.len);
 }
 
 test {

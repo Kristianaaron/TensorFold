@@ -1,16 +1,20 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 // GLM's element-wise glue by hand: each output value alone, in the Triton kernel's order of fp32 ops.
 #pragma once
+
+#include "tf_vblock.cuh"
 
 #include "glm_triton.cuh"
 
 namespace glm_glue {
 using namespace glm_triton;
 
-// Column c of a 2-D grid's row blockIdx.x, 256 threads a block along y.
-__device__ __forceinline__ int64_t col() { return (int64_t)blockIdx.y * blockDim.x + threadIdx.x; }
+// Column c of a 2-D grid's row TF_VBID.x, 256 threads a block along y.
+__device__ __forceinline__ int64_t col() { return (int64_t)TF_VBID.y * TF_VBDIM.x + threadIdx.x; }
 
 // The first of a thread's 8 contiguous columns: Triton's BLOCK 1024 over 4 warps, 128 threads a block along y.
-__device__ __forceinline__ int64_t col8() { return ((int64_t)blockIdx.y * blockDim.x + threadIdx.x) * 8; }
+__device__ __forceinline__ int64_t col8() { return ((int64_t)TF_VBID.y * TF_VBDIM.x + threadIdx.x) * 8; }
 
 // 8 contiguous values in one 16-byte load (bf16) or two (fp32), and 8 bf16 out in one 16-byte store.
 __device__ __forceinline__ void ld8(const __nv_bfloat16* p, float v[8]) {
@@ -46,9 +50,10 @@ using namespace glm_triton;
 // glue._residual_add: xout = bf16(x + bf16(the partials summed rank 0 first)), 8 columns a thread.
 extern "C" __global__ void tf_glm_residual_add(const __nv_bfloat16* x, __nv_bfloat16* xout, const float* g, int64_t rs,
                                                int64_t d, int world) {
+    TF_VBLOCK_ENTER();
   const int64_t c = glm_glue::col8();
   if (c >= d) return;
-  const int64_t i = blockIdx.x * d + c;
+  const int64_t i = TF_VBID.x * d + c;
   float a[8], v[8];
   glm_glue::ranks8(g, rs, i, world, a);
   glm_glue::ld8(x + i, v);
@@ -58,9 +63,10 @@ extern "C" __global__ void tf_glm_residual_add(const __nv_bfloat16* x, __nv_bflo
 
 // glue._stream_mean: bf16 of the s streams' sum over s (div.full, as Triton divides), 8 columns a thread.
 extern "C" __global__ void tf_glm_stream_mean(const __nv_bfloat16* x, __nv_bfloat16* out, int64_t d, int s) {
+    TF_VBLOCK_ENTER();
   const int64_t c = glm_glue::col8();
   if (c >= d) return;
-  const __nv_bfloat16* row = x + blockIdx.x * s * d + c;
+  const __nv_bfloat16* row = x + TF_VBID.x * s * d + c;
   float a[8];
   glm_glue::ld8(row, a);
   for (int k = 1; k < s; ++k) {
@@ -69,15 +75,16 @@ extern "C" __global__ void tf_glm_stream_mean(const __nv_bfloat16* x, __nv_bfloa
     for (int j = 0; j < 8; ++j) a[j] = a[j] + b[j];
   }
   for (int j = 0; j < 8; ++j) a[j] = div_full(a[j], (float)s);
-  glm_glue::st8(out + blockIdx.x * d + c, a);
+  glm_glue::st8(out + TF_VBID.x * d + c, a);
 }
 
 // glue._rank_sum: bf16 of the partials summed rank 0 first, `me` from `own`, others from `peers`, 8 columns a thread.
 extern "C" __global__ void tf_glm_rank_sum(const float* own, const float* peers, __nv_bfloat16* out, int64_t rs,
                                            int64_t d, int world, int me) {
+    TF_VBLOCK_ENTER();
   const int64_t c = glm_glue::col8();
   if (c >= d) return;
-  const int64_t i = blockIdx.x * d + c;
+  const int64_t i = TF_VBID.x * d + c;
   float a[8];
   glm_glue::ld8(me == 0 ? own + i : peers + i, a);
   for (int k = 1; k < world; ++k) {
@@ -91,9 +98,10 @@ extern "C" __global__ void tf_glm_rank_sum(const float* own, const float* peers,
 // glue._hc_post: stream s = bf16(post[s] branch + sum_t comb[t][s] x[t]) in LLVM's fma order; x may be xout.
 extern "C" __global__ void tf_glm_hc_post(const __nv_bfloat16* x, __nv_bfloat16* xout, const float* g,
                                           const float* post, const float* comb, int64_t rs, int64_t d, int world) {
+    TF_VBLOCK_ENTER();
   const int64_t c = glm_glue::col8();
   if (c >= d) return;
-  const int64_t r = blockIdx.x;
+  const int64_t r = TF_VBID.x;
   float branch[8];
   glm_glue::ranks8(g, rs, r * d + c, world, branch);
   float xv[4][8];
@@ -116,9 +124,10 @@ extern "C" __global__ void tf_glm_hc_post(const __nv_bfloat16* x, __nv_bfloat16*
 // glue._combine: fp32 sum over slots in order of y[r][k] wts[r][k] (fma from 0), y fp32 or bf16, 8 columns a thread.
 extern "C" __global__ void tf_glm_combine(
         const void* y, int y_f32, const float* wts, float* out, int64_t d, int slots) {
+    TF_VBLOCK_ENTER();
   const int64_t c = glm_glue::col8();
   if (c >= d) return;
-  const int64_t r = blockIdx.x;
+  const int64_t r = TF_VBID.x;
   float a[8] = {};
   for (int k = 0; k < slots; ++k) {
     const int64_t i = (r * slots + k) * d + c;
@@ -136,8 +145,8 @@ extern "C" __global__ void tf_glm_combine(
 }
 
 // glue._router_sum and qmm._reduce: ks slices of `total` fp32 added in order (fp32 or bf16 out), 8 values a thread.
-extern "C" __global__ void tf_glm_slice_sum(const float* part, void* out, int64_t total, int ks, int f32) {
-  const int64_t i0 = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
+__device__ __forceinline__ void tf_glm_slice_sum_task(const float* part, void* out, int64_t total, int ks, int f32) {
+  const int64_t i0 = ((int64_t)TF_VBID.x * TF_VBDIM.x + threadIdx.x) * 8;
   if (i0 >= total) return;
   const bool aligned = ((reinterpret_cast<uintptr_t>(out) | reinterpret_cast<uintptr_t>(part)) & 15) == 0;
   if (i0 + 8 <= total && (total & 3) == 0 && aligned) {
@@ -167,22 +176,29 @@ extern "C" __global__ void tf_glm_slice_sum(const float* part, void* out, int64_
   }
 }
 
+extern "C" __global__ void tf_glm_slice_sum(const float* part, void* out, int64_t total, int ks, int f32) {
+    TF_VBLOCK_ENTER();
+  tf_glm_slice_sum_task(part, out, total, ks, f32);
+}
+
 // glue._embed_b16: token ids[r]'s bf16 row into `copies` streams of d.
 extern "C" __global__ void tf_glm_embed_b16(const int* ids, const __nv_bfloat16* w, __nv_bfloat16* out, int64_t d,
                                             int copies) {
+    TF_VBLOCK_ENTER();
   const int64_t c = glm_glue::col();
   if (c >= d) return;
-  const int64_t r = blockIdx.x;
+  const int64_t r = TF_VBID.x;
   const __nv_bfloat16 v = w[(int64_t)ids[r] * d + c];
   for (int k = 0; k < copies; ++k) out[(r * copies + k) * d + c] = v;
 }
 
-// forward._conv_shift: layer blockIdx.x's 3-row window takes rows keep .. keep + 2 of [window; projection rows].
+// forward._conv_shift: layer TF_VBID.x's 3-row window takes rows keep .. keep + 2 of [window; projection rows].
 extern "C" __global__ void tf_glm_conv_shift(__nv_bfloat16* conv, const __nv_bfloat16* proj, int64_t keep,
                                              int64_t conv_layer, int64_t proj_layer, int64_t proj_row, int64_t c) {
+    TF_VBLOCK_ENTER();
   const int64_t k = glm_glue::col();
   if (k >= c) return;
-  const int64_t l = blockIdx.x;
+  const int64_t l = TF_VBID.x;
   __nv_bfloat16 v[3];
   for (int j = 0; j < 3; ++j) {
     const int64_t src = keep + j;
@@ -194,6 +210,7 @@ extern "C" __global__ void tf_glm_conv_shift(__nv_bfloat16* conv, const __nv_bfl
 // decode.sample_rows' greedy pick, as the host scan: first max of n bf16 logits, NaN never wins; out fp32 bits, lo+id.
 extern "C" __global__ void __launch_bounds__(1024) tf_glm_top1(const unsigned short* logits, int64_t n, unsigned lo,
                                                                 unsigned* out) {
+    TF_VBLOCK_ENTER();
   __shared__ float sv[1024];
   __shared__ unsigned si[1024];
   const int t = threadIdx.x;
@@ -224,5 +241,6 @@ struct tf_glm_words {
   unsigned w[96];
 };
 extern "C" __global__ void tf_glm_put_words(unsigned* dst, unsigned n, tf_glm_words v) {
-  for (unsigned i = threadIdx.x; i < n; i += blockDim.x) dst[i] = v.w[i];
+    TF_VBLOCK_ENTER();
+  for (unsigned i = threadIdx.x; i < n; i += TF_VBDIM.x) dst[i] = v.w[i];
 }

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! safetensors: the JSON header's names, dtypes, shapes and byte ranges (every backend's index), and read-only maps.
 
 const std = @import("std");
@@ -53,6 +55,7 @@ pub const Entry = struct {
 };
 
 pub const Header = std.StringArrayHashMapUnmanaged(Entry);
+pub const Keep = struct { ctx: *anyopaque, keep: *const fn (ctx: *anyopaque, tensor: []const u8) bool };
 
 /// The header's entries (names live in `arena`); an entry that breaks the format, runs past `data_len` bytes or has the wrong size is refused.
 pub fn parseHeader(arena: std.mem.Allocator, json: []const u8, data_len: usize) !Header {
@@ -61,6 +64,14 @@ pub fn parseHeader(arena: std.mem.Allocator, json: []const u8, data_len: usize) 
 
 /// Select one tensor namespace before interpreting shapes, so a text engine need not admit a vision tower's layouts.
 pub fn parseHeaderPrefix(arena: std.mem.Allocator, json: []const u8, data_len: usize, prefix: ?[]const u8) !Header {
+    return parseHeaderSelect(arena, json, data_len, prefix, null);
+}
+
+pub fn parseHeaderFiltered(arena: std.mem.Allocator, json: []const u8, data_len: usize, keep: Keep) !Header {
+    return parseHeaderSelect(arena, json, data_len, null, keep);
+}
+
+fn parseHeaderSelect(arena: std.mem.Allocator, json: []const u8, data_len: usize, prefix: ?[]const u8, filter: ?Keep) !Header {
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
     if (parsed != .object) return error.BadSafetensors;
     var out: Header = .empty;
@@ -68,6 +79,7 @@ pub fn parseHeaderPrefix(arena: std.mem.Allocator, json: []const u8, data_len: u
     while (it.next()) |kv| {
         if (std.mem.eql(u8, kv.key_ptr.*, "__metadata__")) continue;
         if (prefix) |p| if (!std.mem.startsWith(u8, kv.key_ptr.*, p)) continue;
+        if (filter) |f| if (!f.keep(f.ctx, kv.key_ptr.*)) continue;
         if (kv.value_ptr.* != .object) return error.BadSafetensors;
         const o = kv.value_ptr.object;
         const dtype = DType.parse(str(o.get("dtype")) orelse return error.BadSafetensors) orelse return error.UnsupportedDType;
@@ -143,6 +155,12 @@ pub const File = struct {
         return openPrefix(gpa, io, path, null);
     }
     pub fn openPrefix(gpa: std.mem.Allocator, io: Io, path: []const u8, prefix: ?[]const u8) !File {
+        return openSelect(gpa, io, path, prefix, null);
+    }
+    pub fn openFiltered(gpa: std.mem.Allocator, io: Io, path: []const u8, keep: Keep) !File {
+        return openSelect(gpa, io, path, null, keep);
+    }
+    fn openSelect(gpa: std.mem.Allocator, io: Io, path: []const u8, prefix: ?[]const u8, filter: ?Keep) !File {
         var file = try Io.Dir.cwd().openFile(io, path, .{});
         errdefer file.close(io);
         const len: usize = @intCast(try file.length(io));
@@ -153,7 +171,7 @@ pub const File = struct {
         if (header_len > len - 8) return error.BadSafetensors;
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
-        const names = try parseHeaderPrefix(arena.allocator(), map.memory[8..][0..header_len], len - 8 - header_len, prefix);
+        const names = try parseHeaderSelect(arena.allocator(), map.memory[8..][0..header_len], len - 8 - header_len, prefix, filter);
         const own = try arena.allocator().dupeSentinel(u8, path, 0);
         return .{ .path = own, .file = file, .map = map, .data = 8 + header_len, .names = names, .arena = arena };
     }
@@ -191,6 +209,20 @@ test "header entries" {
     try std.testing.expectEqual(@as(usize, 2), h.count());
     try std.testing.expectEqual(DType.bf16, h.get("a.scales").?.dtype);
     try std.testing.expectError(error.BadSafetensors, parseHeader(arena.allocator(), json, 20));
+}
+
+test "filtered header skips unselected values before interpretation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const Ctx = struct {
+        fn keep(_: *anyopaque, name: []const u8) bool { return std.mem.eql(u8, name, "keep"); }
+    };
+    const json = "{\"keep\":{\"dtype\":\"U8\",\"shape\":[2],\"data_offsets\":[0,2]},\"drop\":42}";
+    const h = try parseHeaderFiltered(arena.allocator(), json, 2, .{ .ctx = undefined, .keep = Ctx.keep });
+    try std.testing.expectEqual(@as(usize, 1), h.count());
+    try std.testing.expect(h.contains("keep"));
+    const bad = "{\"keep\":{\"dtype\":\"U8\",\"shape\":[2],\"data_offsets\":[0,3]}}";
+    try std.testing.expectError(error.BadSafetensors, parseHeaderFiltered(arena.allocator(), bad, 2, .{ .ctx = undefined, .keep = Ctx.keep }));
 }
 
 test "FP8 entries parse with one byte an element, as cluster/checkpoint.zig sizes them" {

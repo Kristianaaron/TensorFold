@@ -126,39 +126,85 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
             continue;
         }
         if (max_calls) |m| if (calls.items.len >= m) continue;
-        const parsed: ?[]Call = blk: {
-            if (std.mem.startsWith(u8, env.payload, dsml_open)) {
-                const inner = env.payload[dsml_open.len .. env.payload.len - dsml_close.len];
-                break :blk dsmlCalls(a, inner) catch |e| switch (e) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.Invalid => null,
-                };
+        var start = env.start;
+        var parsed = try offeredCalls(a, env.payload, &schemas, &known, max_calls != null);
+        if (parsed == null and std.ascii.startsWithIgnoreCase(text[env.start..], "<tool_call>")) {
+            const closer = env.end - "</tool_call>".len;
+            var inner = lastOpener(text, env.start + "<tool_call>".len, closer);
+            var tries: usize = 0;
+            while (inner) |candidate| : (inner = lastOpener(text, env.start + "<tool_call>".len, candidate)) {
+                tries += 1;
+                if (tries > 4) break;
+                if (insideValue(text[env.start + "<tool_call>".len .. candidate])) continue;
+                parsed = try offeredCalls(a, strip(text[candidate + "<tool_call>".len .. closer]), &schemas, &known, max_calls != null);
+                if (parsed != null) {
+                    start = candidate;
+                    break;
+                }
             }
-            const one = payload(a, env.payload, &schemas, max_calls != null) catch |e| switch (e) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.Invalid => break :blk null,
-            };
-            if (one) |c| {
-                const list = try a.alloc(Call, 1);
-                list[0] = c;
-                break :blk list;
-            }
-            break :blk null;
-        };
-        const good = if (parsed) |list| list.len > 0 and for (list) |c| {
-            if ((try callName(a, c, &known)) == null) break false;
-        } else true else false;
-        if (!good) {
+        }
+        const list = parsed orelse {
             // a malformed or unoffered call stays text when calls are unlimited, and drops out of a one-call reply
             if (max_calls == null) try residue.appendSlice(a, text[env.start..env.end]);
             continue;
-        }
-        for (parsed.?) |c| {
+        };
+        try residue.appendSlice(a, text[env.start..start]);
+        for (list) |c| {
             if (max_calls == null or calls.items.len < max_calls.?) try calls.append(a, try openaiCall(a, (try callName(a, c, &known)).?, c.arguments));
         }
     }
     try residue.appendSlice(a, text[cursor..]);
     return .{ .content = strip(residue.items), .calls = if (calls.items.len > 0) calls.items else null };
+}
+
+fn offeredCalls(a: Allocator, block: []const u8, schemas: *const tool_params.Schemas, known: *const std.StringArrayHashMapUnmanaged([]const u8), complete: bool) Allocator.Error!?[]Call {
+    const parsed: ?[]Call = blk: {
+        if (std.mem.startsWith(u8, block, dsml_open)) {
+            const inner = block[dsml_open.len .. block.len - dsml_close.len];
+            break :blk dsmlCalls(a, inner) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Invalid => null,
+            };
+        }
+        const one = payload(a, block, schemas, complete) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Invalid => break :blk null,
+        };
+        if (one) |c| {
+            const list = try a.alloc(Call, 1);
+            list[0] = c;
+            break :blk list;
+        }
+        break :blk null;
+    };
+    const list = parsed orelse return null;
+    if (list.len == 0) return null;
+    for (list) |c| if ((try callName(a, c, known)) == null) return null;
+    return list;
+}
+
+fn insideValue(before: []const u8) bool {
+    var depth: isize = 0;
+    for (before) |ch| {
+        if (ch == '{') depth += 1 else if (ch == '}') depth -= 1;
+    }
+    if (depth > 0) return true;
+    const open_value = std.mem.lastIndexOf(u8, before, "<arg_value>");
+    if (open_value) |open| if (std.mem.lastIndexOf(u8, before, "</arg_value>")) |close| {
+        if (close < open) return true;
+    } else return true;
+    const open_param = std.mem.lastIndexOf(u8, before, "<parameter=");
+    if (open_param) |open| if (std.mem.lastIndexOf(u8, before, "</parameter>")) |close| {
+        if (close < open) return true;
+    } else return true;
+    return false;
+}
+
+fn lastOpener(text: []const u8, from: usize, before: usize) ?usize {
+    var last: ?usize = null;
+    var pos = from;
+    while (findCI(text[0..before], "<tool_call>", pos)) |start| : (pos = start + 1) last = start;
+    return last;
 }
 
 /// What closes the call ``text`` ends inside (the model's end token came before its ``
@@ -453,7 +499,7 @@ fn glmCall(a: Allocator, written: []const u8, schemas: ?*const tool_params.Schem
 }
 
 /// The first ``</arg_key>`` at or after `from` that an ``<arg_value>`` follows, and where that value starts.
-fn valueKey(rest: []const u8, from: usize) ?[2]usize {
+pub fn valueKey(rest: []const u8, from: usize) ?[2]usize {
     var at = from;
     while (find(rest, "</arg_key>", at)) |ke| : (at = ke + 1) {
         var j = ke + 10;

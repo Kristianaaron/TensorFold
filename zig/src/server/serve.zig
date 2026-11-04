@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! Server lifetime: keys, socket, startup and live lines, and a clean stop on SIGTERM or SIGINT.
 const std = @import("std");
 const platform = @import("sys");
@@ -155,6 +157,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .reasoning_effort = args.reasoning_effort,
         .thinking_budget = args.thinking_budget,
         .loop_guard = args.loop_guard,
+        .allow_ablate = args.allow_ablate,
         .keep_warm_s = args.keep_warm,
         .default_sampling = s.sampling,
         .use_drafts = !args.no_drafts,
@@ -183,6 +186,10 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
     srv.recall = s.recall;
     if (args.loop_guard and !srv.info.loop_guard) {
         std.debug.print("tensorfold: --loop-guard is not supported by this native engine\n", .{});
+        return 2;
+    }
+    if (args.allow_ablate and !srv.info.ablate) {
+        std.debug.print("tensorfold: --allow-ablate needs an engine with ablation vectors (TF_GLM53_ABLATE_FILE)\n", .{});
         return 2;
     }
     if (raiseOpenFileLimit()) |r| log.line("open-file limit raised: soft {d} -> {d}", .{ r[0], r[1] });

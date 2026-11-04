@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! libtfgrammar, structured output's optional runtime library (tf_grammar.cc over xgrammar), built beside bin/.
 
 const std = @import("std");
@@ -12,18 +14,35 @@ pub fn option(b: *std.Build) ?[]const u8 {
     return b.option([]const u8, "xgrammar", "An xgrammar " ++ pinned ++ " checkout with its submodules (zig build grammar, dist)");
 }
 
-pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, dir: ?[]const u8) void {
+pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, dir: ?[]const u8, lanes: *std.Build.Module, sys: *std.Build.Module) void {
     const step = b.step("grammar", "libtfgrammar (structured output) from an xgrammar " ++ pinned ++ " checkout: -Dxgrammar=DIR");
+    const tools = b.step("test-grammar-tools", "tool_grammar's call grammars walked through a real libtfgrammar: -Dxgrammar=DIR");
     const root = dir orelse {
         step.dependOn(&b.addFail("zig build grammar needs -Dxgrammar=DIR: " ++ clone).step);
+        tools.dependOn(&b.addFail("zig build test-grammar-tools needs -Dxgrammar=DIR: " ++ clone).step);
         return;
     };
     const lib = library(b, target, root) orelse {
         step.dependOn(&b.addFail(b.fmt("-Dxgrammar={s} is not an xgrammar " ++ pinned ++ " checkout: " ++ clone, .{root})).step);
+        tools.dependOn(&b.addFail(b.fmt("-Dxgrammar={s} is not an xgrammar " ++ pinned ++ " checkout: " ++ clone, .{root})).step);
         return;
     };
     const into = if (target.result.os.tag == .macos) "native/lib" else "lib";
     step.dependOn(&b.addInstallArtifact(lib, .{ .dest_dir = .{ .override = .{ .custom = into } } }).step);
+    if (target.result.os.tag != .macos) {
+        step.dependOn(&b.addInstallArtifact(lib, .{ .dest_dir = .{ .override = .{ .custom = "native/lib" } } }).step);
+    }
+    const host_lib = library(b, b.graph.host, root) orelse {
+        tools.dependOn(&b.addFail("could not build host libtfgrammar for test-grammar-tools").step);
+        return;
+    };
+    const options = b.addOptions();
+    options.addOptionPath("library", host_lib.getEmittedBin());
+    const walk = @import("server.zig").plain(b, "zig/src/server/tool_grammar_xgrammar_test.zig", b.graph.host, .Debug, lanes, sys);
+    walk.addOptions("grammar_library", options);
+    const run = b.addRunArtifact(b.addTest(.{ .root_module = walk }));
+    run.step.dependOn(&host_lib.step);
+    tools.dependOn(&run.step);
 }
 
 /// libtfgrammar for `target` from the checkout at `dir`; null unless `dir` is a git checkout at the pinned tag.

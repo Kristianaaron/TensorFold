@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! A CUDA family's options from the serve flags it takes: its ranks, images and videos, NVFP4 precision and fp8 caches.
 const std = @import("std");
 const api = @import("engine_api");
@@ -6,6 +8,7 @@ const api = @import("engine_api");
 pub fn set(comptime F: type, o: api.Open, opts: *F.Options, problem: *[]const u8) bool {
     if (@hasField(F.Options, "mtp_drafts")) opts.mtp_drafts = o.mtp_drafts;
     if (@hasField(F.Options, "mtp_confidence")) opts.mtp_confidence = o.mtp_confidence;
+    if (comptime @hasField(F.Options, "manifest")) opts.manifest = o.manifest;
     if (@hasField(F.Options, "mtp_drafts") and o.mtp_drafts == 0) opts.drafts = false;
     if (@hasField(F.Options, "lanes")) opts.lanes = o.lanes;
     if (@hasField(F.Options, "lanes_fixed")) opts.lanes_fixed = o.lanes_fixed;

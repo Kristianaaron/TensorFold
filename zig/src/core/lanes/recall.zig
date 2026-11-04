@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! Recall: drafts copied from a record of what a server read and wrote (not the prompt cache's learned states).
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -140,6 +142,12 @@ pub const Reader = struct {
         x.proposals += 1;
         x.proposed += got.len;
         return x.out.items;
+    }
+
+    pub fn landing(x: *Reader) f64 {
+        x.shared.lock();
+        defer x.shared.unlock();
+        return x.shared.rates.rate(x.band);
     }
 
     /// What a lookup reads of `ctx` (its last max_match ids) and the width asked, hashed.

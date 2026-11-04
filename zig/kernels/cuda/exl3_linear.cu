@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
+#include "tf_vblock.cuh"
 // EXL3 decode-row linear: any codebook, width, 1-128 rows, a row's bits only its own; port of tensorfold's linear.cu.
 #include <cstdint>
 #include <cuda_fp16.h>
@@ -102,7 +105,8 @@ __device__ __forceinline__ void step_lane_words(const uint32_t (&raw)[8 * lane_w
 
 // xh = fp16(((x * suh) @ H) / sqrt(128)): one warp per 128 columns, one block of 4 warps per 512.
 extern "C" __global__ void __launch_bounds__(128) tf_exl3_rot_in(RotInArgs a) {
-    const int blk = blockIdx.x * 4 + (threadIdx.x >> 5), row = blockIdx.y, lane = threadIdx.x & 31;
+    TF_VBLOCK_ENTER();
+    const int blk = TF_VBID.x * 4 + (threadIdx.x >> 5), row = TF_VBID.y, lane = threadIdx.x & 31;
     if (blk * 128 >= a.k) return;
     const int k = blk * 128 + 4 * lane;
     float v[4], s[4];
@@ -127,7 +131,7 @@ __device__ __forceinline__ void linear_body(LinearArgs a) {
     __shared__ int last;
     const int M = a.m, K = a.k, N = a.n, SK = a.sk, NB = N >> 7;
     const int RH = imin(M, 8);                                // rows of red a warp
-    const int nb = (int)blockIdx.x % NB, split = (int)blockIdx.x / NB;
+    const int nb = (int)TF_VBID.x % NB, split = (int)TF_VBID.x / NB;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int g = lane >> 2, t = lane & 3;
     const int per_warp = (K >> 4) / SK / WK;
@@ -187,7 +191,7 @@ __device__ __forceinline__ void linear_body(LinearArgs a) {
         // the warps' sums, added in warp order, rows 0-7 of the pass and then rows 8-15
         for (int rlo = 0; rlo < R; rlo += 8) {
             const int rn = imin(R - rlo, 8);
-            __syncthreads();                         // red is reused by every half and pass
+            TF_TASK_SYNC();                         // red is reused by every half and pass
             if (g < RH) {
 #pragma unroll
                 for (int i = 0; i < 8; ++i)
@@ -199,7 +203,7 @@ __device__ __forceinline__ void linear_body(LinearArgs a) {
                                 : make_float2(acc[i][h][0], acc[i][h][1]);
                     }
             }
-            __syncthreads();
+            TF_TASK_SYNC();
 
             if (SK == 1) {
                 for (int r = warp; r < rn; r += WK) {
@@ -229,9 +233,9 @@ __device__ __forceinline__ void linear_body(LinearArgs a) {
         }
         if (SK > 1) {
             __threadfence();
-            __syncthreads();
+            TF_TASK_SYNC();
             if (threadIdx.x == 0) last = atomicAdd(a.counters + pass * NB + nb, 1) == SK - 1;
-            __syncthreads();
+            TF_TASK_SYNC();
             if (last) {
                 __threadfence();
                 for (int r = warp; r < R; r += WK) {
@@ -248,7 +252,7 @@ __device__ __forceinline__ void linear_body(LinearArgs a) {
                 if (threadIdx.x == 0) a.counters[pass * NB + nb] = 0;   // every program of the block has arrived
             }
         }
-        __syncthreads();                             // red is reused in the next pass
+        TF_TASK_SYNC();                             // red is reused in the next pass
     }
 }
 
@@ -256,6 +260,7 @@ __device__ __forceinline__ void linear_body(LinearArgs a) {
 #define TF_EXL3_LINEAR(K2, CB, WK)                                                       \
     extern "C" __global__ void __launch_bounds__((WK) * 32)                              \
         tf_exl3_linear_##K2##_##CB##_##WK(tf_exl3::LinearArgs a) {                       \
+        TF_VBLOCK_ENTER();                                                               \
         tf_exl3::linear_body<K2, CB, WK>(a);                                             \
     }
 

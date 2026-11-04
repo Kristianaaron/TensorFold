@@ -1,0 +1,1 @@
+NVIDIA/cutlass 91843b71d90737e0a9b86f7d9df213cff5a3526f (Tue Oct 20 17:30:56 2026 +0800), include/ and tools/util/include, BSD-3-Clause; vendored unmodified 2026-10-21

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! Device memory and pinned host memory, each owned by one value; copies and fills, blocking or on a stream.
 
 const std = @import("std");
@@ -58,6 +60,11 @@ pub fn takeUsage() Usage {
         fn afterRead(_: @This()) void {}
     };
     return sample(true, NoHook{}, true);
+}
+
+/// Account a driver allocation whose lifetime is managed outside DeviceBuffer (for example a VMM arena).
+pub fn accountExternalDeviceAllocation(n: usize) void {
+    held(&device_bytes, n);
 }
 
 fn usageWithHook(reset_peak: bool, hook: anytype) Usage {

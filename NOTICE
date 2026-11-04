@@ -2,7 +2,21 @@ TensorFold
 Copyright 2026 TensorFold contributors
 https://github.com/ashhart/TensorFold
 
+Ash (ashhart, TensorFold Labs) created TensorFold. This repository is a fork of TensorFold. This fork does not imply review or endorsement by Ash or TensorFold Labs. Matt Mastracci (mmastrac, Kindling AI) is credited for the EXLR8 multi-width store and FP8-aware rounding ideas; this does not imply review or endorsement.
+
 TensorFold is licensed under the Apache License, Version 2.0 (LICENSE) from 0.6.0.
 Releases up to 0.5.0 were MIT-licensed, and code written before 0.6.0 keeps its
 MIT notice in LICENSES/MIT.txt. Third-party code and its licenses are listed in
 THIRD_PARTY_NOTICES.md.
+
+This repository is a fork of TensorFold at commit d1018b318fb51981c4a18f12e40269a4d3ee9713.
+It is not affiliated with or endorsed by the TensorFold project.
+Fork changes: Copyright 2026 Kristian Aaron (Krishando). Apache License, Version 2.0.
+The files this fork added or changed are listed in docs/fork-changes.txt.
+
+Parts of this fork follow MiaAI-Lab's GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold, which carries this notice:
+
+  GLM-5.3 EXL3 on 3x DGX Spark with TensorFold
+  Copyright 2026 Mia's AI Lab (MiaAI-Lab)
+
+Third-party code and its licenses are listed in THIRD_PARTY_NOTICES.md.

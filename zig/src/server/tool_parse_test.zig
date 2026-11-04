@@ -29,6 +29,38 @@ test "families" {
     try std.testing.expectEqualStrings("hi <tool_call>{\"name\":\"other tool\"}</tool_call>", kept.content);
 }
 
+test "a call after prose that quotes its opener is recovered, while open values guard nested calls" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"parameters\":{\"properties\":{\"n\":{\"type\":\"integer\"},\"q\":{\"type\":\"string\"}}}}}]")).ok.array;
+    const prose = "Each lab uses another format (Qwen's <tool_call>{})...";
+    const calls = [_][]const u8{
+        "<tool_call>lookup<arg_key>n</arg_key><arg_value>7</arg_value></tool_call>",
+        "<tool_call>{\"name\":\"lookup\",\"arguments\":{\"n\":7}}</tool_call>",
+        "<tool_call>\n<function=lookup>\n<parameter=n>\n7\n</parameter>\n</function>\n</tool_call>",
+    };
+    for (calls) |call| {
+        const text = try std.mem.concat(a, u8, &.{ prose, call });
+        for ([_]?usize{ null, 1 }) |max_calls| {
+            const parsed = try parse(a, text, tools, max_calls);
+            try std.testing.expectEqualStrings(prose, parsed.content);
+            try std.testing.expectEqual(@as(usize, 1), parsed.calls.?.len);
+            try std.testing.expectEqualStrings("{\"n\":7}", parsed.calls.?[0].get("function").?.get("arguments").?.string);
+        }
+    }
+    const cuts = [_][]const u8{
+        "<tool_call>{\"name\":\"lookup\",\"arguments\":{\"q\":\"<tool_call>lookup<arg_key>n</arg_key><arg_value>7</arg_value></tool_call>\"}}</tool_call>",
+        "<tool_call>lookup<arg_key>q</arg_key><arg_value><tool_call>lookup<arg_key>n</arg_key><arg_value>7</arg_value></tool_call></arg_value></tool_call>",
+        "<tool_call>\n<function=lookup>\n<parameter=q>\n<tool_call>lookup<arg_key>n</arg_key><arg_value>7</arg_value></tool_call>\n</parameter>\n</function>\n</tool_call>",
+        "Note: <tool_call>{\"name\":\"lookup\",\"arguments\":{\"q\":\"<tool_call>lookup<arg_key>n</arg_key><arg_value>7</arg_value></tool_call>\"}}</tool_call>",
+    };
+    for (cuts) |text| for ([_]?usize{ null, 1 }) |max_calls| {
+        const parsed = try parse(a, text, tools, max_calls);
+        if (parsed.calls) |result| try std.testing.expect(!std.mem.eql(u8, "{\"n\":7}", result[0].get("function").?.get("arguments").?.string));
+    };
+}
+
 test "a reply of many calls searches each opener once, not again after every call" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
@@ -92,7 +124,6 @@ test "a call left open that would not parse whole stays the reply's text" {
         "Trying.<tool_call>\n<function=lookup>\n<parameter=n>\n5\n", // before its </parameter>
         "Trying.<tool_call>{\"name\":\"launch rocket!\",\"arguments\":{}}", // no function name
         "Trying.<tool_call>", // nothing written
-        "Trying <tool_call> tags.<tool_call>{\"name\":\"lookup\"}", // an earlier opener would take the closer
     };
     for (replies) |text| {
         try std.testing.expectEqualStrings("", try closeCall(a, text, tools));
@@ -100,6 +131,12 @@ test "a call left open that would not parse whole stays the reply's text" {
         try std.testing.expect(r.calls == null);
         try std.testing.expectEqualStrings(text, r.content);
     }
+    // an earlier opener no longer takes the closer that closes the call the end token left open
+    const tags = "Trying <tool_call> tags.<tool_call>{\"name\":\"lookup\"}";
+    try std.testing.expectEqualStrings("</tool_call>", try closeCall(a, tags, tools));
+    const tagged = try parse(a, try std.mem.concat(a, u8, &.{ tags, "</tool_call>" }), tools, null);
+    try std.testing.expectEqualStrings("lookup", tagged.calls.?[0].get("function").?.get("name").?.string);
+    try std.testing.expectEqualStrings("Trying <tool_call> tags.", tagged.content);
 }
 
 test "replies that end outside a call close nothing" {

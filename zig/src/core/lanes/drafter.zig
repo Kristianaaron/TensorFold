@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! A drafter outside the target family reading its tapped states; each call takes a round's streams together.
 const Stream = @import("stream.zig").Stream;
 const Features = @import("backend.zig").Features;
@@ -18,6 +20,11 @@ pub const Facts = struct {
     window_costs: []const Cost = &.{}, // the target's window ms by rows (timed at load), for the depth rule
     lane_costs: []const Cost = &.{}, // the same for the lane planner (Model.lane_costs)
     tree_nodes: u32 = 0, // hold() without lanes grows its own tree of up to `depth` nodes, at most this many (tree, chances)
+    chances: bool = false,
+    confidence_floor: ?f64 = null,
+    slack: u32 = 0,
+    copy_first: bool = false,
+    hold_costs: []const @import("hold_price.zig").HoldCost = &.{},
 };
 
 /// Target rows [start, start + features.rows) and the token after each; `rows`, when given, picks which to absorb.

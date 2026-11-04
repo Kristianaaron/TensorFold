@@ -1,5 +1,9 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 // glue._hc_partial and glue._hc_finish by hand (hyper-connections' pre side, 4 streams of 4096).
 #pragma once
+
+#include "tf_vblock.cuh"
 
 #include "glm_triton.cuh"
 
@@ -9,9 +13,10 @@ using namespace glm_triton;
 extern "C" __global__ void __launch_bounds__(128)
     tf_glm_hc_partial(
             const __nv_bfloat16* x, const __nv_bfloat16* fn, float* part, int64_t wide, int nb, int64_t rows) {
+    TF_VBLOCK_ENTER();
   constexpr int R = 4;
   __shared__ float smem[R][4];
-  const int64_t r0 = (int64_t)blockIdx.x * R, b = blockIdx.y, kb = wide / nb;
+  const int64_t r0 = (int64_t)TF_VBID.x * R, b = TF_VBID.y, kb = wide / nb;
   const int t = threadIdx.x, lane = t & 31, warp = t >> 5, c = t & 15, m0 = (t >> 4) & 7;
   float acc[R][3] = {}, ss[R] = {};
   for (int64_t step = 0; step < kb / 128; ++step) {
@@ -58,9 +63,10 @@ extern "C" __global__ void __launch_bounds__(128)
 // The same for decode windows (16 blocks a row): 8 steps of 128 at once, a 128-thread group each; same ops, same order.
 extern "C" __global__ void __launch_bounds__(1024)
     tf_glm_hc_partial8(const __nv_bfloat16* x, const __nv_bfloat16* fn, float* part, int64_t wide, int nb) {
+    TF_VBLOCK_ENTER();
   __shared__ float dots[8][24];
   __shared__ float smem[4];
-  const int64_t r = blockIdx.x, b = blockIdx.y, kb = wide / nb;
+  const int64_t r = TF_VBID.x, b = TF_VBID.y, kb = wide / nb;
   const int grp = threadIdx.x >> 7, t = threadIdx.x & 127, c = t & 15, m0 = (t >> 4) & 7;
   const int steps = static_cast<int>(kb / 128);
   if (grp < steps) {
@@ -121,10 +127,11 @@ extern "C" __global__ void __launch_bounds__(256)
     tf_glm_hc_finish(const __nv_bfloat16* x, const float* part, const float* base, const float* scale,
                      const __nv_bfloat16* nw, __nv_bfloat16* out, float* xs, float* post, float* comb, float eps,
                      float hc_eps, int nb, int iters) {
+    TF_VBLOCK_ENTER();
   constexpr int D = 4096, S = 4;
   __shared__ float smem[8];
   __shared__ float pre[4];
-  const int64_t r = blockIdx.x;
+  const int64_t r = TF_VBID.x;
   const int t = threadIdx.x, lane = t & 31;
   // A thread's 8 inputs of each half are contiguous: one 16-byte load per stream and half, issued before Sinkhorn.
   const __nv_bfloat16* row = x + r * S * D;

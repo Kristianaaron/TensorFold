@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! #741's Grouped interface on #837's pointer tables and independent per-expert projection widths.
 const std = @import("std");
 const ex = @import("exl3_experts.zig");
@@ -90,6 +92,7 @@ pub const Grouped = struct {
         for ([_]usize{ k, n, pairs, sk, 64, in.slots, items, mats, if (up) w.gu_stride else 0, 1 }) |v|
             args.add(@as(i32, @intCast(v)));
         args.add(skip);
+        args.add(@as(i32, ex.l2_depth));
         try launch.launch(g.kernels.grouped[@backingInt(w.codebook)], .{ .grid = .{ .x = @intCast(items), .y = @intCast(n / 128), .z = @intCast(mats * sk * 4) }, .block = .{ .x = 128 } }, s, &args);
         var finish: launch.Args = .{};
         finish.add(a);

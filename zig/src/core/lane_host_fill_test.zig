@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! The order a lane host fills waiting prompts in: foreground first, then the shortest (lane_host_fill.zig).
 const std = @import("std");
 const lanes = @import("lanes");
@@ -170,4 +172,5 @@ test "status reads a filling prompt's tokens while its pass runs, and none once 
 
 test {
     _ = @import("lane_host_fill_aging_test.zig");
+    _ = @import("lane_host_fill_progress_test.zig");
 }

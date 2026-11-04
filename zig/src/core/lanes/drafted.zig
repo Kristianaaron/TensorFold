@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! A target backend with an external drafter in front; deinit releases no stream, so callers release first.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -64,6 +66,15 @@ pub const Drafted = struct {
         m.draft_streams = d.batched;
         m.draft_probabilities = false;
         m.head_trees = d.trees;
+        m.copy_first = d.copy_first;
+        m.hold_costs = d.hold_costs;
+        if (d.chances and x.drafter.vtable.chances != null) {
+            // Upstream TensorFold #1381: price this drafter's verify rows by its own chain chances.
+            m.draft_probabilities = d.confidence_floor == null;
+            m.draft_confidence = d.confidence_floor;
+            m.granted_depth = d.confidence_floor == null;
+            m.draft_slack = d.slack;
+        }
         if (d.tree_nodes > 0) {
             // the drafter grows its own trees, best first, and prices their nodes
             m.drafts = @min(d.tree_nodes, if (target.exact_width > 1) target.exact_width - 1 else 0);

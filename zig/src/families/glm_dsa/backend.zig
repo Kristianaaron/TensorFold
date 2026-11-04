@@ -110,6 +110,7 @@ pub const Backend = struct {
         var mark: usize = 0;
         while (at < prompt.len) {
             if (s.isCancelled()) return error.Cancelled;
+            if (s.yields()) return error.Yielded;
             while (next < s.chunks.len and s.chunks[next] <= at) next += 1;
             while (mark < s.reuse.marks.len and s.reuse.marks[mark] <= at) mark += 1;
             var end: u32 = if (next < s.chunks.len) s.chunks[next] else @intCast(prompt.len);

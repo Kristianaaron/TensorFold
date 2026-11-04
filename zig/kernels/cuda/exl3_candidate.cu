@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
+#include "tf_vblock.cuh"
 // EXL3 projections on CUDA: trellis tiles as stored ([K/16, N/16, 16 bits] int16), core/exl3_format.zig's codebooks.
 #include "exl3_candidate.cuh"
 
@@ -14,12 +17,12 @@ __device__ __forceinline__ void tf_exl3_tail(unsigned rows, const __half* svh, f
                                              unsigned sg, unsigned lane, unsigned tid, float* zs) {
   __shared__ unsigned last;
   if (m.split > 1) {
-    float* part = ws + ((uint64_t)ob * m.split + blockIdx.y) * (16 * 128);
+    float* part = ws + ((uint64_t)ob * m.split + TF_VBID.y) * (16 * 128);
     for (unsigned i = tid; i < rows * 128; i += 256) part[i] = zs[i];
     __threadfence();
-    __syncthreads();
+    TF_TASK_SYNC();
     if (tid == 0) last = atomicAdd(tickets + ob, 1u) == m.split - 1;
-    __syncthreads();
+    TF_TASK_SYNC();
     if (!last) return;
     __threadfence();
     const float* parts = ws + (uint64_t)ob * m.split * (16 * 128);
@@ -29,7 +32,7 @@ __device__ __forceinline__ void tf_exl3_tail(unsigned rows, const __half* svh, f
       zs[i] = v;
     }
     if (tid == 0) tickets[ob] = 0;
-    __syncthreads();
+    TF_TASK_SYNC();
   }
   for (unsigned i = sg; i < rows; i += 8) {
     float v[4];
@@ -46,7 +49,8 @@ __device__ __forceinline__ void tf_exl3_tail(unsigned rows, const __half* svh, f
 
 // Qualification: every state's weight under codebook c, for the host to compare with exl3_format.codebookValue.
 extern "C" __global__ void tf_exl3_codebook(unsigned c, __half* out) {
-  const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    TF_VBLOCK_ENTER();
+  const unsigned i = TF_VBID.x * TF_VBDIM.x + threadIdx.x;
   if (i >= 65536) return;
   out[i] = c == 2 ? tf_exl3_value<2>(i) : c == 1 ? tf_exl3_value<1>(i) : tf_exl3_value<0>(i);
 }
@@ -60,7 +64,8 @@ __device__ __forceinline__ void tf_exl3_unpack_tile(const uint32_t* tile, unsign
 
 // Qualification: W_q [K, N] fp16 in the rotated domain, a warp per tile, as exl3_format.unpack places it.
 extern "C" __global__ void __launch_bounds__(32) tf_exl3_unpack(const uint8_t* T, TfExl3Matrix m, unsigned c, __half* out) {
-  const unsigned lane = threadIdx.x, tn = blockIdx.x, tk = blockIdx.y;
+    TF_VBLOCK_ENTER();
+  const unsigned lane = threadIdx.x, tn = TF_VBID.x, tk = TF_VBID.y;
   const uint32_t* tile = reinterpret_cast<const uint32_t*>(T + ((uint64_t)tk * m.tiles_n + tn) * 32 * m.bits);
   __half w[8];
   switch (m.bits) {
@@ -82,7 +87,8 @@ extern "C" __global__ void __launch_bounds__(32) tf_exl3_unpack(const uint8_t* T
 // Prompt rows (docs/recipes/exl3.md, Prompts): (x * suh) H times 2^-4 rounded once to fp16; 2^-3 goes on the output.
 extern "C" __global__ void __launch_bounds__(32) tf_exl3_rotate_h(const __nv_bfloat16* X, unsigned x_stride, const __half* suh,
                                                                   __half* R, unsigned r_stride) {
-  const unsigned lane = threadIdx.x, row = blockIdx.y, base = blockIdx.x * 128;
+    TF_VBLOCK_ENTER();
+  const unsigned lane = threadIdx.x, row = TF_VBID.y, base = TF_VBID.x * 128;
   float v[4];
   for (int q = 0; q < 4; ++q) {
     const unsigned c = base + lane + 32 * q;
@@ -97,8 +103,8 @@ template <int K, int C>
 __device__ __forceinline__ void tf_exl3_prompt_job(const __half* Xh, unsigned rows, const uint8_t* T, const __half* svh,
                                                    const TfExl3Matrix m, uint8_t* Y, unsigned y_f32, float* buf) {
   constexpr unsigned TB = 32 * K;
-  const unsigned tid = threadIdx.x, sg = tid / 32, lane = tid % 32, g8 = lane / 4, t4 = lane % 4, ob = blockIdx.x;
-  const unsigned row0 = blockIdx.y * 64, kb = m.k / 128;
+  const unsigned tid = threadIdx.x, sg = tid / 32, lane = tid % 32, g8 = lane / 4, t4 = lane % 4, ob = TF_VBID.x;
+  const unsigned row0 = TF_VBID.y * 64, kb = m.k / 128;
   __half* xs = reinterpret_cast<__half*>(buf);
   const uint64_t row_bytes = (uint64_t)m.tiles_n * TB;
   const uint8_t* col = T + (uint64_t)(8 * ob + sg) * TB;
@@ -114,7 +120,7 @@ __device__ __forceinline__ void tf_exl3_prompt_job(const __half* Xh, unsigned ro
       const uint4 v = row0 + r < rows ? *reinterpret_cast<const uint4*>(Xh + (uint64_t)(row0 + r) * m.k + ib * 128 + c) : make_uint4(0, 0, 0, 0);
       *reinterpret_cast<uint4*>(xs + r * TF_EXL3_XS + c) = v;
     }
-    __syncthreads();
+    TF_TASK_SYNC();
     for (unsigned r = 0; r < 8; ++r) {
       const uint4 now = next;
       next = tf_exl3_words<K>(reinterpret_cast<const uint32_t*>(col + (uint64_t)(r < 7 ? 8 * ib + r + 1 : (ib + 1 < kb ? 8 * ib + 8 : 8 * ib + 7)) * row_bytes), lane);
@@ -130,7 +136,7 @@ __device__ __forceinline__ void tf_exl3_prompt_job(const __half* Xh, unsigned ro
         tf_exl3_mma(acc[i][1], a, b[1][0], b[1][1]);
       }
     }
-    __syncthreads();
+    TF_TASK_SYNC();
   }
   // the sums by row into shared memory (over the rows' halves), then a warp a row: transform, svh, 2^-3
 #pragma unroll
@@ -141,7 +147,7 @@ __device__ __forceinline__ void tf_exl3_prompt_job(const __half* Xh, unsigned ro
         buf[(16 * i + g8 + 8 * h) * 128 + c] = acc[i][n][2 * h];
         buf[(16 * i + g8 + 8 * h) * 128 + c + 1] = acc[i][n][2 * h + 1];
       }
-  __syncthreads();
+  TF_TASK_SYNC();
   for (unsigned i = sg; i < 64 && row0 + i < rows; i += 8) {
     float v[4];
     for (int q = 0; q < 4; ++q) v[q] = buf[i * 128 + lane + 32 * q];
@@ -158,7 +164,8 @@ __device__ __forceinline__ void tf_exl3_prompt_job(const __half* Xh, unsigned ro
   extern "C" __global__ void __launch_bounds__(256) tf_exl3_prompt_##C(const __half* Xh, unsigned rows,              \
                                                                       const uint8_t* T, const __half* svh,          \
                                                                       const TfExl3Matrix m, uint8_t* Y,              \
-                                                                      unsigned y_f32) {                              \
+                                                                      unsigned y_f32) { \
+    TF_VBLOCK_ENTER();                              \
     __shared__ __align__(16) float buf[64 * 128];                                                                    \
     switch (m.bits) {                                                                                                \
       case 1: tf_exl3_prompt_job<1, C>(Xh, rows, T, svh, m, Y, y_f32, buf); break;                                   \
@@ -180,7 +187,8 @@ TF_EXL3_PROMPT(2)
 // Decode rows for the tensor units: tf_exl3_rotate_h's values, each 128-block in fragment order (t4, r, 4 halves).
 extern "C" __global__ void __launch_bounds__(32) tf_exl3_rotate_f(const __nv_bfloat16* X, unsigned x_stride, const __half* suh,
                                                                   __half* R, unsigned r_stride) {
-  const unsigned lane = threadIdx.x, row = blockIdx.y, base = blockIdx.x * 128;
+    TF_VBLOCK_ENTER();
+  const unsigned lane = threadIdx.x, row = TF_VBID.y, base = TF_VBID.x * 128;
   float v[4];
   for (int q = 0; q < 4; ++q) {
     const unsigned c = base + lane + 32 * q;
@@ -199,9 +207,9 @@ template <int K, int C>
 __device__ __forceinline__ void tf_exl3_tc_job(const __half* Xh, const uint8_t* T, const __half* svh, const TfExl3Rows a,
                                                const TfExl3Matrix m, uint8_t* Y, float* ws, unsigned* tickets, float* zs) {
   constexpr unsigned TB = 32 * K;
-  const unsigned tid = threadIdx.x, sg = tid / 32, lane = tid % 32, g8 = lane / 4, t4 = lane % 4, ob = blockIdx.x;
+  const unsigned tid = threadIdx.x, sg = tid / 32, lane = tid % 32, g8 = lane / 4, t4 = lane % 4, ob = TF_VBID.x;
   const unsigned rows = a.rows < 16 ? a.rows : 16, kb = m.k / 128, per = (kb + m.split - 1) / m.split;
-  const unsigned b0 = blockIdx.y * per, b1 = b0 + per < kb ? b0 + per : kb;
+  const unsigned b0 = TF_VBID.y * per, b1 = b0 + per < kb ? b0 + per : kb;
   const uint64_t row_bytes = (uint64_t)m.tiles_n * TB;
   const uint8_t* col = T + (uint64_t)(8 * ob + sg) * TB;
   const bool lo = g8 < rows, hi = g8 + 8 < rows;
@@ -246,7 +254,7 @@ __device__ __forceinline__ void tf_exl3_tc_job(const __half* Xh, const uint8_t* 
         zs[row * 128 + c + 1] = acc[n][2 * h + 1];
       }
     }
-  __syncthreads();
+  TF_TASK_SYNC();
   tf_exl3_tail(rows, svh, 0.125f, a, m, Y, ws, tickets, ob, sg, lane, tid, zs);
 }
 
@@ -255,7 +263,8 @@ __device__ __forceinline__ void tf_exl3_tc_job(const __half* Xh, const uint8_t* 
 #define TF_EXL3_TC(C)                                                                                                \
   extern "C" __global__ void __launch_bounds__(256) tf_exl3_tc_##C(const __half* Xh, const uint8_t* T, const __half* svh, \
                                                                   const TfExl3Rows a, const TfExl3Matrix m, uint8_t* Y, \
-                                                                  float* ws, unsigned* tickets) {                   \
+                                                                  float* ws, unsigned* tickets) { \
+    TF_VBLOCK_ENTER();                   \
     __shared__ __align__(16) float zs[16 * 128];                                                                     \
     switch (m.bits) {                                                                                                \
       TF_EXL3_TC_CASE(1, C) TF_EXL3_TC_CASE(2, C) TF_EXL3_TC_CASE(3, C) TF_EXL3_TC_CASE(4, C)                        \

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! The lane host under a family round planner: prompt pieces, failed piece runs, learning, refusal.
 const std = @import("std");
 const lanes = @import("lanes");
@@ -11,6 +13,10 @@ const Request = api.Request;
 const Engine = api.Engine;
 const FakeLearner = @import("lane_host_test.zig").FakeLearner;
 const LearnBox = @import("lane_host_test.zig").LearnBox;
+
+test {
+    _ = @import("lane_prefill_first.zig");
+}
 
 test "a round planner: prompts in pieces between the other streams' decode rounds, queued admissions, the same tokens" {
     const gpa = std.testing.allocator;

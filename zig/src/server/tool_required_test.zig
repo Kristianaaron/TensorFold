@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! Required tools through both request parsers, the real feature gate and the shared constrained lane core.
 const std = @import("std");
 const api = @import("engine_api");
@@ -14,7 +16,7 @@ const a = std.testing.allocator;
 const specs = "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}},\"required\":[\"q\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"now\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}]";
 
 const Text = struct {
-    form: enum { xml, json, gemma, unknown } = .json,
+    form: enum { xml, json, gemma, glm, unknown } = .json,
     fn text(t: *Text) mt.Text {
         return .{ .ctx = t, .vtable = &.{ .encode = encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocab, .eos_ids = eos, .render = render, .template_source = source } };
     }
@@ -49,6 +51,7 @@ const Text = struct {
             .xml => "<tool_call><function=tfprobe_fn><parameter=tfprobe_k>v</parameter></function></tool_call>",
             .json => "<tool_call>{\"name\":\"tfprobe_fn\",\"arguments\":{\"tfprobe_k\":\"v\"}}</tool_call>",
             .gemma => "<|tool_call>call:tfprobe_fn{tfprobe_k:<|\"|>v<|\"|>}<tool_call|>",
+            .glm => "<tool_call>tfprobe_fn<arg_key>tfprobe_k</arg_key><arg_value>v</arg_value></tool_call>",
             .unknown => "prompt",
         });
     }
@@ -114,6 +117,37 @@ test "required tools: unsupported required tools name the actual backend before 
     srv.config.identity.backend = "cuda";
     try std.testing.expectError(error.Refused, srv.checkFeatures(&cx, f, true, false, &.{1}, offered, &request));
     try std.testing.expect(std.mem.indexOf(u8, cx.message, "cuda") != null);
+}
+
+test "ablate is opt-in per server flag and requires a loaded vector file" {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const g = arena.allocator();
+    var text: Text = .{};
+    var stub: Stub = .{};
+    const srv = try Server.init(a, std.testing.io, stub.engine(), text.text(), .{ .served_name = "m", .model_ids = &.{"m"} }, null);
+    defer srv.deinit();
+    var request: api.Request = .{ .prompt = &.{1}, .max_tokens = 1 };
+    var cx: errors.Cx = .{ .a = g };
+    const on = try value(g, "{\"ablate\":true}");
+    try std.testing.expectError(error.Refused, srv.checkFeatures(&cx, on, false, false, &.{1}, &.{}, &request));
+    try std.testing.expectEqual(@as(u16, 400), cx.status());
+    try std.testing.expectEqualStrings("ablate is not allowed by this server: start it with --allow-ablate", cx.message);
+    srv.config.allow_ablate = true;
+    var cx2: errors.Cx = .{ .a = g };
+    try std.testing.expectError(error.Refused, srv.checkFeatures(&cx2, on, false, false, &.{1}, &.{}, &request));
+    try std.testing.expectEqualStrings("this engine has no ablation vectors loaded", cx2.message);
+    srv.info.ablate = true;
+    var cx3: errors.Cx = .{ .a = g };
+    try srv.checkFeatures(&cx3, on, false, false, &.{1}, &.{}, &request);
+    try std.testing.expect(request.ablate);
+    var cx4: errors.Cx = .{ .a = g };
+    try std.testing.expectError(error.Refused, srv.checkFeatures(&cx4, try value(g, "{\"ablate\":1}"), false, false, &.{1}, &.{}, &request));
+    try std.testing.expectEqualStrings("ablate must be a boolean", cx4.message);
+    request.ablate = false;
+    var cx5: errors.Cx = .{ .a = g };
+    try srv.checkFeatures(&cx5, try value(g, "{\"ablate\":false}"), false, false, &.{1}, &.{}, &request);
+    try std.testing.expect(!request.ablate);
 }
 
 test "required tools: Gemma and unknown templates can constrain required calls on a grammar backend" {
@@ -246,6 +280,57 @@ test "required tools: Gemma constrained JSON arguments preserve punctuation insi
     try std.testing.expect(result.calls != null);
     const arguments = try value(g, result.calls.?[0].get("function").?.strField("arguments").?);
     try std.testing.expectEqualStrings("a,b:c {d:e}", arguments.strField("q").?);
+}
+
+test "auto tools: a strict tool gets the optional-call grammar, other auto requests none" {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const g = arena.allocator();
+    var stub: Stub = .{};
+    var compile: Compile = .{};
+    var compiler = compile.compiler();
+    const strict_specs = "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"strict\":true,\"parameters\":{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}},\"required\":[\"q\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"now\"}}]";
+    for ([_]@FieldType(Text, "form"){ .xml, .json, .gemma, .glm, .unknown }) |form| {
+        var text: Text = .{ .form = form };
+        const srv = try Server.init(a, std.testing.io, stub.engine(), text.text(), .{ .served_name = "m", .model_ids = &.{"m"} }, null);
+        defer srv.deinit();
+        srv.info.structures = true;
+        srv.grammars = &compiler;
+        var cx: errors.Cx = .{ .a = g };
+        var request: api.Request = .{ .prompt = &.{1}, .max_tokens = 100 };
+        try srv.checkFeatures(&cx, try value(g, "{}"), true, false, &.{1}, (try value(g, strict_specs)).array, &request);
+        const format = (try value(g, request.structure.?.text)).get("format").?;
+        try std.testing.expectEqualStrings("triggered_tags", format.strField("type").?);
+        try std.testing.expect(std.mem.indexOf(u8, request.structure.?.text, "\"required\":[\"q\"]") != null);
+        try std.testing.expect(!format.get("stop_after_first").?.bool);
+        var single: api.Request = .{ .prompt = &.{1}, .max_tokens = 100 };
+        try srv.checkFeatures(&cx, try value(g, "{\"tool_call_single\":true}"), true, false, &.{1}, (try value(g, strict_specs)).array, &single);
+        try std.testing.expect((try value(g, single.structure.?.text)).get("format").?.get("stop_after_first").?.bool);
+        var required: api.Request = .{ .prompt = &.{1}, .max_tokens = 100 };
+        try srv.checkFeatures(&cx, try value(g, "{\"tool_call_required\":true}"), true, false, &.{1}, (try value(g, strict_specs)).array, &required);
+        try std.testing.expectEqualStrings("sequence", (try value(g, required.structure.?.text)).get("format").?.strField("type").?);
+        var plain: api.Request = .{ .prompt = &.{1}, .max_tokens = 100 };
+        try srv.checkFeatures(&cx, try value(g, "{}"), true, false, &.{1}, (try value(g, specs)).array, &plain);
+        try std.testing.expect(plain.structure == null);
+    }
+}
+
+test "auto tools: no grammar library leaves strict tools unconstrained" {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const g = arena.allocator();
+    var text: Text = .{ .form = .glm };
+    var stub: Stub = .{};
+    const srv = try Server.init(a, std.testing.io, stub.engine(), text.text(), .{ .served_name = "m", .model_ids = &.{"m"} }, null);
+    defer srv.deinit();
+    srv.info.structures = true;
+    srv.grammars = null;
+    srv.grammar_problem = "x";
+    var cx: errors.Cx = .{ .a = g };
+    var request: api.Request = .{ .prompt = &.{1}, .max_tokens = 100 };
+    const strict_specs = "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"strict\":true,\"parameters\":{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}},\"required\":[\"q\"]}}}]";
+    try srv.checkFeatures(&cx, try value(g, "{}"), true, false, &.{1}, (try value(g, strict_specs)).array, &request);
+    try std.testing.expect(request.structure == null);
 }
 
 test "qwen27 tool calls: required and named calls use the masked lane fake through both routes" {

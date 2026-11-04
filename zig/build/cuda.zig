@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! The CUDA half of the root build: kernel fatbins with their Python extensions' nvcc flags, the runtime, the CLI.
 const std = @import("std");
 const exlr8_build = @import("exlr8.zig");
@@ -96,6 +98,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     cli.addImport("checkpoint_cli", checkpointCli(b, target, optimize, strip, native.engines, mods.core));
     b.installArtifact(b.addExecutable(.{ .name = "tensorfold", .root_module = cli }));
     const runner = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
+    const glm_cuda = glmCuda(b, target, optimize, cuda, mods.core, mods.lanes, mods.heat);
     runner.addImport("cuda", cuda);
     runner.addImport("gpu_memory", @import("gpu_memory.zig").module(b, target));
     runner.addImport("core", mods.core);
@@ -105,6 +108,77 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     runner.addImport("flashnext", flashnextModule(b, target, optimize, cuda, mods.core, mods.lanes, mods.qwen_vision));
     runner.addImport("lfm2", lfm2Module(b, target, optimize, cuda, mods.core));
     runner.addImport("radio", mods.radio);
+    const glm53_mk_launch = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm_dsa/cuda/megakernel/launch.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "cuda", .module = cuda }} });
+    const glm53_sampler = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm_dsa/cuda/sampler.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "cuda", .module = cuda }} });
+    const glm53_head_tests = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm53_head_tests.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    glm53_head_tests.addImport("cuda", cuda);
+    glm53_head_tests.addImport("sampler.zig", glm53_sampler);
+    runner.addImport("glm53_head_tests", glm53_head_tests);
+    runner.addImport("glm53_mk_head_tests", b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm53_mk_head_tests.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "mk_launch", .module = glm53_mk_launch }, .{ .name = "sampler.zig", .module = glm53_sampler } } }));
+    const glm53_index = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm_dsa/cuda/index.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    glm53_index.addImport("cuda", cuda);
+    glm53_index.addImport("glm_config", b.createModule(.{ .root_source_file = b.path("zig/src/families/glm_dsa/config.zig"), .target = target, .optimize = optimize }));
+    const glm53_index_tests = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm53_index_tests.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    glm53_index_tests.addImport("cuda", cuda);
+    glm53_index_tests.addImport("index.zig", glm53_index);
+    runner.addImport("glm53_index_tests", glm53_index_tests);
+    const glm53_mla_types = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm_dsa/cuda/types.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "cuda_memory", .module = cuda }} });
+    const glm53_mla_api = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm_dsa/cuda/mla.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "types", .module = glm53_mla_types } } });
+    const glm53_mla_tests = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm53_mla_tests.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    glm53_mla_tests.addImport("cuda", cuda);
+    glm53_mla_tests.addImport("mla.zig", glm53_mla_api);
+    glm53_mla_tests.addImport("types", glm53_mla_types);
+    runner.addImport("glm53_mla_tests", glm53_mla_tests);
+    const glm53_prompt_mla_tests = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm53_prompt_mla_tests.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    glm53_prompt_mla_tests.addImport("cuda", cuda);
+    glm53_prompt_mla_tests.addImport("mla.zig", glm53_mla_api);
+    runner.addImport("glm53_prompt_mla_tests", glm53_prompt_mla_tests);
+    const glm53_smla_p_tests = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm53_smla_p_tests.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    glm53_smla_p_tests.addImport("cuda", cuda);
+    glm53_smla_p_tests.addImport("mla.zig", glm53_mla_api);
+    glm53_smla_p_tests.addImport("types", glm53_mla_types);
+    runner.addImport("glm53_smla_p_tests", glm53_smla_p_tests);
+    const glm53_dflash_chunked_load_tests = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm53_dflash_chunked_load.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    glm53_dflash_chunked_load_tests.addImport("cuda", cuda);
+    glm53_dflash_chunked_load_tests.addImport("glm_cuda", glm_cuda);
+    runner.addImport("glm53_dflash_chunked_load", glm53_dflash_chunked_load_tests);
+    const glm_dspark_kernels_tests = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_dspark_kernels_tests.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    glm_dspark_kernels_tests.addImport("cuda", cuda);
+    runner.addImport("glm_dspark_kernels_tests", glm_dspark_kernels_tests);
+    const glm53_mlp_api = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm_dsa/cuda/mlp.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "cuda", .module = cuda }} });
+    const glm53_moe_api = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm_dsa/cuda/moe.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    glm53_moe_api.addImport("cuda", cuda);
+    glm53_moe_api.addImport("mlp.zig", glm53_mlp_api);
+    const glm53_moe_tests = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm53_moe_tests.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    glm53_moe_tests.addImport("cuda", cuda);
+    glm53_moe_tests.addImport("moe.zig", glm53_moe_api);
+    glm53_moe_tests.addImport("mlp.zig", glm53_mlp_api);
+    runner.addImport("glm53_moe_tests", glm53_moe_tests);
+    runner.addImport("moe.zig", glm53_moe_api);
+    const glm53_fuse_tests = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm53_fuse_tests.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    glm53_fuse_tests.addImport("cuda", cuda);
+    runner.addImport("glm53_fuse_tests", glm53_fuse_tests);
+    const glm53_pre_group_tests = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm53_pre_group_tests.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    glm53_pre_group_tests.addImport("cuda", cuda);
+    runner.addImport("glm53_pre_group_tests", glm53_pre_group_tests);
+    const glm53_x3e4_tests = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm53_x3e4_tests.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    glm53_x3e4_tests.addImport("cuda", cuda);
+    glm53_x3e4_tests.addImport("core", mods.core);
+    runner.addImport("glm53_x3e4_tests", glm53_x3e4_tests);
+    const glm53_mk_tests = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm53_mk_tests.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    glm53_mk_tests.addImport("cuda", cuda);
+    glm53_mk_tests.addImport("mk_launch", glm53_mk_launch);
+    runner.addImport("glm53_mk_tests", glm53_mk_tests);
+    runner.addImport("glm53_mk_moe_tests", b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm53_mk_moe_tests.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "mk_launch", .module = glm53_mk_launch } } }));
+    runner.addImport("glm53_mk_attn_tests", b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm53_mk_attn_gpu_tests.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "mk_launch", .module = glm53_mk_launch } } }));
+    runner.addImport("glm53_mk_index_tests", b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm53_mk_index_tests.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "mk_launch", .module = glm53_mk_launch } } }));
+    const glm53_mk_qmmf_tests = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm53_mk_qmmf_tests.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    glm53_mk_qmmf_tests.addImport("cuda", cuda);
+    glm53_mk_qmmf_tests.addImport("mk_launch", glm53_mk_launch);
+    glm53_mk_qmmf_tests.addImport("bind_qmmf", b.createModule(.{ .root_source_file = b.path("zig/src/families/glm_dsa/cuda/megakernel/bind_qmmf.zig"), .target = target, .optimize = optimize }));
+    runner.addImport("glm53_mk_qmmf_tests", glm53_mk_qmmf_tests);
+    const glm53_mk_defer = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm_dsa/cuda/megakernel/defer.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "mk_launch", .module = glm53_mk_launch } } });
+    runner.addImport("glm53_mk_defer_tests", b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm53_mk_defer_tests.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "mk_defer", .module = glm53_mk_defer } } }));
     const exlr8 = exlr8_build.coreAlias(b, target, optimize, mods.core);
     runner.addImport("exlr8", exlr8);
     const exlr8_tests = exlr8_build.testModules(b, target, optimize, exlr8);
@@ -112,11 +186,24 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     runner.addImport("exlr8_frozen", b.createModule(.{ .root_source_file = b.path("zig/tests/fixtures/exlr8/frozen.zig"), .target = target, .optimize = optimize }));
     runner.addImport("exlr8_frozen_dense", b.createModule(.{ .root_source_file = b.path("zig/tests/fixtures/exlr8/frozen_dense.zig"), .target = target, .optimize = optimize }));
     for (exlr8_build.denseModules(b, target, optimize, exlr8, exlr8_tests[0])) |m| runner.addImport(m.name, m.module);
-    const glm_cuda = glmCuda(b, target, optimize, cuda, mods.core, mods.lanes, mods.heat);
     runner.addImport("glm_cuda", glm_cuda);
     runner.addImport("kolibri1", kolibri1Module(b, target, optimize, cuda, mods.core, mods.lanes));
     const runner_exe = b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner });
     b.installArtifact(runner_exe);
+    const glm53_mma = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm53_mma_peak.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
+    glm53_mma.addImport("cuda", cuda);
+    const glm53_fp8_mma = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm_dsa/cuda/fp8_mma.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    glm53_fp8_mma.addImport("cuda", cuda);
+    glm53_mma.addImport("fp8_mma", glm53_fp8_mma);
+    const glm53_cutlass = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm_dsa/cuda/cutlass.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    glm53_cutlass.addImport("cuda", cuda);
+    const glm53_fp8_backend_probe = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm53_fp8_backend_probe.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "glm53_cutlass", .module = glm53_cutlass }, .{ .name = "glm53_fp8", .module = glm53_fp8_mma } } });
+    runner.addImport("glm53_fp8_backend_probe", glm53_fp8_backend_probe);
+    glm53_mma.addImport("fp8_backend_probe", glm53_fp8_backend_probe);
+    const glm53_mma_exe = b.addExecutable(.{ .name = "glm53_mma_peak", .root_module = glm53_mma });
+    const glm53_mma_install = b.addInstallArtifact(glm53_mma_exe, .{});
+    b.step("glm53-mma-peak", "Standalone GLM-5.3 CUDA W8A8 throughput and error probe").dependOn(&glm53_mma_install.step);
+    @import("glm53_wp9.zig").bringup(b, target, optimize, cuda, mods.core, glm_cuda); // tf-glm53-bringup (WP9 GPU driver)
     // tf-tp-watch-check: the ranks' lines with no GPU or NCCL; a failing or dying rank stops every rank
     b.installArtifact(b.addExecutable(.{ .name = "tf-tp-watch-check", .root_module = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/tp_watch_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{.{ .name = "cuda", .module = cuda }} }) }));
     @import("living_dense.zig").target(b, target, optimize, cuda, mods.qwen35);
@@ -155,6 +242,106 @@ fn glmCuda(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     return m;
 }
 
+/// Full GLM-5.3 DSA CUDA family over the runtime and lane core.
+fn glm53Module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, glm: *std.Build.Module) *std.Build.Module {
+    const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm_dsa/cuda/native.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    const dir = "zig/src/families/glm_dsa/cuda/";
+    const module = struct {
+        fn create(bld: *std.Build, t: std.Build.ResolvedTarget, path: []const u8) *std.Build.Module {
+            return bld.createModule(.{ .root_source_file = bld.path(path), .target = t, .optimize = .Debug, .link_libc = true });
+        }
+    }.create;
+    const cfg = module(b, target, "zig/src/families/glm_dsa/config.zig");
+    const types = module(b, target, dir ++ "types.zig");
+    const follow = module(b, target, dir ++ "follow.zig");
+    const ranks = module(b, target, dir ++ "ranks.zig");
+    const kvsave = module(b, target, dir ++ "kvsave.zig");
+    const prefix_cache = module(b, target, dir ++ "prefix_cache.zig");
+    const prefix_snap = module(b, target, dir ++ "prefix_snap.zig");
+    const backend = module(b, target, dir ++ "backend.zig");
+    const prewarm = module(b, target, dir ++ "prewarm.zig");
+    const weights = module(b, target, dir ++ "weights.zig");
+    const state = module(b, target, dir ++ "state.zig");
+    const forward = module(b, target, dir ++ "forward.zig");
+    const taps = module(b, target, dir ++ "taps.zig");
+    taps.addImport("cuda", cuda);
+    forward.addImport("taps.zig", taps);
+    const geometry = module(b, target, "zig/src/families/glm_dsa/cuda/dflash_geometry.zig");
+    const drafts = module(b, target, dir ++ "drafts.zig");
+    drafts.addImport("cuda", cuda);
+    drafts.addImport("geometry", geometry);
+    drafts.addImport("glm", glm);
+    const ablate = module(b, target, dir ++ "ablate.zig");
+    ablate.addImport("cuda", cuda);
+    ablate.addImport("core", core);
+    const prefill_gemm = module(b, target, dir ++ "prefill_gemm.zig");
+    prefill_gemm.addImport("cuda", cuda);
+    forward.addImport("prefill_gemm", prefill_gemm);
+    const engine = module(b, target, dir ++ "engine.zig");
+    const sampler = module(b, target, dir ++ "sampler.zig");
+    const mla = module(b, target, dir ++ "mla.zig");
+    const index = module(b, target, dir ++ "index.zig");
+    const moe = module(b, target, dir ++ "moe.zig");
+    const mlp = module(b, target, dir ++ "mlp.zig");
+    const experts = module(b, target, dir ++ "experts.zig");
+    const share = module(b, target, dir ++ "share.zig");
+    const uma = module(b, target, dir ++ "uma.zig");
+    prefix_cache.addImport("cuda", cuda);
+    prefix_cache.addImport("uma", uma);
+    prefix_cache.addImport("kvsave", kvsave);
+    prefix_snap.addImport("cuda", cuda);
+    prefix_snap.addImport("uma", uma);
+    prefix_snap.addImport("kvsave", kvsave);
+    prefix_snap.addImport("engine", engine);
+    prefix_snap.addImport("prefix_cache.zig", prefix_cache);
+    backend.addImport("lanes", lanes);
+    backend.addImport("glm_sampler", sampler);
+    backend.addImport("glm_follow", follow);
+    backend.addImport("prefix_cache", prefix_cache);
+    backend.addImport("engine", engine);
+    types.addImport("cuda_memory", cuda);
+    follow.addImport("cuda", cuda);
+    follow.addImport("ranks.zig", ranks);
+    mla.addImport("cuda", cuda);
+    mla.addImport("types", types);
+    mla.addCSourceFile(.{ .file = b.path("zig/kernels/cuda/glm_dsa/mla_index_host.c"), .flags = &.{} });
+    state.addImport("types", types);
+    state.addImport("mla.zig", mla);
+    state.addImport("index.zig", index);
+    state.addImport("sampler.zig", sampler);
+    share.addImport("config", cfg);
+    index.addImport("glm_config", cfg);
+    inline for (.{ weights, state, forward, engine, sampler, index, moe, mlp, experts, uma }) |part| part.addImport("cuda", cuda);
+    moe.addImport("mlp.zig", mlp);
+    experts.addImport("core", core);
+    weights.addImport("core", core);
+    weights.addImport("glm_config", cfg);
+    weights.addImport("share.zig", share);
+    weights.addImport("experts.zig", experts);
+    weights.addImport("mlp.zig", mlp);
+    weights.addImport("state.zig", state);
+    weights.addImport("uma.zig", uma);
+    forward.addImport("types", types);
+    inline for (.{ .{ "index.zig", index }, .{ "mla.zig", mla }, .{ "moe.zig", moe }, .{ "mlp.zig", mlp }, .{ "experts.zig", experts }, .{ "sampler.zig", sampler }, .{ "weights.zig", weights }, .{ "state.zig", state }, .{ "glm_config", cfg }, .{ "ablate", ablate } }) |imp| forward.addImport(imp[0], imp[1]);
+    engine.addImport("forward.zig", forward);
+    engine.addImport("ablate", ablate);
+    engine.addImport("sampler.zig", sampler);
+    engine.addImport("state.zig", state);
+    engine.addImport("uma.zig", uma);
+    engine.addImport("weights.zig", weights);
+    // MK8 deferred launch (TF_GLM53_MK=1): the decode sink over the persistent scheduler's host side.
+    const mk_launch = module(b, target, dir ++ "megakernel/launch.zig");
+    mk_launch.addImport("cuda", cuda);
+    const mk_defer = module(b, target, dir ++ "megakernel/defer.zig");
+    mk_defer.addImport("cuda", cuda);
+    mk_defer.addImport("mk_launch", mk_launch);
+    engine.addImport("mk_defer", mk_defer);
+    inline for (.{ .{ "engine", engine }, .{ "forward", forward }, .{ "ablate", ablate }, .{ "weights", weights }, .{ "state", state }, .{ "uma", uma }, .{ "kvsave", kvsave }, .{ "glm_config", cfg }, .{ "glm_sampler", sampler }, .{ "glm_follow", follow }, .{ "core", core }, .{ "cuda", cuda }, .{ "lanes", lanes }, .{ "backend", backend }, .{ "prewarm", prewarm }, .{ "prefix_cache", prefix_cache }, .{ "prefix_snap", prefix_snap } }) |imp| m.addImport(imp[0], imp[1]);
+    m.addImport("glm", glm);
+    m.addImport("drafts", drafts);
+    return m;
+}
+
 /// The Kolibri-1 CUDA family over the runtime, the core and the lane core.
 const kolibri1Module = @import("kolibri.zig").module;
 
@@ -186,6 +373,7 @@ fn flashnextModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: st
 
 /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.
 fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, heat: *std.Build.Module, qwen35: *std.Build.Module, qwen_vision: *std.Build.Module) struct { api: *std.Build.Module, engines: *std.Build.Module } {
+    const glm_mod = glmCuda(b, target, optimize, cuda, core, lanes, heat);
     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
     const mod = b.createModule(.{
         .root_source_file = b.path("zig/src/native/cuda.zig"),
@@ -201,7 +389,8 @@ fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
             .{ .name = "lfm2", .module = lfm2Module(b, target, optimize, cuda, core) },
             .{ .name = "core", .module = core },
             .{ .name = "flashnext", .module = flashnextModule(b, target, optimize, cuda, core, lanes, qwen_vision) },
-            .{ .name = "glm_cuda", .module = glmCuda(b, target, optimize, cuda, core, lanes, heat) },
+            .{ .name = "glm_cuda", .module = glm_mod },
+            .{ .name = "glm53", .module = glm53Module(b, target, optimize, cuda, core, lanes, glm_mod) },
             .{ .name = "qwen35", .module = qwen35 },
             .{ .name = "kolibri1", .module = kolibri1Module(b, target, optimize, cuda, core, lanes) },
         },
@@ -255,11 +444,76 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     const host = b.graph.host;
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/build/check_fatbins.zig"), .target = host }) })).step);
     const cuda = runtime(b, host, .debug, &.{});
+    const glm53_x3e4_host = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm53_x3e4_tests.zig"), .target = host, .optimize = .Debug, .link_libc = true });
+    glm53_x3e4_host.addImport("cuda", cuda);
+    const x3e4_tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = host, .optimize = .Debug, .link_libc = true });
+    const x3e4_living = b.createModule(.{ .root_source_file = b.path("zig/src/living/living.zig"), .target = host, .optimize = .Debug, .link_libc = true });
+    const x3e4_core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = host, .optimize = .Debug, .link_libc = true });
+    x3e4_core.addImport("gpu_memory", @import("gpu_memory.zig").module(b, host));
+    x3e4_core.addImport("tokenizer", x3e4_tokenizer);
+    x3e4_core.addImport("living", x3e4_living);
+    glm53_x3e4_host.addImport("core", x3e4_core);
+    const glm53_x3e4_run = b.addRunArtifact(b.addTest(.{ .root_module = glm53_x3e4_host }));
+    const glm53_x3e4_step = b.step("test-glm53-x3e4-host", "GLM-5.3 MCG-E4M3 tile decode oracle analysis and widths 2, 3, 4");
+    glm53_x3e4_step.dependOn(&glm53_x3e4_run.step);
+    all.dependOn(glm53_x3e4_step);
+    const roce_allreduce = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/roce_allreduce_host.zig"),
+        .target = host,
+        .optimize = .debug,
+        .link_libc = true,
+        .imports = &.{.{ .name = "cuda", .module = cuda }},
+    }) }));
+    const roce_options = b.addOptions();
+    roce_options.addOption(bool, "with_kernels", false);
+    const roce_root = b.createModule(.{
+        .root_source_file = b.path("zig/src/cuda/roce.zig"),
+        .target = host,
+        .optimize = .debug,
+        .link_libc = true,
+    });
+    roce_root.addOptions("kernel_options", roce_options);
+    const roce_module_tests = b.addRunArtifact(b.addTest(.{ .root_module = roce_root }));
+    const roce_step = b.step("test-roce-allreduce-host", "RoCE GLM all-reduce sizes, rank order, timeout and graph protocol (host mock)");
+    roce_step.dependOn(&roce_allreduce.step);
+    roce_step.dependOn(&roce_module_tests.step);
+    step.dependOn(&roce_allreduce.step);
+    const roce_benchmark = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/roce_gather_tests.zig"),
+        .target = host,
+        .optimize = .debug,
+        .link_libc = true,
+        .imports = &.{.{ .name = "cuda", .module = cuda }},
+    });
+    const roce_benchmark_compile = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/roce_allreduce_compile.zig"),
+        .target = host,
+        .optimize = .debug,
+        .link_libc = true,
+        .imports = &.{.{ .name = "roce_allreduce_benchmark", .module = roce_benchmark }},
+    }) }));
+    b.step("test-roce-allreduce-benchmark-host", "Compile and analyze the Spark-only RoCE equality and latency target").dependOn(&roce_benchmark_compile.step);
     @import("h3_host.zig").targets(b, cuda, step);
     b.step("test-gradient-host", "Gradient bounds through real wrappers with recorded CUDA launches").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cuda, .filters = &.{"train launch bounds:"} })).step);
     const runtime_host = b.step("test-runtime-host", "Shared CUDA runtime and graph host regressions");
     runtime_host.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cuda })).step);
     const mods = family(b, host, .debug, cuda, draft_ids);
+    const fp8b_host = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/fp8b_tests.zig"),
+        .target = host,
+        .optimize = .debug,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core } },
+    }) }));
+    step.dependOn(&fp8b_host.step);
+    b.step("test-glm53-fp8b-host", "GLM-5.3 block-FP8 host references and scale mapping").dependOn(&fp8b_host.step);
+    const glm53_sampler_host = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm_dsa/cuda/sampler.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{.{ .name = "cuda", .module = cuda }} });
+    const glm53_head_host = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm53_head_tests.zig"), .target = host, .optimize = .debug, .link_libc = true });
+    glm53_head_host.addImport("cuda", cuda);
+    glm53_head_host.addImport("sampler.zig", glm53_sampler_host);
+    const glm53_head_host_run = b.addRunArtifact(b.addTest(.{ .root_module = glm53_head_host }));
+    step.dependOn(&glm53_head_host_run.step);
+    b.step("test-glm53-head-host", "GLM-5.3 candidate, LSE, and gate host oracle checks").dependOn(&glm53_head_host_run.step);
     @import("qwen_contract.zig").host(b, mods.core, step);
     @import("inc4_host.zig").round(b, cuda, mods.core);
     @import("inc4_host.zig").rows(b, cuda, mods.core);
@@ -277,6 +531,17 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     for ([_]*std.Build.Module{ cuda, mods.core }) |m| {
         exl3_host.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     }
+    const glm53_experts_host = b.step("test-glm53-experts-host", "GLM-5.3 EXL3 expert loader and launch planning on host");
+    const glm53_experts = b.createModule(.{
+        .root_source_file = b.path("zig/src/families/glm_dsa/cuda/experts.zig"),
+        .target = host,
+        .optimize = .debug,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core } },
+    });
+    const glm53_experts_run = b.addRunArtifact(b.addTest(.{ .root_module = glm53_experts }));
+    glm53_experts_host.dependOn(&glm53_experts_run.step);
+    step.dependOn(&glm53_experts_run.step);
     const contract_arch = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/contract_arch_test.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core } } });
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = contract_arch })).step);
     b.step("test-pocket-device-host", "Actual pocket device hooks under CUDA ABI failures").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = flashnextModule(b, host, .debug, cuda, mods.core, mods.lanes, mods.qwen_vision), .filters = &.{"Learning persistence:"} })).step);
@@ -371,6 +636,18 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     const drama3 = @import("drama3_host.zig").hostTests(b, step, cuda, mods.core);
     const native_modules = engines(b, host, .debug, cuda, mods.core, mods.lanes, mods.nemotron, mods.heat, mods.qwen35, mods.qwen_vision);
     const native = native_modules.engines;
+    const glm_host_mod = glmCuda(b, host, .debug, cuda, mods.core, mods.lanes, mods.heat);
+    const glm53_native_mod = glm53Module(b, host, .debug, cuda, mods.core, mods.lanes, glm_host_mod);
+    const glm53_native_run = b.addRunArtifact(b.addTest(.{ .root_module = glm53_native_mod }));
+    const glm53_follow_host = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm_dsa/cuda/follow.zig"), .target = host, .optimize = .Debug, .link_libc = true });
+    glm53_follow_host.addImport("cuda", cuda);
+    const glm53_follow_run = b.addRunArtifact(b.addTest(.{ .root_module = glm53_follow_host }));
+    const glm53_native_step = b.step("test-glm53-native-host", "GLM-5.3 native CUDA host tests, including drafter and follower contracts");
+    glm53_native_step.dependOn(&glm53_native_run.step);
+    glm53_native_step.dependOn(&glm53_follow_run.step);
+    all.dependOn(glm53_native_step);
+    const glm53_registry_test = b.addRunArtifact(b.addTest(.{ .root_module = native, .filters = &.{"CUDA native registry exposes the full GLM-5.3 DSA family"} }));
+    b.step("test-glm53-native-registry-host", "Run the GLM-5.3 CUDA native registry host regression").dependOn(&glm53_registry_test.step);
     @import("release_cuda_refusal.zig").tests(b, step, native_modules.api, mods.nemotron);
     @import("qwen_cost_open.zig").tests(b, mods, native_modules, step);
     const windows_port = @import("windows_host.zig").steps(b, cuda, native_modules.api);
@@ -423,6 +700,8 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
         .imports = &.{ .{ .name = "engine_api", .module = native_modules.api }, .{ .name = "tokenizer", .module = mods.tokenizer }, .{ .name = "template", .module = template }, .{ .name = "living", .module = mods.living } },
     });
     const server_json = @import("server.zig").addTo(b, server_tests, host, .debug);
+    const glm53_server_contracts = b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{ "parse and capabilities share the table", "explicit template overrides checkpoint templates including tool prompts and fails closed" } }));
+    b.step("test-glm53-server-contract-host", "GLM-5.3 serving request parsing and checkpoint template host contracts").dependOn(&glm53_server_contracts.step);
     b.step("test-runtime-capabilities-host", "Optional library discovery in actual capabilities JSON").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"runtime library:"} })).step);
     windows_port.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"hardware names"} })).step);
     b.step("test-benchmark-manifest-host", "Manifest identity through the HTTP server without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"manifest"} })).step);
@@ -431,6 +710,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     b.step("test-issue-934", "Benchmark config admission and receipt regressions").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"issue 934:"} })).step);
     b.step("test-issue-969", "First-EOS classification and incomplete benchmark messages without a GPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"issue 969"} })).step);
     b.step("test-tool-required-host", "Required tool parsing, grammar form and constrained lane replies on the CPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"required tools:"} })).step);
+    b.step("test-tool-auto-host", "Strict auto tool grammars, GLM markup and the TENSORFOLD_TOOL_GRAMMAR switch on the CPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"auto tools:"} })).step);
     const q27 = @import("qwen27_required.zig").modules(b, mods.lanes);
     server_tests.addImport("qwen27_mask_fake", q27.fake);
     server_tests.addImport("qwen27_masks", q27.masks);
@@ -470,6 +750,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     b.step("test-modelopt-host", "Actual Nemotron scratch and CUDA launch records without GPU execution").dependOn(&run.step);
     const glm = glmCuda(b, host, .debug, cuda, mods.core, mods.lanes, mods.heat);
     @import("glm_family_host.zig").steps(b, cuda, glm, mods, step);
+    @import("glm53_wp9.zig").driverHost(b, cuda, mods.core, glm); // tf-glm53-bringup host tests (drafter admission needs glm)
     @import("kolibri.zig").host(b, kolibri1Module(b, host, .debug, cuda, mods.core, mods.lanes), native_modules.api, step);
     @import("glm_contracts.zig").tests(b, glm, mods.lanes, cuda, mods.core);
     // the shares a GLM-5.3-Flash rank takes (cluster/canon.zig against the Python family's)

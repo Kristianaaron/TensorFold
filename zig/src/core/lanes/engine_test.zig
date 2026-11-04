@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! The round loop on the fake target: drafted == one-token rounds, shared rounds == solo, greedy and sampled.
 const std = @import("std");
 const Config = @import("config.zig").Config;
@@ -17,6 +19,10 @@ pub const Case = struct {
     sampling: ?Sampling = null,
     drafts: bool = true,
     think_budget: u32 = 0,
+    think_soft_bits: []const u64 = &.{},
+    think_soft_cap: u32 = 0,
+    loop_guard: bool = false,
+    loop_guard_long: bool = false,
     logprobs: ?u8 = null,
     classes: ?Classes = null, // structured output under this test grammar
     eos: []const u32 = &.{96},
@@ -99,7 +105,13 @@ pub fn modelWith(mtp: bool) !Config {
 }
 
 /// Every case's emitted tokens, the cases admitted together and stepped until done.
+const RunStats = struct { rounds: u64 = 0, head: bool = false, head_rows: u64 = 0, head_multi_rounds: u64 = 0 };
+
 fn run(cases: []const Case) ![][]u32 {
+    return runObserved(cases, null);
+}
+
+fn runObserved(cases: []const Case, stats: ?[]RunStats) ![][]u32 {
     var cfg = try model();
     defer cfg.deinit(gpa);
     var target: fake.Fake = .{ .gpa = gpa };
@@ -121,7 +133,7 @@ fn run(cases: []const Case) ![][]u32 {
             g.* = given;
             k.* = .init(g.rules(), (fake.vocab + 31) / 32, given.after);
         }
-        s.* = try sm.Stream.init(gpa, .{ .id = "s", .prompt = c.prompt, .max_new = c.max_new, .eos = c.eos, .sampling = c.sampling, .drafts = c.drafts, .proposer = p.proposer(), .think_budget = c.think_budget, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .logprobs = c.logprobs, .grammar = if (c.classes != null) k else null });
+        s.* = try sm.Stream.init(gpa, .{ .id = "s", .prompt = c.prompt, .max_new = c.max_new, .eos = c.eos, .sampling = c.sampling, .drafts = c.drafts, .proposer = p.proposer(), .think_budget = c.think_budget, .think_soft_bits = c.think_soft_bits, .think_soft_cap = c.think_soft_cap, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .loop_guard = c.loop_guard, .loop_guard_long = c.loop_guard_long, .logprobs = c.logprobs, .grammar = if (c.classes != null) k else null });
     }
     defer for (streams, proposers) |*s, *p| {
         s.deinit(gpa);
@@ -129,6 +141,12 @@ fn run(cases: []const Case) ![][]u32 {
     };
     for (streams) |*s| try engine.addStream(s);
     while (engine.activeCount() > 0) try engine.step();
+    if (stats) |out_stats| for (streams, out_stats) |s, *out_stat| {
+        out_stat.rounds = s.rounds;
+        out_stat.head = s.head_rounds > 0;
+        out_stat.head_rows = s.head_rows;
+        out_stat.head_multi_rounds = s.head_multi_rounds;
+    };
     for (cases, streams) |c, *s| if (c.logprobs) |k| try expectRows(c, s, k);
     const out = try gpa.alloc([]u32, cases.len);
     for (out, streams) |*o, *s| o.* = try gpa.dupe(u32, s.emitted());
@@ -160,10 +178,15 @@ const GuardCase = struct {
     max_new: u32 = 400,
     drafts: bool = true,
     think_budget: u32 = 0,
+    loop_guard_long: bool = false,
+    loop_long: sm.LongLoopConfig = .{},
+    think_soft_bits: []const u64 = &.{},
+    think_soft_cap: u32 = 0,
     loop_guard: bool = true,
     think_open: ?bool = null,
     cycle_after: usize = 70,
     pattern: []const u32 = &.{ 11, 12, 13 },
+    counter_at: ?usize = null,
     answer_cycles: bool = false,
 };
 
@@ -178,7 +201,7 @@ fn runGuard(cases: []const GuardCase, step_limit: usize) ![]GuardOut {
     var cfg = try model();
     defer cfg.deinit(gpa);
     const c = cases[0];
-    var target: fake.Fake = .{ .gpa = gpa, .cycle_after = c.cycle_after, .probe_prompt = c.prompt.len, .pattern = c.pattern, .answer_cycles = c.answer_cycles };
+    var target: fake.Fake = .{ .gpa = gpa, .cycle_after = c.cycle_after, .probe_prompt = c.prompt.len, .pattern = c.pattern, .counter_at = c.counter_at, .answer_cycles = c.answer_cycles };
     defer target.deinit();
     var clock: fake.FixedClock = .{};
     var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
@@ -189,7 +212,7 @@ fn runGuard(cases: []const GuardCase, step_limit: usize) ![]GuardOut {
     defer gpa.free(proposers);
     for (cases, streams, proposers) |item, *s, *p| {
         p.* = try SuffixLookup.init(gpa, .{ .min_match = 4 });
-        s.* = try sm.Stream.init(gpa, .{ .id = "guard", .prompt = item.prompt, .max_new = item.max_new, .eos = &.{96}, .drafts = item.drafts, .proposer = p.proposer(), .think_budget = item.think_budget, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .think_open = item.think_open, .loop_guard = item.loop_guard });
+        s.* = try sm.Stream.init(gpa, .{ .id = "guard", .prompt = item.prompt, .max_new = item.max_new, .eos = &.{96}, .drafts = item.drafts, .proposer = p.proposer(), .think_budget = item.think_budget, .think_soft_bits = item.think_soft_bits, .think_soft_cap = item.think_soft_cap, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .think_open = item.think_open, .loop_guard = item.loop_guard, .loop_guard_long = item.loop_guard_long, .loop_long = item.loop_long });
     }
     defer for (streams, proposers) |*s, *p| {
         s.deinit(gpa);
@@ -251,6 +274,56 @@ test "the thinking budget's forced close is the same drafted, plain and shared" 
     try std.testing.expectEqualSlices(u32, plain[0], drafted[0]);
     try std.testing.expectEqualSlices(u32, plain[0], shared[0]);
     try std.testing.expectEqual(@as(u32, 90), drafted[0][8]);
+}
+
+test "thinking budget with the long guard keeps drafted multi-row head rounds" {
+    var stats: [1]RunStats = .{};
+    const drafted = try runObserved(&.{.{ .prompt = &p2, .think_budget = 9, .loop_guard = true, .loop_guard_long = true }}, &stats);
+    defer free(drafted);
+    const plain = try run(&.{.{ .prompt = &p2, .think_budget = 9, .drafts = false, .loop_guard = true, .loop_guard_long = true }});
+    defer free(plain);
+    try std.testing.expectEqualSlices(u32, plain[0], drafted[0]);
+    try std.testing.expect(stats[0].rounds > 0);
+    try std.testing.expect(stats[0].head);
+    try std.testing.expect(stats[0].head_rows > 1);
+    try std.testing.expect(stats[0].head_multi_rounds > 0);
+}
+
+test "soft thinking budget commits drafted and plain output at the same boundary" {
+    const bits: [1]u64 = .{@as(u64, 1) << 13};
+    var pattern: [40]u32 = undefined;
+    for (&pattern, 0..) |*token, i| token.* = @intCast(20 + i);
+    pattern[19] = 13;
+    const cases = [_]GuardCase{
+        .{ .prompt = &p2, .think_budget = 20, .loop_guard = false, .think_open = true, .cycle_after = 0, .pattern = &pattern, .think_soft_bits = &bits, .think_soft_cap = 16 },
+        .{ .prompt = &p2, .think_budget = 20, .loop_guard = false, .think_open = true, .drafts = false, .cycle_after = 0, .pattern = &pattern, .think_soft_bits = &bits, .think_soft_cap = 16 },
+    };
+    const out = try runGuard(&cases, 5000);
+    defer freeGuard(out);
+    try std.testing.expectEqualSlices(u32, out[1].emitted, out[0].emitted);
+    try std.testing.expect(out[0].emitted.len > 20 and out[0].emitted.len < 40);
+    try std.testing.expectEqual(@as(u32, 13), out[0].emitted[19]);
+    try std.testing.expectEqual(@as(u32, 90), out[0].emitted[20]);
+}
+
+test "v2 counter loop guard matches drafted and plain while v1 leaves it running" {
+    const pattern = [_]u32{ 20, 21, 22, 23, 24, 25 } ++ [_]u32{ 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59 };
+    const counter_map = [_][2]u32{ .{ 1, 1 }, .{ 2, 2 }, .{ 3, 3 }, .{ 4, 4 }, .{ 5, 5 }, .{ 6, 6 }, .{ 7, 7 }, .{ 8, 8 }, .{ 9, 9 }, .{ 10, 10 } };
+    const v2_config: sm.LongLoopConfig = .{ .v2 = true, .repeats = 3, .min_span = 256, .counters = &counter_map };
+    const cases = [_]GuardCase{
+        .{ .prompt = &p2, .loop_guard = true, .loop_guard_long = true, .cycle_after = 70, .pattern = &pattern, .counter_at = 5, .loop_long = v2_config },
+        .{ .prompt = &p2, .drafts = false, .loop_guard = true, .loop_guard_long = true, .cycle_after = 70, .pattern = &pattern, .counter_at = 5, .loop_long = v2_config },
+    };
+    const v2 = try runGuard(&cases, 5000);
+    defer freeGuard(v2);
+    try std.testing.expectEqualSlices(u32, v2[1].emitted, v2[0].emitted);
+    try std.testing.expectEqual(@as(?u32, 40), v2[0].period);
+    const v1_cases = [_]GuardCase{
+        .{ .prompt = &p2, .loop_guard = true, .loop_guard_long = true, .cycle_after = 70, .pattern = &pattern, .counter_at = 5, .max_new = 400 },
+    };
+    const v1 = try runGuard(&v1_cases, 5000);
+    defer freeGuard(v1);
+    try std.testing.expect(v1[0].period == null and v1[0].emitted.len == 400);
 }
 
 test "logprob rows follow the committed tokens drafted, plain, shared, sampled and through a forced close" {

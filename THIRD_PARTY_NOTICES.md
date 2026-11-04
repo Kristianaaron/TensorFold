@@ -32,6 +32,12 @@ processor and processor in `models/qwen3_vl/` (frame sampling, `smart_resize`, p
 `zig/src/core/qwen_vl/video.zig`, `zig/src/server/images.zig`). Copyright 2025 and 2026 The Qwen Team and The
 HuggingFace Inc. team, Apache License 2.0; see [the license text](LICENSES/Apache-2.0.txt).
 
+## GLM-5.3 tokenizer config fixture
+
+`zig/tests/fixtures/glm53/config.json` is a copy of the public GLM-5.3 tokenizer `config.json`, used only to test
+shape parsing and the explicit `indexer_types` layer map. The configuration is distributed under the model repository's
+MIT License; no model weights or tokenizer assets are included.
+
 ## GLM-5.3-Flash on Apple Silicon
 
 The native GLM-5.3-Flash engine (`zig/src/families/glm/`) runs the Python `glm5_next` family's decode kernels.
@@ -116,6 +122,10 @@ that code.
 
 ## CUDA
 
+The `.fp8b` CUDA linear in `zig/kernels/cuda/qmmf.cu` extends the linear kernels adapted from bertholomus/TensorFold
+`src/tensorfold/families/glm5_next/cuda/qmm.py` at commit `ddfad35` (branch `glm-dsa-tp4`), Apache-2.0; see
+[the license text](LICENSES/Apache-2.0.txt). The native implementation is independently written in CUDA and Zig.
+
 The Python engine's CUDA backends, frozen at 0.6.6, use [PyTorch](https://github.com/pytorch/pytorch), BSD-3-Clause, and
 [Triton](https://github.com/triton-lang/triton), MIT, supplied by NVIDIA's container rather than bundled.
 Dense Qwen implements mlx-lm's model math. CUDA DFlash2 implementations port z-lab's architecture under
@@ -137,11 +147,11 @@ come from plotarmordev's #927 implementation. Their qualification against the me
 The Python engine's GLM CUDA engine implements transformers' `models/glm5_next/modular_glm5_next.py` math,
 Apache-2.0, without including that source. Its draft inputs and thinking-off rendering follow the public GLM recipe
 from Mia-AiLab without including recipe code.
-The native CUDA GLM family (`zig/src/families/glm/cuda_*.zig`, its kernels in `zig/kernels/cuda/glm_*.cu`) implements
-the same math. Its image tower, on Metal (`zig/src/families/glm/vision.zig`) and on CUDA (`cuda_vision.zig`,
-`zig/kernels/cuda/glm_vision.cu`), and the PyTorch reference that checks it (`tools/glm_vision_ref.py`) follow
-mlx-vlm's `glm5_next` (`vision.py`, and `processing.py` for the reference's patches; MIT License, Copyright (c) 2025
-Prince Canuma) without importing it.
+
+The GLM-5.3 DSA CUDA expert package adapts the `glm_moe_dsa` EXL3 tensor naming and split rules from
+bertholomus/TensorFold at commit `ddfad35` (branch `glm-dsa-tp4`; `src/tensorfold/families/glm_moe_dsa/cuda/weights.py`
+and `x3.py`), and its EXL3 decode structure from `src/tensorfold/cuda/exl3/`. The `mcg_e4m3` codebook is this fork's
+addition. That fork is Apache-2.0. The Zig and CUDA code is a separate implementation; it includes no Python runtime or weights.
 
 In the Python engine, frozen at 0.6.6, GLM EXL3 (`families/glm5_next/cuda/exl3.py`, `exl3.cu`, `exl3_mm.py`), the
 shared EXL3 module (`src/tensorfold/cuda/exl3/`) and the EXL3 loaders of Qwen3.8-27B and Qwen3.8 Flash Next
@@ -159,6 +169,10 @@ under the Turboderp attribution above. So do the native checkpoint scan (`zig/sr
 `exl3_metal_load.zig`), the CUDA kernels (`zig/kernels/cuda/exl3_*.cu`, `exl3_decode.cuh`, `exl3_candidate.cuh`) and
 their Zig side (`zig/src/cuda/exl3*.zig`), and GLM's reader of its EXL3 experts (`zig/src/families/glm/cuda_exl3.zig`).
 No captured kernel binaries or model weights are bundled.
+
+The `mcg_e4m3` CUDA decode uses the paired conversion sequence
+`cvt.rn.satfinite.e4m3x2.f16x2` and `cvt.rn.f16x2.e4m3x2` shown in
+[`gr8/engine/kernels/tr3.cuh`](https://github.com/raullenchai/gr8/blob/main/engine/kernels/tr3.cuh), MIT License.
 
 The EXLR8 reader, decoder, pull and kernels (`zig/src/core/exlr8*.zig`, `zig/src/cli/pull_exlr8*.zig`,
 `zig/src/cuda/exlr8.zig`, `zig/kernels/metal/core/exlr8*.metal`, `zig/kernels/cuda/exlr8*.cu`) read kindlingai's exlr8
@@ -183,11 +197,19 @@ values agree within fp16/bf16 rounding (under 0.01 on random groups), not bit fo
 dequant are written for TensorFold and checked against an independent reference of that arithmetic. The native engine
 has no quantized KV cache and refuses `--kv-dtype`.
 
-The two-rank CUDA RoCE gather (`zig/src/cuda/roce.zig`, `zig/kernels/cuda/roce_gather.cu`) adapts
-the one-shot all-gather protocol of [b12x](https://github.com/local-inference-lab/b12x)'s RoCEnante
-(`b12x/comm/roce/`, PRs #295 and #315): a device-resident epoch, sequence flags after each payload, two slots by
-sequence parity and a timeout that fails the transport. Copyright 2026 Luke Alonso and the b12x contributors,
-Apache License 2.0 (see [the license text](LICENSES/Apache-2.0.txt)); b12x ships no NOTICE file.
+The two-rank CUDA RoCE gather and all-reduce (`zig/src/cuda/roce.zig`, `zig/kernels/cuda/roce_gather.cu`) adapt
+the one-shot all-gather and rank-order all-reduce protocol from
+[b12x](https://github.com/local-inference-lab/b12x)'s RoCEnante and
+`flashinfer/experimental/b12x/comm/roce/_oneshot_cute.py` (local-inference-lab/flashinfer@4092b28): a device-resident
+epoch, sequence flags after each payload, two slots by sequence parity, and rank-ordered reduction. Copyright 2026
+Luke Alonso and the b12x contributors, Apache License 2.0 (see [the license text](LICENSES/Apache-2.0.txt)); b12x
+ships no NOTICE file.
+
+The RoCE send-slot lifetime argument and failure-test plan use NVIDIA's
+[flare-local-inference](https://github.com/NVIDIA/flare-local-inference) @47581cc as a design reference only; no
+Flare code or text was copied. Specifically, Flare's `docs/roce-ring.md` `pipe_done` analysis informed the ordering
+argument and stopped-proxy fault tests. Copyright 2026 NVIDIA Corporation and Flare community contributors,
+Apache License 2.0.
 
 ## Vendored code and weights
 
@@ -211,7 +233,9 @@ Bolt's GGML checkpoints (`zig/kernels/cuda/ggml.cu`, `zig/src/cuda/ggml.zig`) ar
 
 TensorFold ships no model weights. The `z-lab/Qwen3.8-27B-DFlash2` model card states Apache-2.0.
 The optional `incoai/GLM-5.3-Flash-DFlash2` model card states CC BY-NC-ND 4.0, for non-commercial use
-without derivatives; only the Python engine reads that drafter. Each checkpoint keeps its own license.
+without derivatives; the Python engine and the native GLM loaders read that drafter, and the GLM-5.3 loader also reads the separate
+incoai/GLM-5.3-DFlash2 (same terms), unmodified, from a copy the user downloads. No DFlash2 weights, converted or
+tuned, are in this repository or its release archives. Each checkpoint keeps its own license.
 
 ## Structured output: libtfgrammar
 
@@ -342,9 +366,89 @@ common EXL3 operators and their per-slot epilogues; tile decoding is shared.
 The ExLlamaV3 MIT attribution, Copyright (c) 2025 Turboderp, applies as described above.
 No external reference, captured cubin, model shard or CUDA compiler is bundled by this patch.
 
+## GLM-5.3 DSA CUDA sources
+
+`zig/kernels/cuda/host/glm53_cutlass.cu` adapts the host adapter and SM120 block-scaled FP8 GEMM configuration from
+NVIDIA CUTLASS `87a_blackwell_geforce_fp8_bf16_gemm_blockwise.cu` and uses the corresponding scale-layout pattern in
+`87b_blackwell_geforce_fp8_bf16_gemm_groupwise.cu` (BSD-3-Clause). The vendored CUTLASS headers are recorded in
+`zig/kernels/cuda/third_party/cutlass/VENDORED.txt` at commit `91843b71d90737e0a9b86f7d9df213cff5a3526f`.
+NVIDIA cuBLASLt is loaded as a system library at runtime; it is not redistributed.
+
+`zig/kernels/cuda/glm_dsa/fp8_mma.cu` adapts the lane staging and E4M3 MMA structure of
+`zig/kernels/cuda/ck_lane.cu` and its `mma4.cuh` helper (ashhart/TensorFold, Apache-2.0). The GLM kernel uses a
+separate 128-K block-scale contract and an independent PTX fragment loader; it includes no external helper source.
+
+The GLM-5.3 CUDA head and sampler adapt the Apache-2.0 sampling primitives in ashhart/TensorFold's
+`zig/kernels/cuda/sample.cu` (`d1018b31`). The keyed 53-bit uniform, candidate ordering and nucleus semantics follow
+bertholomus/TensorFold `src/tensorfold/engine/exact_sampling.py` and
+`src/tensorfold/families/glm5_next/cuda/decode.py` (`ddfad35`), Apache-2.0. The dump row fields follow
+`glm_moe_dsa/cuda/forward.py` (`ddfad35`), Apache-2.0.
+The pairwise-sum reduction ordering follows NumPy 2.0.2's `numpy/_core/src/umath/loops_utils.h.src` behavior
+(BSD-3-Clause), verified bit-exact against NumPy 2.0.2. The 8192-element reduction buffer (`NPY_BUFSIZE`) was checked
+in NumPy 2.5.4's `numpy/_core/include/numpy/ndarraytypes.h`. Copyright (c) 2005-2025, NumPy Developers. This
+independent implementation ports the reduction order, not its source code; see [NumPy's license text](LICENSES/NumPy-BSD-3.txt).
+These are independent Zig/CUDA implementations; no Python or NumPy source is copied.
+
+`zig/src/families/glm_dsa/cuda/{moe,mlp}.zig` and `zig/kernels/cuda/glm_dsa/glue.cu` adapt bertholomus/TensorFold's
+`glm_moe_dsa` MLP forward math (`cuda/forward.py`, commit `ddfad35`) and CUDA glue (`cuda/glue.py:_swiglu_plain` and `embed_pick`). Apache License 2.0; see
+[the license text](LICENSES/Apache-2.0.txt). The Zig and CUDA files are independent implementations.
+The fixed-order `routed + (shared + low-rank)` combine is credited to DeepSeek AI's
+[DeepInfer](https://github.com/deepseek-ai/DeepInfer), Apache-2.0; this is a numerics/design reference and no DeepInfer
+source code is copied. The fused all-reduce/residual/RMSNorm epilogue idea is credited to NVIDIA's
+[Flare](https://github.com/NVIDIA/flare-local-inference) `PreparedAllReduceRMSNorm`, Apache-2.0; no Flare source code is copied.
+
+`zig/kernels/cuda/glm_dsa/index.cu` adapts the exact radix top-k kernel from the DeepSeek-V4.1 CUDA sources above,
+extending its per-thread entry tile for GLM-5.3's 135,168-key DCP2 verify shard. The indexer math follows the Apache-2.0
+`glm_moe_dsa` CUDA reference in bertholomus/TensorFold at commit `ddfad35`; no Python source is
+copied into this repository. The Zig host reference follows `select.py` and `dcp.py` at the same commit. The DCP
+all-gather and merge design also credits ashhart/TensorFold PR #159 by drowzeys (`dc43ca6`), Apache-2.0.
+The packed candidate exchange and fused merge/filter/remap design additionally follows NVIDIA
+`flare-local-inference` at `47581cc`, Apache-2.0; no source code was copied.
+
+`zig/kernels/cuda/glm_dsa/mla.cu` and `zig/src/families/glm_dsa/cuda/mla.zig` adapt the MLA math and cache handling
+from bertholomus/TensorFold at commit `ddfad35`, Apache-2.0, principally
+`glm_moe_dsa/cuda/mla_pe.py` and `glm_moe_dsa/cuda/weights.py`. They are independent CUDA and Zig implementations;
+no Python source is copied into this repository. The DCP partial attention and merge contract follows the same
+fork's `glm_moe_dsa/cuda/dcp.py` and ashhart/TensorFold PR #159 by drowzeys (`dc43ca6`), Apache-2.0.
+
+`zig/src/families/glm_dsa/cuda/recal.zig` and the draft-depth switches it serves in `backend.zig`
+(`TF_GLM53_DRAFT_RECAL`, `TF_GLM53_DRAFT_SWEEP`, `TF_GLM53_ROUND_TRACE`) follow MiaAI-Lab's
+GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold depth policy, patches 0114, 0116, 0119 and 0126 (Apache-2.0, Copyright 2026
+Mia's AI Lab): the DSpark confidence survival product times measured per-width round costs picks the verified prefix,
+with costs measured on real text and kept nondecreasing. The confidence head is Red Hat's DSpark speculator
+(RedHatAI/GLM-5.3-speculator.dspark, GLM-5.3 license per its model card, not included; trained with
+vllm-project/speculators, Apache-2.0). `tools/glm53/recal_fit.py`
+fits the per-slot logistic (Platt) weights offline. These are independent implementations; no patch or speculators
+source is copied.
+
 The tensor-parallel fabric also uses the RoCE design described above (`zig/src/fabric/tp/mailbox.cu`, `roce.zig`, `roce_verbs.zig`).
 
 ## Shared EXL3 resolver setup
 
 The shared EXL3 resolver split and CUDA lane option forwarding retain work from PR #728 by @ajensenwaud,
 with the common EXL3 and DeepSeek contributor credits preserved.
+
+## Fork credits
+
+The DSpark drafter support in `zig/src/families/glm/dflash_load.zig`, `zig/src/families/glm/dflash_select.zig` and
+`zig/src/families/glm_dsa/cuda/drafts.zig` reads Red Hat AI's `RedHatAI/GLM-5.3-speculator.dspark` (GLM-5.3 license, not
+included) and follows the model structure of vllm-project/speculators, Apache-2.0. No source is copied.
+
+The tool grammar ports in `zig/src/server/tool_grammar*.zig` come from ashhart/TensorFold commits `c766e8d0e` and
+`42d478a9f` by Jay Leaton. The drafter-chance lane changes in `zig/src/core/lanes/drafted*.zig` follow ashhart/TensorFold
+#1381 by BlivionIaG. Apache-2.0.
+
+`zig/kernels/cuda/glm_dsa/pmx.cu` follows the per-width K2/K3 kernels in greatyingzi/GLM-5.3-Flash-EXL3-3bit-TensorFold
+`k3-kernel/exl3k3.cu`, Apache-2.0.
+
+`zig/src/families/glm_dsa/cuda/manifest.zig` reads a per-matrix width manifest after kindlingai's EXLR8 format
+(CC BY 4.0, see above). The implementation is this fork's own.
+
+The tool-call parsing fixes in `zig/src/server/tool_parse.zig` and `tool_params.zig` port patches 0103 and 0105 of
+MiaAI-Lab/GLM-5.3-Flash-DGX-Sparks-1104, Apache-2.0, which carry work from the lab's RTX PRO 6000 recipe and its issue #180
+(jsfs11, SvangenStudios). Warm turns for GLM port patch 0104 of the same recipe, Apache-2.0.
+
+Matt Suiche's runtime control vectors (MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold PR #35) are prior art for
+the ablation hook in `zig/src/families/glm_dsa/cuda/ablate.zig`.
+
+The n-gram drafter in `zig/src/core/lanes/zngram*.zig` takes its idea from 0xBakeer's TandemLLM. No source is copied.

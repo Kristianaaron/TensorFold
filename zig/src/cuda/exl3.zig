@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! The EXL3 decode-row linear (exl3/linear.cu's device code): the plan, a layer's tensors, and the two kernels.
 const std = @import("std");
 const candidate = @import("exl3_candidate.zig");
@@ -15,8 +17,53 @@ const Stream = stream_.Stream;
 /// x's and y's element types (linear.cu DType).
 pub const DType = enum(i32) { f16 = 0, bf16 = 1, f32 = 2 };
 
-/// The three codebooks (exl3_format.zig's, numbered as the kernel's).
-pub const Codebook = enum(u3) { inst3 = 0, mcg = 1, mul1 = 2 };
+/// EXL3 codebooks, numbered as the kernel's. `mcg_e4m3` rounds the mcg half sum through E4M3.
+pub const Codebook = enum(u3) { inst3 = 0, mcg = 1, mul1 = 2, mcg_e4m3 = 3 };
+
+/// OCP E4M3FN round-trip used by the CPU oracle and the grouped CUDA decoder.
+pub fn roundE4m3(x: f32) f32 {
+    const bits: u32 = @bitCast(x);
+    const sign: u8 = @intCast((bits >> 24) & 0x80);
+    const a = bits & 0x7fffffff;
+    if (a > 0x7f800000) return std.math.nan(f32);
+    if (a >= 0x43e00000) return if (sign != 0) -448 else 448;
+    var code: u8 = sign;
+    if (a >= 0x3c800000) {
+        const r = (a + 0x7ffff + ((a >> 20) & 1)) & 0xfff00000;
+        code |= @intCast((((r >> 23) - 120) << 3) | ((r >> 20) & 7));
+    } else {
+        const e = a >> 23;
+        if (e == 0 or e < 101) return if (sign != 0) -0.0 else 0.0;
+        const shift: u6 = @intCast(141 - e);
+        const m: u64 = (a & 0x7fffff) | 0x800000;
+        const half: u64 = @as(u64, 1) << (shift - 1);
+        const rem = m & ((@as(u64, 1) << shift) - 1);
+        var n = m >> shift;
+        if (rem > half or (rem == half and n & 1 != 0)) n += 1;
+        code |= @intCast(n);
+    }
+    const exp = (code >> 3) & 15;
+    const mant: f32 = @floatFromInt(code & 7);
+    const value = if (exp == 0) mant * 0x1p-9 else (8 + mant) * std.math.ldexp(@as(f32, 1), @as(i32, exp) - 10);
+    return if (sign != 0) -value else value;
+}
+
+test "mcg_e4m3 host decode uses finite E4M3FN values and nearest-even ties" {
+    try std.testing.expectEqual(@as(f32, 1), roundE4m3(1.0625));
+    try std.testing.expectEqual(@as(f32, 1.25), roundE4m3(1.1875));
+    try std.testing.expectEqual(@as(f32, 448), roundE4m3(463.9));
+    try std.testing.expectEqual(@as(f32, -448), roundE4m3(-std.math.inf(f32)));
+    try std.testing.expectEqual(@as(f32, 0), roundE4m3(0x1p-10));
+    for (0..256) |raw| {
+        const code: u8 = @intCast(raw);
+        if ((code & 0x7f) == 0x7f) continue;
+        const exp = (code >> 3) & 15;
+        const mant: f32 = @floatFromInt(code & 7);
+        const magnitude = if (exp == 0) mant * 0x1p-9 else (8 + mant) * std.math.ldexp(@as(f32, 1), @as(i32, exp) - 10);
+        const value = if (code & 0x80 != 0) -magnitude else magnitude;
+        try std.testing.expectEqual(value, roundE4m3(value));
+    }
+}
 
 /// One compiled kernel: 2 * bits halves, a codebook, and the warps one block runs.
 pub const Variant = struct { halves: u32, codebook: Codebook, warps: u32 };

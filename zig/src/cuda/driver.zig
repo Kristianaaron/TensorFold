@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! The CUDA driver opened at run time: libcuda.so.1's versioned entry points in one table, and checked calls.
 
 const std = @import("std");
@@ -11,8 +13,10 @@ pub const Driver = struct {
     api: abi.Api,
     /// cuFuncGetName (CUDA 12.3+; optional: an older driver opens without it): a failed launch names its kernel
     func_name: ?FuncGetName = null,
+    graph_mem_attribute: ?GraphMemAttribute = null,
 
     pub const FuncGetName = *const fn (*?[*:0]const u8, abi.Function) callconv(.c) abi.Result;
+    pub const GraphMemAttribute = *const fn (abi.Device, c_int, *usize) callconv(.c) abi.Result;
 
     pub fn open() Error!Driver {
         return openPath(platform.cuda_driver);
@@ -30,7 +34,7 @@ pub const Driver = struct {
                 return error.MissingSymbol;
             };
         }
-        const d: Driver = .{ .lib = lib, .api = api, .func_name = lib.lookup(FuncGetName, "cuFuncGetName") };
+        const d: Driver = .{ .lib = lib, .api = api, .func_name = lib.lookup(FuncGetName, "cuFuncGetName"), .graph_mem_attribute = lib.lookup(GraphMemAttribute, "cuDeviceGetGraphMemAttribute") };
         try d.check(api.cuInit(0), "cuInit");
         return d;
     }

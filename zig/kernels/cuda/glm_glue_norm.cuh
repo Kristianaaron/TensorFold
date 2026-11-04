@@ -1,5 +1,9 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 // glue._rmsnorm by hand (glm_glue.cu's first group): see glm_triton.cuh for the Triton ops it keeps.
 #pragma once
+
+#include "tf_vblock.cuh"
 
 #include "glm_triton.cuh"
 
@@ -50,11 +54,11 @@ __device__ __forceinline__ void store_s(__nv_bfloat16* p, const __nv_bfloat16* o
 // glue._rmsnorm, BLOCK = D to a power of two, NW warps, S values a thread: bf16(w * bf16(x / rms)), `sums` per 64.
 template <int D, int BLOCK, int NW, int S>
 __device__ void rmsnorm(const __nv_bfloat16* x, int64_t x_stride, const __nv_bfloat16* w, __nv_bfloat16* out,
-                        int64_t o_stride, float* xs, float eps, int sums) {
+                        int64_t o_stride, float* xs, float eps, int sums, int row_override = -1) {
   constexpr int T = NW * 32, TILE = S * T, REPS = BLOCK / TILE, N = REPS * S, G = 64 / S;
   static_assert(D % S == 0, "a thread's values all inside D or all past it");
   __shared__ float smem[NW];
-  const int64_t r = blockIdx.x;
+  const int64_t r = row_override < 0 ? TF_VBID.x : row_override;
   const int t = threadIdx.x;
   const bool xv = packed<S>(x, x_stride), wv = packed<S>(w, 0), ov = packed<S>(out, o_stride);
   float v[N];
@@ -110,13 +114,21 @@ __device__ void rmsnorm(const __nv_bfloat16* x, int64_t x_stride, const __nv_bfl
 }  // namespace glm_glue
 
 #define RMSNORM(D, BLOCK, NW, S)                                                                                   \
+  __device__ __forceinline__ void tf_glm_rmsnorm_##D##_task(const __nv_bfloat16* x, int64_t x_stride,             \
+      const __nv_bfloat16* w, __nv_bfloat16* out, int64_t o_stride, float* xs, float eps, int sums) {               \
+    glm_glue::rmsnorm<D, BLOCK, NW, S>(x, x_stride, w, out, o_stride, xs, eps, sums);                              \
+  }                                                                                                                \
   extern "C" __global__ void __launch_bounds__(NW * 32)                                                            \
       tf_glm_rmsnorm_##D(const __nv_bfloat16* x, int64_t x_stride, const __nv_bfloat16* w, __nv_bfloat16* out,    \
                          int64_t o_stride, float* xs, float eps, int sums) {                                       \
-    glm_glue::rmsnorm<D, BLOCK, NW, S>(x, x_stride, w, out, o_stride, xs, eps, sums);                              \
+    TF_VBLOCK_ENTER();                                                                                             \
+    tf_glm_rmsnorm_##D##_task(x, x_stride, w, out, o_stride, xs, eps, sums);                                       \
   }
 
 // The model's norms: hidden 4096 (8 warps), q_lora 1536 and kv_lora 512 (4 warps), as glue.rmsnorm launches them.
 RMSNORM(4096, 4096, 8, 8)
 RMSNORM(1536, 2048, 4, 8)
 RMSNORM(512, 512, 4, 4)
+RMSNORM(6144, 8192, 8, 8)
+RMSNORM(2048, 2048, 4, 8)
+// Macro expansion exports the literal loader symbol tf_glm_rmsnorm_6144.

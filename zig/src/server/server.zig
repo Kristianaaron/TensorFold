@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! The server: one engine and tokenizer behind the HTTP routes, one thread a connection.
 const std = @import("std");
 const platform = @import("sys");
@@ -44,6 +46,7 @@ pub const Config = struct {
     reasoning_effort: ?[]const u8 = null,
     thinking_budget: i64 = 0,
     loop_guard: bool = false,
+    allow_ablate: bool = false,
     /// Seconds the idle keepalive runs after the last request ends (0: off).
     keep_warm_s: i64 = 900,
     dashboard: bool = false,
@@ -97,6 +100,9 @@ pub const Server = struct {
     eos: []const u32 = &.{},
     think_close: []const u32 = &.{},
     think_close_end: ?u32 = null,
+    think_soft_bits: []const u64 = &.{},
+    think_soft_cap: u32 = 0,
+    loop_long: api.LongLoopConfig = .{},
     metrics: metrics.Metrics,
     store: responses.Store,
     next_id: std.atomic.Value(u64) = .init(1),
@@ -112,6 +118,7 @@ pub const Server = struct {
     /// Structured output's compiler, opened by the first structured request (Python's grammar.compiler).
     grammars: ?*api.grammar.Compiler = null,
     grammar_problem: ?[]const u8 = null,
+    strict_unheld_noted: std.atomic.Value(bool) = .init(false),
     grammar_mutex: std.Io.Mutex = .init,
     /// The facts the learner was taught and whether the weights recall them.
     slide: slide_graph.Graph,
@@ -153,6 +160,49 @@ pub const Server = struct {
             const trail = try text.encode(a, "\n\n", false);
             srv.think_close = try std.mem.concat(a, u32, &.{ lead, &.{end}, trail });
             srv.think_close_end = end;
+        }
+        const soft_env = std.c.getenv("TF_GLM53_SOFT_BUDGET");
+        if (soft_env != null and std.mem.eql(u8, std.mem.span(soft_env.?), "1") and srv.think_close.len > 0) {
+            srv.think_soft_cap = try parseSoftCap(envSpan(std.c.getenv("TF_GLM53_SOFT_BUDGET_CAP")));
+            const vocab = text.vocabSize();
+            const bits = try a.alloc(u64, (@as(usize, vocab) + 63) / 64);
+            @memset(bits, 0);
+            var count: u32 = 0;
+            var token_arena = std.heap.ArenaAllocator.init(a);
+            defer token_arena.deinit();
+            for (0..vocab) |id| {
+                _ = token_arena.reset(.retain_capacity);
+                const token_bytes = (try text.tokenBytes(token_arena.allocator(), @intCast(id))) orelse continue;
+                if (text.isSpecial(@intCast(id)) or !softBoundary(token_bytes)) continue;
+                bits[id / 64] |= @as(u64, 1) << @intCast(id % 64);
+                count += 1;
+            }
+            srv.think_soft_bits = bits;
+            log.line("soft thinking budget: on (cap {d}, {d} boundary tokens)", .{ srv.think_soft_cap, count });
+        }
+        const long_env = std.c.getenv("TF_GLM53_LOOP_GUARD_LONG");
+        if (long_env != null and std.mem.eql(u8, std.mem.span(long_env.?), "1")) {
+            const repeats = try parseLoopRepeats(envSpan(std.c.getenv("TF_GLM53_LOOP_GUARD_REPEATS")));
+            const min_span = try parseLoopMinSpan(envSpan(std.c.getenv("TF_GLM53_LOOP_GUARD_MIN_SPAN")));
+            const vocab = text.vocabSize();
+            const words: usize = (@as(usize, vocab) + 63) / 64;
+            const inert_bits = try a.alloc(u64, words);
+            const mark_bits = try a.alloc(u64, words);
+            @memset(inert_bits, 0);
+            @memset(mark_bits, 0);
+            var counters: std.ArrayList([2]u32) = .empty;
+            var token_arena = std.heap.ArenaAllocator.init(a);
+            defer token_arena.deinit();
+            for (0..vocab) |id| {
+                _ = token_arena.reset(.retain_capacity);
+                const token_bytes = (try text.tokenBytes(token_arena.allocator(), @intCast(id))) orelse continue;
+                if (text.isSpecial(@intCast(id))) continue;
+                if (counterValue(token_bytes)) |value| try counters.append(a, .{ @intCast(id), value });
+                if (inertToken(token_bytes)) inert_bits[id / 64] |= @as(u64, 1) << @intCast(id % 64);
+                if (markToken(token_bytes)) mark_bits[id / 64] |= @as(u64, 1) << @intCast(id % 64);
+            }
+            srv.loop_long = .{ .v2 = true, .repeats = repeats, .min_span = min_span, .counters = counters.items, .inert_bits = inert_bits, .mark_bits = mark_bits };
+            log.line("long loop guard v2: repeats {d}, min span {d}, {d} counter tokens", .{ repeats, min_span, counters.items.len });
         }
         if (srv.info.prefill_step > 0) {
             srv.chunks = try chunk_plan.markers(srv, a, srv.info.prefill_step);
@@ -224,11 +274,26 @@ pub const Server = struct {
     /// The grammar a request asks for, or its refusal when the engine cannot enforce it.
     pub fn checkFeatures(srv: *Server, cx: *Cx, f: Value, has_tools: bool, thinking: bool, prompt_ids: []const u32, tools: []const Value, request: *api.Request) errors.Refused!void {
         _ = prompt_ids;
+        if (f.get("ablate")) |v| {
+            if (v != .bool) return cx.refuse("ablate must be a boolean");
+            if (v.bool) {
+                if (!srv.config.allow_ablate) return cx.fail(.request, "ablate is not allowed by this server: start it with --allow-ablate", .{});
+                if (!srv.info.ablate) return cx.refuse("this engine has no ablation vectors loaded");
+                request.ablate = true;
+            }
+        }
         const required = if (f.get("tool_call_required")) |r| r.truthy() else false;
+        const one_call = if (f.get("tool_call_single")) |x| x.truthy() else false;
+        const all = has_tools and !required and tool_grammar.autoAllEnv();
         if (has_tools and required) {
             if (!srv.info.structures) return cx.fail(.request, "backend '{s}' cannot enforce tool_choice \"required\" or a named function: it has no token grammar support; send \"auto\" or \"none\"", .{srv.backendName()});
-            const one_call = if (f.get("tool_call_single")) |x| x.truthy() else false;
             request.structure = try tool_grammar.structure(srv, cx, tools, !one_call, thinking);
+        } else if (has_tools and srv.info.structures and tool_grammar.autoWanted(tools, all)) {
+            if (srv.grammarCompiler() != null) {
+                request.structure = try tool_grammar.optionalStructure(srv, cx, tools, all, !one_call, thinking);
+            } else if (!srv.strict_unheld_noted.swap(true, .acq_rel)) {
+                std.log.warn("strict tools served without a grammar: {s}", .{srv.grammar_problem.?});
+            }
         }
         if (try grammar.spec(cx, f)) |s| {
             if (!srv.info.structures) return cx.refuse("structured output (response_format and the guided_* fields) is not supported by this engine yet");
@@ -363,6 +428,95 @@ pub const Server = struct {
 fn single(conn: *const http_conn.Conn, name: []const u8) ?[]const u8 {
     if (conn.headerCount(name) != 1) return null;
     return conn.header(name);
+}
+
+fn envSpan(value: ?[*:0]const u8) ?[]const u8 {
+    const ptr = value orelse return null;
+    return std.mem.span(ptr);
+}
+
+fn parseBounded(value: ?[]const u8, default: u32, low: u32, high: u32, comptime failure: anyerror) !u32 {
+    const raw = value orelse return default;
+    const parsed = std.fmt.parseInt(u32, raw, 10) catch return failure;
+    if (parsed < low or parsed > high) return failure;
+    return parsed;
+}
+
+pub fn parseSoftCap(value: ?[]const u8) !u32 {
+    return parseBounded(value, 256, 1, 4096, error.BadSoftBudgetCap);
+}
+
+pub fn parseLoopRepeats(value: ?[]const u8) !u32 {
+    return parseBounded(value, 3, 2, 16, error.BadLoopGuardRepeats);
+}
+
+pub fn parseLoopMinSpan(value: ?[]const u8) !u32 {
+    return parseBounded(value, 256, 64, 4096, error.BadLoopGuardMinSpan);
+}
+
+pub fn softBoundary(bytes: []const u8) bool {
+    var end = bytes.len;
+    while (end > 0 and (bytes[end - 1] == ' ' or bytes[end - 1] == '\t')) : (end -= 1) {}
+    const body = bytes[0..end];
+    if (body.len == 0) return false;
+    if (body[body.len - 1] == '\n') return true;
+    if (std.mem.endsWith(u8, body, "。") or std.mem.endsWith(u8, body, "！") or std.mem.endsWith(u8, body, "？")) return true;
+    var at = body.len;
+    const tail = body[body.len - 1];
+    if (tail == '"' or tail == '\'' or tail == ')' or tail == ']' or tail == '*') at -= 1;
+    if (at == 0) return false;
+    const punct = body[at - 1];
+    if (punct != '.' and punct != '!' and punct != '?') return false;
+    return punct != '.' or at < 2 or body[at - 2] < '0' or body[at - 2] > '9';
+}
+
+pub fn counterValue(bytes: []const u8) ?u32 {
+    var start: usize = 0;
+    var end = bytes.len;
+    while (start < end and std.ascii.isWhitespace(bytes[start])) : (start += 1) {}
+    while (end > start and std.ascii.isWhitespace(bytes[end - 1])) : (end -= 1) {}
+    if (start < end and (bytes[end - 1] == '.' or bytes[end - 1] == ')')) end -= 1;
+    if (start == end) return null;
+    for (bytes[start..end]) |byte| if (!std.ascii.isDigit(byte)) return null;
+    const parsed_value = std.fmt.parseInt(u32, bytes[start..end], 10) catch return null;
+    return if (parsed_value <= 1_000_000) parsed_value else null;
+}
+
+pub fn inertToken(bytes: []const u8) bool {
+    if (bytes.len == 0) return false;
+    for (bytes) |byte| {
+        if (!((byte >= '0' and byte <= '9') or std.ascii.isWhitespace(byte) or std.mem.indexOfScalar(u8, ".,;:+*/=()[]{}|&\\<>_%-", byte) != null)) return false;
+    }
+    return true;
+}
+
+pub fn markToken(bytes: []const u8) bool {
+    if (!inertToken(bytes)) return false;
+    for (bytes) |byte| if ((byte >= '0' and byte <= '9') or byte == '&' or byte == '|' or byte == '\\') return true;
+    return false;
+}
+
+test "soft boundary classifier and cap parser" {
+    for ([_][]const u8{ ".", " end.", "?\"", ")\n", "\n\n", "。" }) |value| try std.testing.expect(softBoundary(value));
+    for ([_][]const u8{ "1.", " 3.", "e.g", "abc", "", " " }) |value| try std.testing.expect(!softBoundary(value));
+    try std.testing.expectEqual(@as(u32, 256), try parseSoftCap(null));
+    try std.testing.expectEqual(@as(u32, 1), try parseSoftCap("1"));
+    try std.testing.expectError(error.BadSoftBudgetCap, parseSoftCap("0"));
+    try std.testing.expectError(error.BadSoftBudgetCap, parseSoftCap("4097"));
+}
+
+test "loop guard classifiers and parsers" {
+    try std.testing.expectEqual(@as(?u32, 12), counterValue("12"));
+    try std.testing.expectEqual(@as(?u32, 3), counterValue(" 3."));
+    try std.testing.expectEqual(@as(?u32, 4), counterValue("4)"));
+    try std.testing.expectEqual(@as(?u32, null), counterValue("a1"));
+    try std.testing.expectEqual(@as(?u32, null), counterValue("1.5"));
+    for ([_][]const u8{ "| ", " & ", "--", "0" }) |value| try std.testing.expect(inertToken(value));
+    try std.testing.expect(!inertToken(" the"));
+    try std.testing.expectEqual(@as(u32, 3), try parseLoopRepeats(null));
+    try std.testing.expectEqual(@as(u32, 256), try parseLoopMinSpan(null));
+    try std.testing.expectError(error.BadLoopGuardRepeats, parseLoopRepeats("1"));
+    try std.testing.expectError(error.BadLoopGuardMinSpan, parseLoopMinSpan("32"));
 }
 
 fn merge(into: *json.Object, cx: *Cx, from: Value) errors.Refused!void {

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! A model folder's safetensors as one name space (every backend's index): shard files, tensors mapped, leftovers refused.
 
 const std = @import("std");
@@ -7,8 +9,15 @@ const st = @import("safetensors.zig");
 pub const Tensor = st.Tensor;
 pub const DType = st.DType;
 
+pub const PackFile = struct { path: [:0]u8, layer: u32, width: u32 };
+pub const PackSelect = struct { ctx: *anyopaque, keep: *const fn (ctx: *anyopaque, layer: u32, width: u32, tensor: []const u8) bool };
+
 /// The checkpoint's shard paths in name order: model.safetensors.index.json's weight map, else every model*.safetensors.
 pub fn shardFiles(gpa: std.mem.Allocator, io: Io, dir: []const u8) ![][:0]u8 {
+    return shardFilesBut(gpa, io, dir, false);
+}
+
+fn shardFilesBut(gpa: std.mem.Allocator, io: Io, dir: []const u8, skip_packs: bool) ![][:0]u8 {
     var names: std.ArrayList([:0]u8) = .empty;
     errdefer {
         for (names.items) |n| gpa.free(n);
@@ -24,6 +33,7 @@ pub fn shardFiles(gpa: std.mem.Allocator, io: Io, dir: []const u8) ![][:0]u8 {
         defer seen.deinit(gpa);
         var it = parsed.value.object.get("weight_map").?.object.iterator();
         while (it.next()) |e| {
+            if (skip_packs and std.mem.startsWith(u8, e.value_ptr.string, "packs/")) continue;
             const file = e.value_ptr.string;
             if ((try seen.getOrPut(gpa, file)).found_existing) continue;
             try names.ensureUnusedCapacity(gpa, 1);
@@ -47,6 +57,51 @@ pub fn shardFiles(gpa: std.mem.Allocator, io: Io, dir: []const u8) ![][:0]u8 {
         }
     }.lt);
     return names.toOwnedSlice(gpa);
+}
+
+pub fn packFiles(gpa: std.mem.Allocator, io: Io, dir: []const u8) ![]PackFile {
+    const root = try std.fs.path.join(gpa, &.{ dir, "packs" });
+    defer gpa.free(root);
+    var out: std.ArrayList(PackFile) = .empty;
+    errdefer { for (out.items) |p| gpa.free(p.path); out.deinit(gpa); }
+    var pd = Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch return error.NoPacks;
+    defer pd.close(io);
+    var layers = pd.iterate();
+    while (try layers.next(io)) |le| {
+        if (le.kind != .directory) continue;
+        const layer = decimalFolder(le.name) orelse continue;
+        const sub = try std.fs.path.join(gpa, &.{ root, le.name });
+        defer gpa.free(sub);
+        var ld = try Io.Dir.cwd().openDir(io, sub, .{ .iterate = true });
+        defer ld.close(io);
+        var files = ld.iterate();
+        while (try files.next(io)) |fe| {
+            if (fe.kind != .file and fe.kind != .sym_link) continue;
+            const width = packWidth(fe.name) orelse continue;
+            try out.append(gpa, .{ .path = try std.fmt.allocPrintSentinel(gpa, "{s}/{s}/{s}", .{ root, le.name, fe.name }, 0), .layer = layer, .width = width });
+        }
+    }
+    if (out.items.len == 0) return error.NoPacks;
+    std.mem.sort(PackFile, out.items, {}, struct { fn lt(_: void, a: PackFile, b: PackFile) bool { return std.mem.order(u8, a.path, b.path) == .lt; } }.lt);
+    return out.toOwnedSlice(gpa);
+}
+
+pub fn freePackFiles(gpa: std.mem.Allocator, list: []PackFile) void { for (list) |p| gpa.free(p.path); gpa.free(list); }
+fn decimalFolder(name: []const u8) ?u32 { if (name.len < 2 or name[0] != 'L') return null; return std.fmt.parseInt(u32, name[1..], 10) catch null; }
+fn packWidth(name: []const u8) ?u32 {
+    if (!std.mem.startsWith(u8, name, "K") or !std.mem.endsWith(u8, name, ".safetensors")) return null;
+    const end = name.len - ".safetensors".len;
+    const dot = std.mem.indexOfScalarPos(u8, name, 1, '.') orelse return null;
+    if (dot >= end) return null;
+    const suffix = name[dot..end];
+    if (!std.mem.eql(u8, suffix, ".esel")) {
+        if (!std.mem.startsWith(u8, suffix, ".e")) return null;
+        const dash = std.mem.indexOfScalarPos(u8, suffix, 2, '-') orelse return null;
+        if (std.mem.indexOfScalarPos(u8, suffix, dash + 1, '-') != null) return null;
+        _ = std.fmt.parseInt(u32, suffix[2..dash], 10) catch return null;
+        _ = std.fmt.parseInt(u32, suffix[dash + 1 ..], 10) catch return null;
+    }
+    return std.fmt.parseInt(u32, name[1..dot], 10) catch null;
 }
 
 pub fn freeShardFiles(gpa: std.mem.Allocator, files: [][:0]u8) void {
@@ -82,6 +137,32 @@ pub const Checkpoint = struct {
         for (paths) |p| ck.files.appendAssumeCapacity(try st.File.openPrefix(gpa, io, p, prefix));
         return ck;
     }
+
+    pub fn openModelPacks(gpa: std.mem.Allocator, io: Io, dir: []const u8, select: PackSelect) !Checkpoint {
+        try @import("save_guard").check(io, dir);
+        const shards: [][:0]u8 = shardFilesBut(gpa, io, dir, true) catch |err| switch (err) { error.NoSafetensors => @constCast(&.{}), else => return err };
+        defer freeShardFiles(gpa, shards);
+        const packs = try packFiles(gpa, io, dir);
+        defer freePackFiles(gpa, packs);
+        var ck: Checkpoint = .{ .gpa = gpa, .io = io };
+        errdefer ck.close();
+        var names: std.StringHashMapUnmanaged(void) = .empty;
+        defer names.deinit(gpa);
+        for (shards) |p| try ck.files.append(gpa, try st.File.open(gpa, io, p));
+        for (packs) |p| {
+            const ctx = FilterCtx{ .select = select, .layer = p.layer, .width = p.width };
+            var f = try st.File.openFiltered(gpa, io, p.path, .{ .ctx = @constCast(&ctx), .keep = filterPack });
+            if (f.names.count() == 0) { f.close(io); continue; }
+            try ck.files.append(gpa, f);
+        }
+        for (ck.files.items) |f| for (f.names.keys()) |name| {
+            if ((try names.getOrPut(gpa, name)).found_existing) return error.DuplicateTensor;
+        };
+        return ck;
+    }
+
+    const FilterCtx = struct { select: PackSelect, layer: u32, width: u32 };
+    fn filterPack(raw: *anyopaque, tensor: []const u8) bool { const c: *const FilterCtx = @ptrCast(@alignCast(raw)); return c.select.keep(c.select.ctx, c.layer, c.width, tensor); }
 
     /// One more file (an MTP head beside the model's files).
     pub fn add(self: *Checkpoint, dir: []const u8, name: []const u8) !void {
@@ -189,6 +270,48 @@ fn addShard(gpa: std.mem.Allocator, io: Io, dir: []const u8) !void {
     var ck: Checkpoint = .{ .gpa = gpa, .io = io };
     defer ck.close();
     try ck.add(dir, "model-00001-of-00002.safetensors");
+}
+
+const PackTestSelect = struct {
+    width: u32,
+    all: bool = false,
+    fn keep(raw: *anyopaque, _: u32, width: u32, name: []const u8) bool {
+        const s: *const PackTestSelect = @ptrCast(@alignCast(raw));
+        return std.mem.eql(u8, name, "same") and (s.all or width == s.width);
+    }
+};
+
+test "pack store filters widths and rejects kept duplicate names" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "packs/L01");
+    for ([_][]const u8{ "K1.e0-1.safetensors", "K2.e0-1.safetensors" }) |file_name| {
+        const image = try testImage(gpa, "same", 1);
+        defer gpa.free(image);
+        var path: [96]u8 = undefined;
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&path, "packs/L01/{s}", .{file_name}), .data = image });
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"ignored\":\"packs/L01/K1.e0-1.safetensors\"}}" });
+    var dir_buf: [64]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const ordinary = try shardFiles(gpa, io, dir);
+    defer freeShardFiles(gpa, ordinary);
+    try std.testing.expectEqual(@as(usize, 1), ordinary.len);
+    try std.testing.expect(std.mem.endsWith(u8, ordinary[0], "packs/L01/K1.e0-1.safetensors"));
+    var wanted: PackTestSelect = .{ .width = 2 };
+    var ck = try Checkpoint.openModelPacks(gpa, io, dir, .{ .ctx = &wanted, .keep = PackTestSelect.keep });
+    try std.testing.expectEqual(@as(usize, 1), ck.files.items.len);
+    try std.testing.expect(ck.has("same"));
+    ck.close();
+    wanted.all = true;
+    try std.testing.expectError(error.DuplicateTensor, Checkpoint.openModelPacks(gpa, io, dir, .{ .ctx = &wanted, .keep = PackTestSelect.keep }));
+    wanted.all = false;
+    wanted.width = 3;
+    ck = try Checkpoint.openModelPacks(gpa, io, dir, .{ .ctx = &wanted, .keep = PackTestSelect.keep });
+    try std.testing.expectEqual(@as(usize, 0), ck.files.items.len);
+    ck.close();
 }
 
 test "a failed allocation while a checkpoint opens leaves nothing behind" {

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! Quantized projections behind one call: a weight view per format, with decode rows and prompt rows chosen per format.
 const std = @import("std");
 const driver = @import("driver.zig");
@@ -62,6 +64,7 @@ pub const Weight = union(enum) {
     exl3: exl3.Weight,
     affine4: Affine4,
     fp8g: qmmf.Weight,
+    fp8b: qmmf.Weight, // native 128x128 block scales, rounded to bf16 before the MMA
     mxfp8: qmmf.Weight, // e4m3 with UE8M0 scale bytes per 32 inputs
     nvfp4: qmmf.Weight,
     fp8: qmmf.Weight, // e4m3 with one fp32 scale (ModelOpt FP8)
@@ -73,7 +76,7 @@ pub const Weight = union(enum) {
         return switch (w) {
             .exl3 => |q| q.n,
             .affine4 => |q| q.n,
-            .fp8g, .mxfp8, .nvfp4, .fp8, .bf16 => |q| q.n,
+            .fp8g, .fp8b, .mxfp8, .nvfp4, .fp8, .bf16 => |q| q.n,
             .q8_0, .iq2xxs => |q| q.n,
         };
     }
@@ -82,7 +85,7 @@ pub const Weight = union(enum) {
         return switch (w) {
             .exl3 => |q| q.k,
             .affine4 => |q| q.k,
-            .fp8g, .mxfp8, .nvfp4, .fp8, .bf16 => |q| q.k,
+            .fp8g, .fp8b, .mxfp8, .nvfp4, .fp8, .bf16 => |q| q.k,
             .q8_0, .iq2xxs => |q| q.k,
         };
     }
@@ -123,6 +126,7 @@ pub const Linear = struct {
                 return a.decode(s, in.x, in.sums, q, out, rows);
             },
             .fp8g => |q| return l.onLane(s, q, .fp8g, in, out, rows),
+            .fp8b => |q| return l.onLane(s, q, .fp8b, in, out, rows),
             .mxfp8 => |q| return l.onLane(s, q, .mxfp8, in, out, rows),
             .nvfp4 => |q| return l.onLane(s, q, .fp4, in, out, rows),
             .fp8 => |q| return if (q.act != 0 and l.ck != null) l.checkpoint(s, l.ck.?, q, in, out, rows) else l.onLane(s, q, .fp8, in, out, rows),
@@ -145,6 +149,7 @@ pub const Linear = struct {
                 return a.prompt(s, in.x, q, out, rows);
             },
             .fp8g => |q| return l.onLane(s, q, .fp8g, in, out, rows),
+            .fp8b => |q| return l.onLane(s, q, .fp8b, in, out, rows),
             .mxfp8 => |q| return l.onLane(s, q, .mxfp8, in, out, rows),
             .nvfp4 => |q| return l.onPrompt(s, q, .fp4, in, out, rows),
             .fp8 => |q| return if (q.act != 0 and l.ck != null) l.checkpoint(s, l.ck.?, q, in, out, rows) else l.onPrompt(s, q, .fp8, in, out, rows),
@@ -162,6 +167,7 @@ pub const Linear = struct {
                 if (in.ldx != 0 and in.ldx != q.k) return error.RowStride;
                 return e.decode(s, q, in.x, .bf16, rows, out, .f32);
             },
+            .fp8b => |q| return l.onLaneAs(s, q, .fp8b, in, out, .f32, rows),
             .nvfp4 => |q| q,
             else => return error.EpilogueNotBuilt,
         };
@@ -176,6 +182,7 @@ pub const Linear = struct {
                 if (in.ldx != 0 and in.ldx != q.k) return error.RowStride;
                 return e.prompt(s, q, in.x, .bf16, rows, out, .f32);
             },
+            .fp8b => |q| return l.onLaneAs(s, q, .fp8b, in, out, .f32, rows),
             .nvfp4 => |q| q,
             else => return error.EpilogueNotBuilt,
         };
@@ -464,6 +471,10 @@ test "split_k follows the Python shapes" {
     try std.testing.expectEqual(@as(usize, 2), splitK(4608, 2688));
     try std.testing.expectEqual(@as(usize, 4), splitK(2688, 5376));
     try std.testing.expectEqual(@as(usize, 1), splitK(131072, 2688));
+}
+
+test {
+    std.testing.refAllDecls(@This());
 }
 
 test {

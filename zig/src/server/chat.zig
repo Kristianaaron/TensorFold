@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! One reply, as ``ChatApp.chat`` makes it: render, submit to the engine, stream text, reasoning and calls.
 const std = @import("std");
 const api = @import("engine_api");
@@ -70,6 +72,18 @@ pub const Failure = error{ Refused, Cancelled, Failed, OutOfMemory };
 
 const nowNs = clock.nowNs;
 const seconds = clock.seconds;
+
+/// The long-period detector is an opt-in extension of the existing server guard.
+fn longLoopGuardEnabled() bool {
+    const value = std.c.getenv("TF_GLM53_LOOP_GUARD");
+    const long = value != null and std.mem.eql(u8, std.mem.span(value.?), "long");
+    return long or longLoopGuardV2();
+}
+
+fn longLoopGuardV2() bool {
+    const value = std.c.getenv("TF_GLM53_LOOP_GUARD_LONG") orelse return false;
+    return std.mem.eql(u8, std.mem.span(value), "1");
+}
 
 /// Python's ``bool(fields.get(key))`` on the sampling fields.
 fn flag(f: Value, key: []const u8) ?bool {
@@ -155,8 +169,14 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         if (budget > 0 and !srv.info.thinking_budget)
             return cx.refuse("thinking_budget is not supported by this native engine");
         if (srv.think_close.len > 0) request.loop_guard = srv.config.loop_guard;
+        request.loop_guard_long = request.loop_guard and longLoopGuardEnabled();
+        if (longLoopGuardV2()) request.loop_long = srv.loop_long;
         if ((budget > 0 or request.loop_guard) and srv.think_close.len > 0) {
-            if (budget > 0) request.think_budget = @intCast(@min(budget, std.math.maxInt(u32)));
+            if (budget > 0) {
+                request.think_budget = @intCast(@min(budget, std.math.maxInt(u32)));
+                request.think_soft_bits = srv.think_soft_bits;
+                request.think_soft_cap = srv.think_soft_cap;
+            }
             request.think_close = srv.think_close;
             request.think_end = srv.think_close_end;
         }

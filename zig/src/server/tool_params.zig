@@ -15,8 +15,13 @@ pub fn parseObject(a: Allocator, text: []const u8) Allocator.Error!?Value {
     return if (v == .object) v else null;
 }
 
+const ToolSchemas = struct {
+    root: Value,
+    properties: *const json.Object,
+};
+
 /// Each offered tool's parameter schemas by lowercase name.
-pub const Schemas = std.StringHashMapUnmanaged(*const json.Object);
+pub const Schemas = std.StringHashMapUnmanaged(ToolSchemas);
 
 pub fn schemas(a: Allocator, tools: []const Value) Allocator.Error!Schemas {
     var out: Schemas = .empty;
@@ -40,7 +45,7 @@ pub fn schemas(a: Allocator, tools: []const Value) Allocator.Error!Schemas {
             if (v == .object) try kept.put(a, k, v);
         };
         const name = if (function.get("name")) |n| try tool_specs.pyStr(a, n) else "";
-        try out.put(a, try std.ascii.allocLowerString(a, name), kept);
+        try out.put(a, try std.ascii.allocLowerString(a, name), .{ .root = parameters, .properties = kept });
     }
     return out;
 }
@@ -48,8 +53,9 @@ pub fn schemas(a: Allocator, tools: []const Value) Allocator.Error!Schemas {
 /// The schema of ``key`` in tool ``name``, or an empty one.
 pub fn schemaOf(s: *const Schemas, name: []const u8, key: []const u8, a: Allocator) Allocator.Error!Value {
     const lower = try std.ascii.allocLowerString(a, name);
-    const props = s.get(lower) orelse return .{ .object = try json.newObject(a) };
-    return props.get(key) orelse .{ .object = try json.newObject(a) };
+    const tool = s.get(lower) orelse return .{ .object = try json.newObject(a) };
+    const schema = tool.properties.get(key) orelse return .{ .object = try json.newObject(a) };
+    return try effectiveSchema(tool.root, schema, a);
 }
 
 const Kind = enum { array, object, boolean, integer, number, null };
@@ -58,6 +64,116 @@ fn kindOf(schema: Value) ?Kind {
     const t = schema.get("type") orelse return null;
     if (t != .string) return null;
     return std.meta.stringToEnum(Kind, t.string);
+}
+
+/// Resolve local schema references and nullable unions for one tool's parameter root.
+pub fn effectiveSchema(root: Value, schema: Value, a: Allocator) Allocator.Error!Value {
+    var seen: [8][]const u8 = undefined;
+    return effectiveSchemaDepth(root, schema, a, &seen, 0);
+}
+
+fn effectiveSchemaDepth(root: Value, schema: Value, a: Allocator, seen: *[8][]const u8, depth: usize) Allocator.Error!Value {
+    if (depth >= seen.len or schema != .object) return schema;
+    if (schema.get("type")) |declared| if (declared == .string) return schema;
+
+    if (schema.get("$ref")) |reference| {
+        if (reference == .string and std.mem.startsWith(u8, reference.string, "#/")) {
+            for (seen[0..depth]) |previous| if (std.mem.eql(u8, previous, reference.string)) return schema;
+            const target = try resolvePointer(root, reference.string[2..], a) orelse return schema;
+            seen[depth] = reference.string;
+            return effectiveSchemaDepth(root, target, a, seen, depth + 1);
+        }
+    }
+
+    for ([_][]const u8{ "anyOf", "oneOf" }) |choice_key| {
+        const choices = schema.get(choice_key) orelse continue;
+        if (choices != .array) continue;
+        var only: ?Value = null;
+        var count: usize = 0;
+        var removed_null = false;
+        for (choices.array) |choice| {
+            if (isNullSchema(choice)) {
+                removed_null = true;
+                continue;
+            }
+            only = choice;
+            count += 1;
+            if (count > 1) break;
+        }
+        if (count == 1) {
+            const resolved = try effectiveSchemaDepth(root, only.?, a, seen, depth + 1);
+            return if (removed_null) try markNullable(resolved, a) else resolved;
+        }
+        return schema;
+    }
+
+    if (schema.get("type")) |declared| if (declared == .array) {
+        var remaining: ?[]const u8 = null;
+        var count: usize = 0;
+        var removed_null = false;
+        for (declared.array) |entry| {
+            if (entry == .string and std.mem.eql(u8, entry.string, "null")) {
+                removed_null = true;
+                continue;
+            }
+            if (entry != .string) continue;
+            remaining = entry.string;
+            count += 1;
+            if (count > 1) break;
+        }
+        if (count == 1) {
+            const copy = try json.newObject(a);
+            for (schema.object.keys(), schema.object.values()) |key, value| {
+                if (std.mem.eql(u8, key, "type")) {
+                    try copy.put(a, key, .{ .string = remaining.? });
+                } else try copy.put(a, key, value);
+            }
+            if (removed_null) try copy.put(a, "x-tfz-nullable", .{ .bool = true });
+            return .{ .object = copy };
+        }
+    };
+    return schema;
+}
+
+fn markNullable(schema: Value, a: Allocator) Allocator.Error!Value {
+    if (schema != .object) return schema;
+    const copy = try json.newObject(a);
+    for (schema.object.keys(), schema.object.values()) |key, value| try copy.put(a, key, value);
+    try copy.put(a, "x-tfz-nullable", .{ .bool = true });
+    return .{ .object = copy };
+}
+
+fn isNullSchema(schema: Value) bool {
+    const declared = schema.get("type") orelse return false;
+    return declared == .string and std.mem.eql(u8, declared.string, "null");
+}
+
+fn resolvePointer(root: Value, pointer: []const u8, a: Allocator) Allocator.Error!?Value {
+    var current = root;
+    var parts = std.mem.splitScalar(u8, pointer, '/');
+    while (parts.next()) |part| {
+        var token: std.ArrayList(u8) = .empty;
+        var i: usize = 0;
+        while (i < part.len) : (i += 1) {
+            if (part[i] == '~' and i + 1 < part.len) {
+                i += 1;
+                try token.append(a, if (part[i] == '0') '~' else if (part[i] == '1') '/' else part[i]);
+            } else try token.append(a, part[i]);
+        }
+        if (current == .object) {
+            current = current.object.get(token.items) orelse return null;
+        } else if (current == .array) {
+            const index = std.fmt.parseInt(usize, token.items, 10) catch return null;
+            if (index >= current.array.len) return null;
+            current = current.array[index];
+        } else return null;
+    }
+    return current;
+}
+
+/// A schema with no declared type admits an object or array written as JSON; all other text stays text.
+pub fn schemaUntyped(schema: Value) bool {
+    return schema.get("type") == null;
 }
 
 fn valid(kind: Kind, v: Value) bool {
@@ -113,7 +229,11 @@ pub fn closedJson(a: Allocator, text: []const u8) Allocator.Error!?[]const u8 {
 
 /// ``decode_parameter``: the schema's type when the text spells one, else the text; ``python`` also reads Python's spelling.
 pub fn decode(a: Allocator, value: []const u8, schema: Value, python: bool) Allocator.Error!Value {
-    const kind = kindOf(schema) orelse return .{ .string = value };
+    const kind = kindOf(schema) orelse return if (schemaUntyped(schema)) try untyped(a, value) else .{ .string = value };
+    if (schema.get("x-tfz-nullable")) |nullable| if (nullable == .bool and nullable.bool) {
+        const stripped = reply_text.pyStrip(value);
+        if (std.ascii.eqlIgnoreCase(stripped, "null") or (python and std.ascii.eqlIgnoreCase(stripped, "none"))) return .null;
+    };
     const closed: ?[]const u8 = if (kind == .array or kind == .object) try closedJson(a, value) else null;
     for ([_]?[]const u8{ value, closed }) |candidate| {
         const text = candidate orelse continue;
@@ -128,6 +248,19 @@ pub fn decode(a: Allocator, value: []const u8, schema: Value, python: bool) Allo
     const parsed = (try pythonLiteral(a, value)) orelse return .{ .string = value };
     if (!finite(parsed)) return .{ .string = value };
     return if (valid(kind, parsed)) parsed else .{ .string = value };
+}
+
+fn untyped(a: Allocator, value: []const u8) Allocator.Error!Value {
+    const closed = try closedJson(a, value);
+    for ([_]?[]const u8{ value, closed }) |candidate| {
+        const text = candidate orelse continue;
+        const parsed = switch (try json.parseText(a, text)) {
+            .ok => |v| v,
+            .err => continue,
+        };
+        if ((parsed == .object or parsed == .array) and finite(parsed)) return parsed;
+    }
+    return .{ .string = value };
 }
 
 /// ``_python_literal``: True, None, quoted strings, numbers, lists, tuples and dicts; null if ``text`` is not one.
@@ -387,4 +520,59 @@ test "decode parameters" {
     const py = try decode(a, "['a', None, True]", arr, true);
     try std.testing.expectEqualStrings("[\"a\", null, true]", try json.stringify(a, py, .{}));
     try std.testing.expectEqual(Value.null, (try decode(a, " None ", (try json.parse(a, "{\"type\": \"null\"}")).ok, true)));
+}
+
+test "effective schemas resolve local refs and nullable forms" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = (try json.parse(a, "{\"$defs\":{\"Limit\":{\"type\":\"integer\"},\"Nested\":{\"type\":\"object\",\"properties\":{\"limit\":{\"$ref\":\"#/$defs/Limit\"}}}},\"definitions\":{\"Label\":{\"type\":\"string\"}}}")).ok;
+    const ref = (try json.parse(a, "{\"$ref\":\"#/$defs/Limit\"}")).ok;
+    const any_of = (try json.parse(a, "{\"anyOf\":[{\"type\":\"integer\"},{\"type\":\"null\"}]}")).ok;
+    const one_of = (try json.parse(a, "{\"oneOf\":[{\"type\":\"string\"},{\"type\":\"null\"}]}")).ok;
+    const types = (try json.parse(a, "{\"type\":[\"integer\",\"null\"]}")).ok;
+    const expected_int = (try json.parse(a, "{\"type\":\"integer\"}")).ok;
+    const resolved_ref = try effectiveSchema(root, ref, a);
+    try std.testing.expectEqualStrings(try json.stringify(a, expected_int, .{}), try json.stringify(a, resolved_ref, .{}));
+    const resolved_any = try effectiveSchema(root, any_of, a);
+    try std.testing.expectEqualStrings("integer", resolved_any.get("type").?.string);
+    const resolved_one = try effectiveSchema(root, one_of, a);
+    try std.testing.expectEqualStrings("string", resolved_one.get("type").?.string);
+    const resolved_types = try effectiveSchema(root, types, a);
+    try std.testing.expectEqualStrings("integer", resolved_types.get("type").?.string);
+    try std.testing.expectEqual(Value.null, try decode(a, "null", resolved_any, false));
+    try std.testing.expectEqual(Value.null, try decode(a, "null", resolved_types, false));
+    try std.testing.expectEqualStrings("5", (try decode(a, "5", resolved_any, false)).int);
+
+    const nested = (try json.parse(a, "{\"$ref\":\"#/$defs/Nested\"}")).ok;
+    const nested_resolved = try effectiveSchema(root, nested, a);
+    try std.testing.expectEqualStrings("object", nested_resolved.get("type").?.string);
+    const cycle_root = (try json.parse(a, "{\"$defs\":{\"A\":{\"$ref\":\"#/$defs/B\"},\"B\":{\"$ref\":\"#/$defs/A\"}}}")).ok;
+    const cycle = (try json.parse(a, "{\"$ref\":\"#/$defs/A\"}")).ok;
+    try std.testing.expect((try effectiveSchema(cycle_root, cycle, a)).get("type") == null);
+    const unresolved = (try json.parse(a, "{\"$ref\":\"#/$defs/Missing\"}")).ok;
+    try std.testing.expectEqualStrings(try json.stringify(a, unresolved, .{}), try json.stringify(a, try effectiveSchema(root, unresolved, a), .{}));
+    const nullable_string = try effectiveSchema(root, (try json.parse(a, "{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}]}")).ok, a);
+    try std.testing.expectEqualStrings("hello", (try decode(a, "hello", nullable_string, false)).string);
+    const definition_ref = try effectiveSchema(root, (try json.parse(a, "{\"$ref\":\"#/definitions/Label\"}")).ok, a);
+    try std.testing.expectEqualStrings("string", definition_ref.get("type").?.string);
+}
+
+test "untyped parameters decode JSON containers and preserve scalar text" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const empty_schema = (try json.parse(a, "{}")).ok;
+    const obj = try decode(a, "{\"id\": 7, \"tags\": [\"alpha\", \"beta\"]}", empty_schema, false);
+    try std.testing.expectEqualStrings("7", obj.object.get("id").?.int);
+    try std.testing.expectEqual(@as(usize, 2), obj.object.get("tags").?.array.len);
+    const arr = try decode(a, "[1, 2]", empty_schema, false);
+    try std.testing.expectEqual(@as(usize, 2), arr.array.len);
+    const open = try decode(a, "{\"id\": 7", empty_schema, false);
+    try std.testing.expectEqualStrings("7", open.object.get("id").?.int);
+    for ([_][]const u8{ "hello world", "42", "true", "null", "\"quoted\"", "{not json}", "" }) |text| {
+        try std.testing.expectEqualStrings(text, (try decode(a, text, empty_schema, false)).string);
+    }
+    const string_schema = (try json.parse(a, "{\"type\":\"string\"}")).ok;
+    try std.testing.expectEqualStrings("{\"id\": 7}", (try decode(a, "{\"id\": 7}", string_schema, false)).string);
 }

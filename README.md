@@ -1,5 +1,12 @@
 # TensorFold
 
+> This is an independent fork of TensorFold for GLM-5.3 on two DGX Sparks. It is not affiliated with or endorsed by
+> the TensorFold project. See `NOTICE` and `THIRD_PARTY_NOTICES.md` for credits.
+
+
+Ash (ashhart, TensorFold Labs) created TensorFold. This repository is a fork of TensorFold. This fork does not imply review or endorsement by Ash or TensorFold Labs. Matt Mastracci (mmastrac, Kindling AI) is credited for the EXLR8 multi-width store and FP8-aware rounding ideas; this does not imply review or endorsement.
+
+
 TensorFold serves language models from a Zig binary on Apple Silicon and NVIDIA GPUs.
 The engine reads checkpoints, tokenizes requests and runs Metal or CUDA kernels directly.
 Serving needs no Python or MLX installation.

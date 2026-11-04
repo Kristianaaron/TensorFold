@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! One stream (Python LaneStream) and the round loop's state for it (Python's dicts keyed by stream id).
 const std = @import("std");
 const grammar = @import("grammar.zig");
@@ -27,6 +29,103 @@ pub const Mode = enum { pipe, drain, verify, exit };
 pub const loop_max_period: usize = 8;
 pub const loop_min_run: usize = 256;
 pub const loop_warm_in: usize = 64;
+pub const long_loop_max_period: usize = 512;
+pub const long_loop_min_repeats: usize = 4;
+pub const long_loop_min_span: usize = 256;
+
+pub const LongLoopConfig = struct {
+    v2: bool = false,
+    repeats: u32 = 3,
+    min_span: u32 = 256,
+    counters: []const [2]u32 = &.{},
+    inert_bits: []const u64 = &.{},
+    mark_bits: []const u64 = &.{},
+};
+
+/// Per-period consecutive match counts for the long-period detector.
+pub const LongLoopDetector = struct {
+    runs: [long_loop_max_period + 1]u16 = @splat(0),
+    cruns: [long_loop_max_period + 1]u16 = @splat(0),
+
+    /// Add one token, comparing it with the token `period` positions back.
+    fn push(d: *LongLoopDetector, token: u32, prior: anytype) ?u32 {
+        const index = prior.len;
+        for (1..long_loop_max_period + 1) |period| {
+            if (index < period) continue;
+            if (prior.at(index - period) == token) {
+                d.runs[period] +|= 1;
+            } else {
+                d.runs[period] = 0;
+            }
+            const span = @max(period * long_loop_min_repeats, long_loop_min_span);
+            if (index + 1 >= span and @as(usize, d.runs[period]) >= span - period) return @intCast(period);
+        }
+        return null;
+    }
+
+    fn pushV2(d: *LongLoopDetector, token: u32, prior: anytype, cfg: *const LongLoopConfig) ?u32 {
+        const index = prior.len;
+        for (1..long_loop_max_period + 1) |period| {
+            if (index < period) continue;
+            const left = prior.at(index - period);
+            if (left == token) {
+                d.runs[period] +|= 1;
+            } else {
+                d.runs[period] = 0;
+            }
+            const left_value = counterFor(cfg.counters, left);
+            const token_value = counterFor(cfg.counters, token);
+            if (left == token or (left_value != null and token_value != null and token_value.? == left_value.? +| 1)) {
+                d.cruns[period] +|= 1;
+            } else {
+                d.cruns[period] = 0;
+            }
+            const repeat_span: usize = period * @as(usize, cfg.repeats);
+            const span: usize = @max(repeat_span, @as(usize, cfg.min_span));
+            const need = span - period;
+            if (index + 1 < span or (@as(usize, d.runs[period]) < need and (period == 1 or @as(usize, d.cruns[period]) < need))) continue;
+            var inert = true;
+            var marked = false;
+            const start = index + 1 - period;
+            for (start..index) |at| {
+                const body_token = prior.at(at);
+                inert = inert and bitSet(cfg.inert_bits, body_token);
+                marked = marked or bitSet(cfg.mark_bits, body_token);
+            }
+            inert = inert and bitSet(cfg.inert_bits, token);
+            marked = marked or bitSet(cfg.mark_bits, token);
+            if (inert and marked) continue;
+            return @intCast(period);
+        }
+        return null;
+    }
+};
+
+fn bitSet(bits: []const u64, id: u32) bool {
+    const word: usize = @intCast(id / 64);
+    return word < bits.len and bits[word] & (@as(u64, 1) << @intCast(id % 64)) != 0;
+}
+
+fn counterFor(entries: []const [2]u32, id: u32) ?u32 {
+    var low: usize = 0;
+    var high = entries.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        if (entries[mid][0] < id) low = mid + 1 else high = mid;
+    }
+    return if (low < entries.len and entries[low][0] == id) entries[low][1] else null;
+}
+
+fn SliceHistory(comptime Head: type, comptime Tail: type) type {
+    return struct {
+        head: Head,
+        tail: Tail,
+        len: usize,
+        fn at(h: @This(), index: usize) u32 {
+            return if (index < h.head.len) h.head[index] else h.tail[index - h.head.len];
+        }
+    };
+}
 
 /// Return the shortest exact cycle at the end of a combined token prefix.
 fn cycleAt(head: []const u32, tail: []const u32, n: usize) ?u32 {
@@ -53,8 +152,16 @@ fn cycleAt(head: []const u32, tail: []const u32, n: usize) ?u32 {
 /// Return the first token index in a candidate batch that would fire the guard.
 pub fn loopCut(s: *const Stream, tokens: []const u32) ?usize {
     if (!s.loop_guard or !s.think_open or s.think_end < 0 or s.loop_period != null) return null;
+    var detector = s.long_loop_detector;
     for (tokens, 0..) |token, i| {
         if (@as(i64, token) == s.think_end) return null;
+        if (s.loop_guard_long) {
+            const history = SliceHistory([]const u32, []const u32){ .head = s.emitted(), .tail = tokens[0..i], .len = s.emitted().len + i };
+            if (s.loop_long.v2) {
+                if (detector.pushV2(token, history, &s.loop_long) != null) return i;
+            } else if (detector.push(token, history) != null) return i;
+            continue;
+        }
         if (cycleAt(s.emitted(), tokens, s.emitted().len + i + 1) != null) return i;
     }
     return null;
@@ -121,10 +228,14 @@ pub const Spec = struct {
     cancel_check: ?CancelCheck = null,
     yield_check: ?CancelCheck = null, // a background prompt pass: real work waits, so it keeps what it has and stops
     think_budget: u32 = 0,
+    think_soft_bits: []const u64 = &.{},
+    think_soft_cap: u32 = 0,
     think_close: []const u32 = &.{},
     think_end: i64 = -1,
     think_open: ?bool = null, // null: open when a budget is set (the server's rule)
     loop_guard: bool = false,
+    loop_guard_long: bool = false,
+    loop_long: LongLoopConfig = .{},
     chunks: []const u32 = &.{}, // where prefill chunks start after 0 (Python's PrefillPlan); empty: the backend's step
     history_len: u32 = 0, // prompt prefix lengths a backend may keep for a later turn: the rendered history,
     shared_prefixes: []const u32 = &.{}, // then shared system blocks
@@ -137,6 +248,7 @@ pub const Spec = struct {
     decode_spans: []const [2]u32 = &.{}, // prompt rows an earlier reply decoded (Request.decode_spans), for backends that keep their bits
     images: []const Image = &.{}, // in prompt order; the backend's tower fills their rows
     key: []const u32 = &.{}, // the prompt as the cache matches it (image rows by their image); empty: the prompt
+    ablate: bool = false,
 };
 
 pub const Stream = struct {
@@ -152,10 +264,15 @@ pub const Stream = struct {
     cancel_check: ?CancelCheck,
     yield_check: ?CancelCheck,
     think_budget: u32,
+    think_soft_bits: []const u64 = &.{},
+    think_soft_cap: u32 = 0,
     think_close: []const u32,
     think_end: i64,
     think_open: bool,
     loop_guard: bool,
+    loop_guard_long: bool = false,
+    loop_long: LongLoopConfig = .{},
+    long_loop_detector: LongLoopDetector = .{},
     loop_period: ?u32 = null,
     chunks: []const u32,
     history_len: u32,
@@ -172,6 +289,7 @@ pub const Stream = struct {
     untaught: bool = false,
     images: []const Image = &.{},
     key: []const u32 = &.{},
+    ablate: bool = false,
     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
     fill_at: std.atomic.Value(u32) = .init(0), // prompt tokens the pass has prefilled; the engine thread writes
     reuse_failed: bool = false, // the backend's restore of `reuse` failed: it prefilled from 0
@@ -183,6 +301,9 @@ pub const Stream = struct {
     finished: bool = false,
     reason: Reason = .none,
     rounds: u64 = 0,
+    head_rounds: u64 = 0,
+    head_multi_rounds: u64 = 0,
+    head_rows: u64 = 0,
     cost_probe_after: u64 = 8, // completed rounds before the next calibration trial is owed
     cost_probe_spacing: u64 = 8, // the latest trial interval, including its expected repayment bound
     cost_probes: [129]@import("lone_costs.zig").Cooldown = @splat(.{}), // per-width losing-trial retry deadlines
@@ -211,6 +332,7 @@ pub const Stream = struct {
     inflight: ?u64 = null,
     served: ?u64 = null,
     granted: ?u32 = null,
+    grant_short: bool = false,
     copy_width: ?u32 = null,
 
     pub fn init(gpa: Allocator, spec: Spec) !Stream {
@@ -227,10 +349,14 @@ pub const Stream = struct {
             .cancel_check = spec.cancel_check,
             .yield_check = spec.yield_check,
             .think_budget = spec.think_budget,
+            .think_soft_bits = spec.think_soft_bits,
+            .think_soft_cap = spec.think_soft_cap,
             .think_close = spec.think_close,
             .think_end = spec.think_end,
             .think_open = spec.think_open orelse (spec.think_budget > 0 or (spec.loop_guard and spec.think_end >= 0)),
             .loop_guard = spec.loop_guard,
+            .loop_guard_long = spec.loop_guard_long,
+            .loop_long = spec.loop_long,
             .chunks = spec.chunks,
             .history_len = spec.history_len,
             .shared_prefixes = spec.shared_prefixes,
@@ -244,6 +370,7 @@ pub const Stream = struct {
             .decode_spans = spec.decode_spans,
             .images = spec.images,
             .key = spec.key,
+            .ablate = spec.ablate,
         };
         // under a grammar a forced close ends at the think end: the grammar takes the reply from the next token
         if (spec.grammar) |g| if (g.after) |end| if (std.mem.indexOfScalar(u32, s.think_close, end)) |at| {
@@ -311,10 +438,30 @@ pub const Stream = struct {
         return s.think_open and s.think_budget > 0 and s.think_close.len > 0;
     }
 
+    fn softOn(s: *const Stream) bool {
+        return s.think_soft_bits.len > 0 and s.think_soft_cap > 0;
+    }
+
+    fn isBoundary(s: *const Stream, token: u32) bool {
+        return bitSet(s.think_soft_bits, token);
+    }
+
     /// The index the thinking budget replaces with `think_close[0]`, or null if the block closed first.
     pub fn thinkCut(s: *const Stream, tokens: anytype) ?usize {
         if (!s.budgetActive()) return null;
         const done = s.emitted().len;
+        if (s.softOn()) {
+            for (tokens, 0..) |t, i| {
+                const n = done + i + 1;
+                if (n >= @as(usize, s.think_budget) + s.think_soft_cap) return i;
+                if (n >= s.think_budget) {
+                    const prev: ?u32 = if (i > 0) tokens[i - 1] else if (done > 0) s.emitted()[done - 1] else null;
+                    if (prev) |p| if (s.isBoundary(p)) return i;
+                }
+                if (@as(i64, t) == s.think_end) return null;
+            }
+            return null;
+        }
         for (tokens, 0..) |t, i| {
             if (done + i + 1 >= s.think_budget) return i;
             if (@as(i64, t) == s.think_end) return null;
@@ -329,6 +476,10 @@ pub const Stream = struct {
 
     /// Python `think_cut([-1]) == 0`: the next position is the budget's cut.
     pub fn cutsNext(s: *const Stream) bool {
+        if (s.softOn()) {
+            const emitted_tokens = s.emitted();
+            return s.budgetActive() and ((emitted_tokens.len + 1 >= s.think_budget and emitted_tokens.len > 0 and s.isBoundary(emitted_tokens[emitted_tokens.len - 1])) or emitted_tokens.len + 1 >= @as(usize, s.think_budget) + s.think_soft_cap);
+        }
         return s.budgetActive() and s.emitted().len + 1 >= s.think_budget;
     }
 
@@ -343,7 +494,10 @@ pub const Stream = struct {
     /// Tokens a round may commit before the length limit or the thinking budget's cut.
     pub fn draftRoom(s: *const Stream) i64 {
         var room = s.budgetLeft();
-        if (s.budgetActive()) room = @min(room, @as(i64, s.think_budget) - @as(i64, @intCast(s.emitted().len)));
+        if (s.budgetActive()) {
+            const limit: i64 = @as(i64, s.think_budget) + (if (s.softOn()) @as(i64, s.think_soft_cap) else 0);
+            room = @min(room, limit - @as(i64, @intCast(s.emitted().len)));
+        }
         return room;
     }
 
@@ -392,7 +546,18 @@ pub const Stream = struct {
                     break;
                 }
             }
-            const fire = if (s.loop_guard and s.think_open and s.think_end >= 0 and s.loop_period == null) detectLoop(s.emitted()) else null;
+            var fire: ?u32 = null;
+            if (s.loop_guard and s.think_open and s.think_end >= 0 and s.loop_period == null) {
+                if (s.loop_guard_long) {
+                    const current = s.emitted();
+                    if (current.len > 0) {
+                        const history = SliceHistory([]const u32, []const u32){ .head = current[0 .. current.len - 1], .tail = &.{}, .len = current.len - 1 };
+                        fire = if (s.loop_long.v2) s.long_loop_detector.pushV2(t, history, &s.loop_long) else s.long_loop_detector.push(t, history);
+                    }
+                } else {
+                    fire = detectLoop(s.emitted());
+                }
+            }
             if (s.isEos(t) or s.stopped()) {
                 s.finished = true;
                 s.reason = .stop;
@@ -457,6 +622,195 @@ test "loop guard stops at the cap even when no cycle fires" {
     defer guarded.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 10), try guarded.commit(gpa, &tokens, &.{}));
     try std.testing.expect(guarded.finished and guarded.reason == .length);
+}
+
+fn bruteLongLoop(tokens: []const u32, repeats: usize, min_span: usize, max_period: usize) ?u32 {
+    for (1..max_period + 1) |period| {
+        const span = @max(period * repeats, min_span);
+        if (tokens.len < span) continue;
+        var matches = true;
+        for (period..span) |at| {
+            if (tokens[tokens.len - span + at] != tokens[tokens.len - span + at - period]) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches) return @intCast(period);
+    }
+    return null;
+}
+
+fn detectLongLoop(tokens: []const u32) ?u32 {
+    var detector: LongLoopDetector = .{};
+    for (tokens, 0..) |token, i| {
+        const history = SliceHistory([]const u32, []const u32){ .head = tokens[0..i], .tail = &.{}, .len = i };
+        if (detector.push(token, history)) |period| return period;
+    }
+    return null;
+}
+
+test "long loop detector finds a period three cycle at min span" {
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*token, i| token.* = @intCast(i % 3);
+    try std.testing.expectEqual(@as(?u32, 3), detectLongLoop(&tokens));
+    try std.testing.expectEqual(@as(?u32, null), detectLongLoop(tokens[0..255]));
+    try std.testing.expectEqual(@as(?u32, 3), detectLongLoop(tokens[0..256]));
+    var detector: LongLoopDetector = .{};
+    var detected_at: ?usize = null;
+    for (tokens, 0..) |token, i| {
+        const history = SliceHistory([]const u32, []const u32){ .head = tokens[0..i], .tail = &.{}, .len = i };
+        if (detector.push(token, history)) |_| {
+            detected_at = i + 1;
+            break;
+        }
+    }
+    try std.testing.expectEqual(@as(?usize, 256), detected_at);
+}
+
+test "long loop detector enforces min span for period one" {
+    var tokens: [256]u32 = @splat(7);
+    try std.testing.expectEqual(@as(?u32, null), detectLongLoop(tokens[0..255]));
+    try std.testing.expectEqual(@as(?u32, 1), detectLongLoop(&tokens));
+}
+
+test "long loop detector rejects a long non-periodic sequence" {
+    var tokens: [4096]u32 = undefined;
+    for (&tokens, 0..) |*token, i| token.* = @intCast(i);
+    try std.testing.expectEqual(@as(?u32, null), detectLongLoop(&tokens));
+}
+
+test "incremental long loop detector agrees with brute force on random planted loops" {
+    var random = std.Random.DefaultPrng.init(0x53_10_2026);
+    const rng = random.random();
+    for (1..20) |case| {
+        const period = 1 + case % 19;
+        const prefix_len = 80 + case;
+        const total_len = prefix_len + 420;
+        const tokens = try std.testing.allocator.alloc(u32, total_len);
+        defer std.testing.allocator.free(tokens);
+        for (tokens[0..prefix_len]) |*token| token.* = rng.int(u32);
+        var pattern: [19]u32 = undefined;
+        for (pattern[0..period]) |*token| token.* = rng.int(u32);
+        for (tokens[prefix_len..], 0..) |*token, i| token.* = pattern[i % period];
+        var detector: LongLoopDetector = .{};
+        var first: ?u32 = null;
+        for (tokens, 0..) |token, i| {
+            const history = SliceHistory([]const u32, []const u32){ .head = tokens[0..i], .tail = &.{}, .len = i };
+            if (detector.push(token, history)) |found| {
+                first = found;
+                try std.testing.expectEqual(first, bruteLongLoop(tokens[0 .. i + 1], long_loop_min_repeats, long_loop_min_span, long_loop_max_period));
+                break;
+            }
+            try std.testing.expectEqual(@as(?u32, null), bruteLongLoop(tokens[0 .. i + 1], long_loop_min_repeats, long_loop_min_span, long_loop_max_period));
+        }
+        try std.testing.expect(first != null);
+    }
+}
+
+fn detectLongLoopV2(tokens: []const u32, cfg: *const LongLoopConfig) ?u32 {
+    var detector: LongLoopDetector = .{};
+    for (tokens, 0..) |token, i| {
+        const history = SliceHistory([]const u32, []const u32){ .head = tokens[0..i], .tail = &.{}, .len = i };
+        if (detector.pushV2(token, history, cfg)) |period| return period;
+    }
+    return null;
+}
+
+test "long loop v2 exact mode matches v1 with default threshold values" {
+    const cfg: LongLoopConfig = .{ .v2 = true, .repeats = 4, .min_span = 256 };
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*token, i| token.* = @intCast(i % 3);
+    try std.testing.expectEqual(detectLongLoop(&tokens), detectLongLoopV2(&tokens, &cfg));
+    try std.testing.expectEqual(detectLongLoop(&.{ 1, 2, 3, 4 }), detectLongLoopV2(&.{ 1, 2, 3, 4 }, &cfg));
+    const ones: [256]u32 = @splat(7);
+    try std.testing.expectEqual(detectLongLoop(&ones), detectLongLoopV2(&ones, &cfg));
+    var non_periodic: [4096]u32 = undefined;
+    for (&non_periodic, 0..) |*token, i| token.* = @intCast(i);
+    try std.testing.expectEqual(detectLongLoop(&non_periodic), detectLongLoopV2(&non_periodic, &cfg));
+}
+
+test "long loop v2 accepts three copies and requires four when configured" {
+    const body_len = 300;
+    const tokens = try std.testing.allocator.alloc(u32, body_len * 4);
+    defer std.testing.allocator.free(tokens);
+    for (tokens, 0..) |*token, i| token.* = @intCast(i % body_len + 10);
+    const three: LongLoopConfig = .{ .v2 = true, .repeats = 3, .min_span = 256 };
+    const four: LongLoopConfig = .{ .v2 = true, .repeats = 4, .min_span = 256 };
+    try std.testing.expectEqual(@as(?u32, 300), detectLongLoopV2(tokens[0 .. body_len * 3], &three));
+    try std.testing.expectEqual(@as(?u32, null), detectLongLoopV2(tokens[0 .. body_len * 3], &four));
+}
+
+test "long loop v2 detects increasing counter positions and excludes structural runs" {
+    const body_len = 120;
+    var counters = [_][2]u32{.{ 1, 1 }, .{ 2, 2 }, .{ 3, 3 }, .{ 4, 4 }};
+    var tokens: [body_len * 4]u32 = undefined;
+    for (&tokens, 0..) |*token, i| token.* = @intCast(20 + i % body_len);
+    for (0..4) |copy| tokens[copy * body_len + 5] = @intCast(copy + 1);
+    const cfg: LongLoopConfig = .{ .v2 = true, .repeats = 3, .min_span = 256, .counters = &counters };
+    try std.testing.expectEqual(@as(?u32, 120), detectLongLoopV2(&tokens, &cfg));
+    try std.testing.expectEqual(@as(?u32, null), detectLongLoop(&tokens));
+
+    counters = .{ .{ 1, 1 }, .{ 2, 1 }, .{ 3, 1 }, .{ 4, 1 } };
+    for (0..4) |copy| tokens[copy * body_len + 5] = if (copy == 2) 3 else 1;
+    try std.testing.expectEqual(@as(?u32, null), detectLongLoopV2(&tokens, &cfg));
+
+    const inert_bits: [1]u64 = .{@as(u64, 1) << 10 | @as(u64, 1) << 11};
+    const mark_bits: [1]u64 = .{@as(u64, 1) << 10};
+    var structural: [64 * 8]u32 = @splat(10);
+    const inert_cfg: LongLoopConfig = .{ .v2 = true, .repeats = 3, .min_span = 256, .inert_bits = &inert_bits, .mark_bits = &mark_bits };
+    try std.testing.expectEqual(@as(?u32, null), detectLongLoopV2(&structural, &inert_cfg));
+    for (0..8) |copy| structural[copy * 64 + 10] = 12;
+    try std.testing.expectEqual(@as(?u32, 64), detectLongLoopV2(&structural, &inert_cfg));
+}
+
+test "long loop v2 exact detector agrees with brute force for randomized small periods" {
+    var random = std.Random.DefaultPrng.init(0x53_10_2026);
+    const rng = random.random();
+    const cfg: LongLoopConfig = .{ .v2 = true, .repeats = 4, .min_span = 256 };
+    var tokens: [400]u32 = undefined;
+    for (0..2000) |_| {
+        const len = 64 + rng.intRangeLessThan(usize, 0, 337);
+        for (tokens[0..len]) |*token| token.* = rng.intRangeLessThan(u32, 0, 3);
+        var detector: LongLoopDetector = .{};
+        var found: ?u32 = null;
+        for (tokens[0..len], 0..) |token, i| {
+            const history = SliceHistory([]const u32, []const u32){ .head = tokens[0..i], .tail = &.{}, .len = i };
+            if (detector.pushV2(token, history, &cfg)) |period| {
+                found = period;
+                try std.testing.expectEqual(found, bruteLongLoop(tokens[0 .. i + 1], 4, 256, 40));
+                break;
+            }
+            try std.testing.expectEqual(@as(?u32, null), bruteLongLoop(tokens[0 .. i + 1], 4, 256, 40));
+        }
+        try std.testing.expectEqual(detectLongLoopV2(tokens[0..len], &cfg), found);
+    }
+}
+
+test "soft thinking budget cuts at boundaries or the cap and keeps hard mode unchanged" {
+    const gpa = std.testing.allocator;
+    const bits: [1]u64 = .{@as(u64, 1) << 7};
+    var soft = try Stream.init(gpa, .{ .id = "soft", .prompt = &.{1}, .max_new = 100, .think_budget = 10, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .think_soft_bits = &bits, .think_soft_cap = 16 });
+    defer soft.deinit(gpa);
+    var candidates: [30]u32 = @splat(3);
+    candidates[12] = 7;
+    try std.testing.expectEqual(@as(?usize, 13), soft.thinkCut(&candidates));
+    @memset(&candidates, 3);
+    try std.testing.expectEqual(@as(?usize, 25), soft.thinkCut(&candidates));
+    candidates[5] = 7;
+    try std.testing.expectEqual(@as(?usize, 25), soft.thinkCut(&candidates));
+    soft.think_soft_bits = &.{};
+    try std.testing.expectEqual(@as(?usize, 9), soft.thinkCut(&candidates));
+
+    soft.think_soft_bits = &bits;
+    candidates[3] = 3;
+    candidates[5] = 7;
+    candidates[9] = 3;
+    try std.testing.expectEqual(@as(?usize, 25), soft.thinkCut(&candidates));
+    candidates[3] = 91;
+    try std.testing.expectEqual(@as(?usize, null), soft.thinkCut(&candidates));
+    candidates[3] = 3;
+    try soft.context.appendSlice(gpa, &.{ 1, 2, 3, 4, 5, 6, 7, 8, 7 });
+    try std.testing.expect(soft.cutsNext());
 }
 
 test "loop guard fires, closes thinking, and latches once" {

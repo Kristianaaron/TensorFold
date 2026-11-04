@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! FP32 lane output before residual/rank combination: independent FP64, rounding and row/reduction invariance.
 const std = @import("std");
 const cuda = @import("cuda");
@@ -29,7 +31,7 @@ pub fn run(gpu: check.Gpu) !void {
     }
     var lane = try cuda.qmmf.Lane.load(gpu.d, (try gpu.ctx.capability()) / 10);
     defer lane.unload();
-    for ([_]Mode{ .fp4, .fp8, .mxfp8, .fp8g, .bf16 }) |mode| try projection(&r, &lane, mode);
+    for ([_]Mode{ .fp4, .fp8, .mxfp8, .fp8g, .fp8b, .bf16 }) |mode| try projection(&r, &lane, mode);
 }
 
 fn projection(r: *Rig, lane: *cuda.qmmf.Lane, mode: Mode) !void {
@@ -62,7 +64,7 @@ fn projection(r: *Rig, lane: *cuda.qmmf.Lane, mode: Mode) !void {
             cuda.nvfp4.packScales(tiles, scales, n, k);
             w = cuda.nvfp4.weight(try r.dev(std.mem.sliceAsBytes(words)), try r.dev(tiles), global, n, k);
         },
-        .fp8, .fp8g, .mxfp8 => {
+        .fp8, .fp8g, .fp8b, .mxfp8 => {
             cuda.fp8.packCodes(tiled_codes[0 .. npad * k], codes, n, k);
             const dw = try r.dev(tiled_codes[0 .. npad * k]);
             w = switch (mode) {
@@ -71,6 +73,11 @@ fn projection(r: *Rig, lane: *cuda.qmmf.Lane, mode: Mode) !void {
                     const tiles = try a.alloc(f32, npad * (k / 64));
                     cuda.fp8.packScales(tiles, inv, n, k);
                     break :blk cuda.fp8.weight(dw, try r.dev(std.mem.sliceAsBytes(tiles)), n, k);
+                },
+                .fp8b => blk: {
+                    const tiles = try a.alloc(f32, npad / cuda.fp8.group * (k / cuda.fp8.group));
+                    try cuda.fp8.packBlockScales(tiles, inv, n, k, 0, 0, n, k);
+                    break :blk cuda.fp8.blockWeight(dw, try r.dev(std.mem.sliceAsBytes(tiles)), n, k);
                 },
                 .mxfp8 => blk: {
                     const tiles = try a.alloc(u8, npad * (k / 32));
@@ -106,6 +113,7 @@ fn projection(r: *Rig, lane: *cuda.qmmf.Lane, mode: Mode) !void {
                 .bf16 => bf(w16[col * k + i]),
                 .fp8 => core.quant.fp8.e4m3(code) * global,
                 .fp8g => core.quant.fp8.e4m3(code) * inv[(col / 128) * (k / 128) + i / 128],
+                .fp8b => @as(f64, bf(fp8RoundBf16(@as(f32, @floatCast(core.quant.fp8.e4m3(code))) * inv[(col / 128) * (k / 128) + i / 128]))),
                 .mxfp8 => core.quant.fp8.e4m3(code) * std.math.ldexp(@as(f64, 1), @as(i32, scales[col * (k / 32) + i / 32]) - 127),
                 .fp4 => blk: {
                     const byte = codes[col * (k / 2) + i / 2];
@@ -122,7 +130,7 @@ fn projection(r: *Rig, lane: *cuda.qmmf.Lane, mode: Mode) !void {
     var baseline: ?[]u8 = null;
     for ([_]bool{ true, false }) |clusters| {
         lane.clusters = clusters and (try r.gpu.ctx.capability()) >= 90;
-        for ([_]usize{ 256, 1, 7, 17, 33 }) |rows| {
+        for ([_]usize{ 1, 7, 17, 33, 256 }) |rows| {
             try dispatch(lane, r.s, dx, ldx, rows, w, out_buf, part_buf, .f32);
             try r.close("FP32 projection", out, true, want[0 .. rows * n], tol[0 .. rows * n]);
             const got = try r.back(out, rows * n * 4);
@@ -136,4 +144,9 @@ fn projection(r: *Rig, lane: *cuda.qmmf.Lane, mode: Mode) !void {
         }
     }
     check.pass("{t}: FP32 outputs preserve FP64 accuracy, BF16 rounding and row/reduction invariance", .{mode});
+}
+
+fn fp8RoundBf16(value: f32) u16 {
+    const bits: u32 = @bitCast(value);
+    return @truncate((bits +% 0x7fff +% ((bits >> 16) & 1)) >> 16);
 }

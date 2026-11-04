@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
+#include "../tf_vblock.cuh"
 // Copy of src/tensorfold/families/deepseek_v41/cuda/x3gm.cu (blob 7aed2b027afc): sass_check.sh
 
 
@@ -104,6 +107,7 @@ struct Args {
 template <int MATS, int XM, int K2, int MTL, int NG, int KS, int NSA, int NGR>
 __global__ void __launch_bounds__(Cfg<MATS, XM, K2, MTL, NG, KS, NSA, NGR>::THREADS,
                                   Cfg<MATS, XM, K2, MTL, NG, KS, NSA, NGR>::MINB) gm_kernel(const Args a) {
+    TF_VBLOCK_ENTER();
     using C = Cfg<MATS, XM, K2, MTL, NG, KS, NSA, NGR>;
     constexpr int THREADS = C::THREADS, BM = C::BM, LDA = C::LDA, LDE = C::LDE, ER = C::ER, CPR = C::CPR,
                   TW = C::TW, W = C::W;
@@ -121,11 +125,11 @@ __global__ void __launch_bounds__(Cfg<MATS, XM, K2, MTL, NG, KS, NSA, NGR>::THRE
     const int lr = (lane & 7) + ((lane >> 4) << 3), lc = (lane >> 3) & 1;
     const LaneMap<K2> map(lane);
 
-    int next = blockIdx.x;
+    int next = TF_VBID.x;
     for (;;) {
         __syncthreads();                                      // the last item is done with rows_sh and shared memory
         if (threadIdx.x == 0) item_sh = a.ticket ? atomicAdd(a.ticket, 1) : next;
-        next += gridDim.x;
+        next += TF_VNBLK.x;
         __syncthreads();
         const int item = item_sh;
         if (item >= total) break;
@@ -271,7 +275,8 @@ __global__ void __launch_bounds__(256) rot_kernel(const TIN* __restrict__ x, int
                                                   const half* __restrict__ suh0, const half* __restrict__ suh1,
                                                   half* __restrict__ out0, half* __restrict__ out1, int K, int slots,
                                                   int items) {
-    const int item = blockIdx.x * 8 + (threadIdx.x >> 5);
+    TF_VBLOCK_ENTER();
+    const int item = TF_VBID.x * 8 + (threadIdx.x >> 5);
     if (item >= items) return;                                // warp-uniform
     const int KB = K >> 7, p = item / KB, blk = item % KB, lane = threadIdx.x & 31;
     const int e = pick[p];
@@ -295,9 +300,10 @@ __global__ void __launch_bounds__(256) rot_kernel(const TIN* __restrict__ x, int
 // Tests: W_q [K, N] fp16 of one trellis through decode_a (words staged in shared memory as the gm kernels stage them).
 template <int K2>
 __global__ void __launch_bounds__(32) dequant_kernel(const uint32_t* __restrict__ T, half* __restrict__ out, int N) {
+    TF_VBLOCK_ENTER();
     constexpr int TW = 4 * K2;
     __shared__ __align__(16) uint32_t tile[TW];
-    const int kt = blockIdx.x, nt = blockIdx.y, lane = threadIdx.x, NTILES = N >> 4;
+    const int kt = TF_VBID.x, nt = TF_VBID.y, lane = threadIdx.x, NTILES = N >> 4;
     for (int i = lane; i < TW; i += 32) tile[i] = T[((size_t)kt * NTILES + nt) * TW + i];
     __syncwarp();
     const LaneMap<K2> map(lane);

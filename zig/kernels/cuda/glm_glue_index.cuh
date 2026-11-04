@@ -1,5 +1,9 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 // sparse.py's DSA indexer glue by hand: the index key write, the 4-token pools and the per-row top-512 pools.
 #pragma once
+
+#include "tf_vblock.cuh"
 
 #include "glm_triton.cuh"
 
@@ -9,8 +13,9 @@ using namespace glm_triton;
 extern "C" __global__ void __launch_bounds__(32)
     tf_glm_index_write(const __nv_bfloat16* kr, int64_t k_stride, const float* gr, const __nv_bfloat16* lnw,
                        const __nv_bfloat16* lnb, __nv_bfloat16* ik, __nv_bfloat16* ig, const int* pos, float eps) {
+    TF_VBLOCK_ENTER();
   constexpr int D = 128;
-  const int64_t r = blockIdx.x, at = (int64_t)pos[0] + r;
+  const int64_t r = TF_VBID.x, at = (int64_t)pos[0] + r;
   const int d0 = threadIdx.x * 4;
   float x[4];
   for (int j = 0; j < 4; ++j) x[j] = bf(kr[r * k_stride + d0 + j]);
@@ -38,8 +43,9 @@ extern "C" __global__ void __launch_bounds__(32)
 extern "C" __global__ void __launch_bounds__(32)
     tf_glm_pool_keys(const __nv_bfloat16* ik, const __nv_bfloat16* ig, const __nv_bfloat16* ape, __nv_bfloat16* pk,
                      const int* pos, int64_t rows) {
+    TF_VBLOCK_ENTER();
   constexpr int D = 128;
-  const int64_t P = pos[0], p = P / 4 + blockIdx.x;
+  const int64_t P = pos[0], p = P / 4 + TF_VBID.x;
   if (4 * p + 3 > P + rows - 1) return;
   for (int j = 0; j < 4; ++j) {
     const int d = threadIdx.x * 4 + j;
@@ -78,7 +84,7 @@ __device__ __forceinline__ int block_scan(int v, int (*wsum)[4], int slot, int* 
     if (lane >= o) inc += u;
   }
   if (lane == 31) wsum[slot][warp] = inc;
-  __syncthreads();
+  TF_TASK_SYNC();
   int before = inc - v;
   for (int w = 0; w < warp; ++w) before += wsum[slot][w];
   *total = wsum[slot][0] + wsum[slot][1] + wsum[slot][2] + wsum[slot][3];
@@ -90,10 +96,11 @@ __device__ __forceinline__ int block_scan(int v, int (*wsum)[4], int slot, int* 
 // sparse._select_rows (VISIBLE), a row per 4-warp block: K best visible pools by 8-bit radix select, ties to lower.
 extern "C" __global__ void __launch_bounds__(128)
     tf_glm_select_rows(const float* scores, int64_t* out, int64_t np, const int* pos, int k) {
+    TF_VBLOCK_ENTER();
   __shared__ int hist[256];
   __shared__ uint32_t sh_prefix;
   __shared__ int sh_need, wsum[2][4];
-  const int64_t r = blockIdx.x;
+  const int64_t r = TF_VBID.x;
   const float* row = scores + r * np;
   const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
   const unsigned below = (1u << lane) - 1;
@@ -114,7 +121,7 @@ extern "C" __global__ void __launch_bounds__(128)
   uint32_t prefix = 0, fixed = 0;
   int need = k;
   for (int shift = 24; shift >= 0; shift -= 8) {
-    for (int b = t; b < 256; b += blockDim.x) hist[b] = 0;
+    for (int b = t; b < 256; b += TF_VBDIM.x) hist[b] = 0;
     __syncthreads();
     for (int64_t c = 0; c < limit; c += 1024) {
       uint32_t u[8];

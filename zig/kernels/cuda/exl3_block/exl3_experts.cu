@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
+#include "../tf_vblock.cuh"
 // Copy of src/tensorfold/cuda/exl3/experts.cu (blob 8ce66ca83bce): sass_check.sh
 
 // EXL3 routed experts, a width per expert: fixed-order splits, slots and butterflies, no atomics, so bit-exact.
@@ -19,6 +22,7 @@ constexpr int GROUP_PER_THREAD = 4;
 __global__ void __launch_bounds__(GROUP_THREADS) group_kernel(const int* __restrict__ pick, int* __restrict__ uids,
                                                               int* __restrict__ ucount, int* __restrict__ members,
                                                               int R, int slots, int E, int maxm) {
+    TF_VBLOCK_ENTER();
     extern __shared__ int sh_pick[];
     __shared__ int warp_tot[GROUP_THREADS / 32];
     const int n = R * slots;
@@ -94,7 +98,8 @@ template <typename TIN>
 __global__ void rot_in_kernel(const TIN* __restrict__ x, int x_stride, const int* __restrict__ pick,
                               const half* __restrict__ suh0, const half* __restrict__ suh1, half* __restrict__ out0,
                               half* __restrict__ out1, int K, int slots, int E) {
-    const int p = blockIdx.x, blk = blockIdx.y, mat = blockIdx.z;
+    TF_VBLOCK_ENTER();
+    const int p = TF_VBID.x, blk = TF_VBID.y, mat = TF_VBID.z;
     const int row = p / slots;
     const int e = pick[p];
     if (e < 0 || e >= E) return;
@@ -117,7 +122,8 @@ __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* _
                                        const half* __restrict__ svh_g, const half* __restrict__ svh_u,
                                        const half* __restrict__ suh_d, half* __restrict__ xd, int P, int N, int SK,
                                        int E, float limit, int act_mode) {
-    const int p = blockIdx.x, blk = blockIdx.y;
+    TF_VBLOCK_ENTER();
+    const int p = TF_VBID.x, blk = TF_VBID.y;
     const int e = pick[p];
     if (e < 0 || e >= E) return;
     const int lane = threadIdx.x;
@@ -161,7 +167,8 @@ __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* _
 __global__ void down_epilogue_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
                                      const half* __restrict__ svh_d, float* __restrict__ y, int P, int D, int SK,
                                      int E) {
-    const int p = blockIdx.x, blk = blockIdx.y;
+    TF_VBLOCK_ENTER();
+    const int p = TF_VBID.x, blk = TF_VBID.y;
     const int e = pick[p];
     if (e < 0 || e >= E) return;
     const int lane = threadIdx.x;
@@ -182,8 +189,9 @@ __global__ void down_epilogue_kernel(const float* __restrict__ Z, const int* __r
 // out[r][d] = sum over slots in order of wts[r][k] * y[r * slots + k][d] (fp32, fma chain from 0).
 __global__ void combine_kernel(const float* __restrict__ y, const float* __restrict__ wts, float* __restrict__ out,
                                int D, int slots) {
-    const int r = blockIdx.x;
-    const int d = blockIdx.y * blockDim.x + threadIdx.x;
+    TF_VBLOCK_ENTER();
+    const int r = TF_VBID.x;
+    const int d = TF_VBID.y * TF_VBDIM.x + threadIdx.x;
     if (d >= D) return;
     float acc = 0.f;
     for (int k = 0; k < slots; ++k) acc = fmaf(wts[r * slots + k], y[((size_t)r * slots + k) * D + d], acc);
@@ -200,8 +208,9 @@ __global__ void down_combine_kernel(const float* __restrict__ Z, const int* __re
                                     const half* __restrict__ svh_d, float* __restrict__ y,
                                     const float* __restrict__ wts, OutT* __restrict__ out, int P, int D, int SK,
                                     int E, int slots) {
+    TF_VBLOCK_ENTER();
     __shared__ float4 part[32][32];                 // [slot][lane]: the slot's 4 outputs of the lane
-    const int r = blockIdx.x, blk = blockIdx.y;
+    const int r = TF_VBID.x, blk = TF_VBID.y;
     const int k = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int n = blk * 128 + 4 * lane;
     const int p = r * slots + k;
@@ -259,6 +268,9 @@ TF_EXL3X_INST(4, 4, 2, 2, 16)
 template __global__ void tf_exl3x::dequant_kernel<2, 2>(const uint32_t*, half*, int, int);
 template __global__ void tf_exl3x::dequant_kernel<2, 3>(const uint32_t*, half*, int, int);
 template __global__ void tf_exl3x::dequant_kernel<2, 4>(const uint32_t*, half*, int, int);
+template __global__ void tf_exl3x::dequant_kernel<3, 2>(const uint32_t*, half*, int, int);
+template __global__ void tf_exl3x::dequant_kernel<3, 3>(const uint32_t*, half*, int, int);
+template __global__ void tf_exl3x::dequant_kernel<3, 4>(const uint32_t*, half*, int, int);
 template __global__ void tf_exl3x::dequant_kernel<2, 5>(const uint32_t*, half*, int, int);
 template __global__ void tf_exl3x::dequant_kernel<2, 6>(const uint32_t*, half*, int, int);
 template __global__ void tf_exl3x::dequant_kernel<2, 7>(const uint32_t*, half*, int, int);

@@ -1,4 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 // After ExLlamaV3, MIT, Copyright (c) 2025 Turboderp; DeepSeek integration by @jayleaton.
+// Adapted from bertholomus/TensorFold@ddfad35:src/tensorfold/cuda/exl3/decode.cuh (Apache-2.0). Changes: CB 3 E4M3FN round-trip.
 
 // EXL3 tiles: lane L decodes values 8L..8L+7 straight into its two mma B fragments; port of tensorfold's decode.cuh.
 #pragma once
@@ -8,7 +11,38 @@
 
 namespace tf_exl3 {
 
-enum Codebook : int { CB_3INST = 0, CB_MCG = 1, CB_MUL1 = 2 };
+enum Codebook : int { CB_3INST = 0, CB_MCG = 1, CB_MUL1 = 2, CB_MCG_E4M3 = 3 };
+
+// Round an fp32 value to OCP E4M3FN (nearest-even, finite saturation), then widen it.
+// This implements the mcg_e4m3 decode contract.
+__device__ __forceinline__ uint8_t round_e4m3(float x) {
+    const uint32_t bits = __float_as_uint(x);
+    const uint8_t sign = (bits >> 24) & 0x80;
+    const uint32_t a = bits & 0x7fffffffu;
+    if (a > 0x7f800000u) return sign | 0x7fu;
+    if (a >= 0x43e00000u) return sign | 0x7eu;
+    if (a >= 0x3c800000u) {
+        const uint32_t r = (a + 0x7ffffu + ((a >> 20) & 1u)) & 0xfff00000u;
+        return sign | (uint8_t)((((r >> 23) - 120u) << 3) | ((r >> 20) & 7u));
+    }
+    const uint32_t e = a >> 23;
+    if (e == 0 || e < 101u) return sign;
+    const uint32_t shift = 141u - e;
+    const uint64_t m = (a & 0x7fffffu) | 0x800000u;
+    const uint64_t half = 1ull << (shift - 1);
+    const uint64_t rem = m & ((1ull << shift) - 1);
+    uint64_t n = m >> shift;
+    if (rem > half || (rem == half && (n & 1))) ++n;
+    return sign | (uint8_t)n;
+}
+
+__device__ __forceinline__ float e4m3_value(uint8_t code) {
+    const int e = (code >> 3) & 15;
+    const int m = code & 7;
+    if (e == 15 && m == 7) return __int_as_float(0x7fffffffu);
+    float v = e == 0 ? m * 0x1p-9f : (8 + m) * ldexpf(1.f, e - 10);
+    return (code & 0x80) ? -v : v;
+}
 
 // 32-bit words of a tile: 256 values of K2 / 2 bits.
 template <int K2>
@@ -94,7 +128,7 @@ __device__ __forceinline__ uint32_t decode2(uint32_t s0, uint32_t s1) {
         return *reinterpret_cast<const uint32_t*>(&r);
     } else {
         uint32_t x0, x1;
-        if constexpr (CB == CB_MCG) {
+        if constexpr (CB == CB_MCG || CB == CB_MCG_E4M3) {
             x0 = s0 * 0xCBAC1FEDu;
             x1 = s1 * 0xCBAC1FEDu;
         } else {
@@ -106,7 +140,25 @@ __device__ __forceinline__ uint32_t decode2(uint32_t s0, uint32_t s1) {
         const uint32_t lo = __byte_perm(x0, x1, 0x5410);
         const uint32_t hi = __byte_perm(x0, x1, 0x7632);
         const half2 r = __hadd2(*reinterpret_cast<const half2*>(&lo), *reinterpret_cast<const half2*>(&hi));
-        return *reinterpret_cast<const uint32_t*>(&r);
+        const uint32_t out = *reinterpret_cast<const uint32_t*>(&r);
+        if constexpr (CB == CB_MCG_E4M3) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+            // The paired conversion sequence is also used by gr8 (MIT); see THIRD_PARTY_NOTICES.md.
+            uint16_t packed;
+            uint32_t restored;
+            asm volatile("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;\n" : "=h"(packed) : "r"(out));
+            asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;\n" : "=r"(restored) : "h"(packed));
+            return restored;
+#else
+            const half2 h = *reinterpret_cast<const half2*>(&out);
+            const float a = __half2float(__low2half(h));
+            const float b = __half2float(__high2half(h));
+            const half2 q = __halves2half2(__float2half_rn(e4m3_value(round_e4m3(a))),
+                                           __float2half_rn(e4m3_value(round_e4m3(b))));
+            return *reinterpret_cast<const uint32_t*>(&q);
+#endif
+        }
+        return out;
     }
 }
 

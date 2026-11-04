@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! Timings steer windows, never bits; retain each entry's fastest run and retime outliers.
 const std = @import("std");
 
@@ -40,6 +42,19 @@ pub fn drifted(ms: []const f64, reference: []const f64) bool {
 /// Compare a measured cost with its reference without imposing a positive-reference policy.
 pub fn changed(ms: f64, reference: f64) bool {
     return @abs(ms - reference) > drift * reference;
+}
+
+/// A window table's entry from its timed runs: the fastest, so one slow run cannot set the table.
+pub fn keepFastest(runs: []const f64) f64 {
+    var best = std.math.inf(f64);
+    for (runs) |v| best = @min(best, v);
+    return best;
+}
+
+/// A kept table's spot check: one width's quick reading against the stored entry.
+pub fn entryHolds(stored: f64, probed: f64) bool {
+    if (!(stored > 0) or !std.math.isFinite(stored)) return false;
+    return !changed(probed, stored);
 }
 
 /// Whether entries `at` and the head (sampled as `measure` does) time within drift, a drifted reading timed twice.

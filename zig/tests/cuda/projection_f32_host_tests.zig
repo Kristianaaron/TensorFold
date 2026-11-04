@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! Exercise the fixture's actual poison-and-dispatch path with CPU buffers and no-op CUDA launches.
 const std = @import("std");
 const cuda = @import("cuda");
@@ -62,8 +64,7 @@ test "every F32 and BF16 fixture dispatch rejects a no-op after a valid stale pr
         .reduce = @splat(f),
         .clusters = false,
     };
-    const weight: cuda.qmmf.Weight = .{ .mode = .fp4, .codes = 0, .scales = 0, .n = 70, .k = 1024, .npad = 128 };
-    const elements = 256 * weight.n;
+    const elements = 256 * 70;
     const expected = try a.alloc(f64, elements);
     defer a.free(expected);
     const tolerance = try a.alloc(f64, elements);
@@ -78,31 +79,34 @@ test "every F32 and BF16 fixture dispatch rejects a no-op after a valid stale pr
         .s = stream,
         .rng = undefined,
     };
-    for ([_]cuda.qmmf.Out{ .f32, .bf16 }) |format| {
-        const width: usize = if (format == .f32) 4 else 2;
-        const destination = try a.alloc(u8, elements * width);
-        defer a.free(destination);
-        const scratch = try a.alloc(u8, 8 * elements * 4);
-        defer a.free(scratch);
-        const out: cuda.DeviceBuffer = .{ .d = &driver, .ptr = @intFromPtr(destination.ptr), .len = destination.len };
-        const part: cuda.DeviceBuffer = .{ .d = &driver, .ptr = @intFromPtr(scratch.ptr), .len = scratch.len };
-        Mock.destination = destination;
-        Mock.scratch = scratch;
-        for ([_]bool{ true, false }) |clusters| {
-            lane.clusters = clusters;
-            for ([_]usize{ 256, 1, 7, 17, 33 }) |rows| {
-                @memset(destination, 0);
-                @memset(scratch, 0);
-                const count = rows * weight.n;
-                try rig.close("valid stale prefix", out.ptr, format == .f32, expected[0..count], tolerance[0..count]);
-                Mock.fills = 0;
-                Mock.launches = 0;
-                Mock.fresh = true;
-                try fixture.dispatch(&lane, stream, 0, 1088, rows, weight, out, part, format);
-                try std.testing.expectEqual(@as(usize, 2), Mock.fills);
-                try std.testing.expect(Mock.launches > 0);
-                try std.testing.expect(Mock.fresh);
-                try std.testing.expectError(error.TestFailed, rig.close("no-op projection", out.ptr, format == .f32, expected[0..count], tolerance[0..count]));
+    for ([_]cuda.qmmf.Mode{ .fp4, .fp8b }) |mode| {
+        for ([_]cuda.qmmf.Out{ .f32, .bf16 }) |format| {
+            const weight: cuda.qmmf.Weight = .{ .mode = mode, .codes = 0, .scales = 0, .n = 70, .k = 1024, .npad = 128 };
+            const width: usize = if (format == .f32) 4 else 2;
+            const destination = try a.alloc(u8, elements * width);
+            defer a.free(destination);
+            const scratch = try a.alloc(u8, 8 * elements * 4);
+            defer a.free(scratch);
+            const out: cuda.DeviceBuffer = .{ .d = &driver, .ptr = @intFromPtr(destination.ptr), .len = destination.len };
+            const part: cuda.DeviceBuffer = .{ .d = &driver, .ptr = @intFromPtr(scratch.ptr), .len = scratch.len };
+            Mock.destination = destination;
+            Mock.scratch = scratch;
+            for ([_]bool{ true, false }) |clusters| {
+                lane.clusters = clusters;
+                for ([_]usize{ 1, 7, 17, 33, 256 }) |rows| {
+                    @memset(destination, 0);
+                    @memset(scratch, 0);
+                    const count = rows * weight.n;
+                    try rig.close("valid stale prefix", out.ptr, format == .f32, expected[0..count], tolerance[0..count]);
+                    Mock.fills = 0;
+                    Mock.launches = 0;
+                    Mock.fresh = true;
+                    try fixture.dispatch(&lane, stream, 0, 1088, rows, weight, out, part, format);
+                    try std.testing.expectEqual(@as(usize, 2), Mock.fills);
+                    try std.testing.expect(Mock.launches > 0);
+                    try std.testing.expect(Mock.fresh);
+                    try std.testing.expectError(error.TestFailed, rig.close("no-op projection", out.ptr, format == .f32, expected[0..count], tolerance[0..count]));
+                }
             }
         }
     }

@@ -1,7 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! GLM-5.3-Flash's packed matmul and DFlash2 launches on CUDA, read by kernel-contract-limits from every SM's image.
 const registry = @import("registry.zig");
 
-/// nvcc 13.0's usage, the compiler of the release fatbins.
+/// WP11c changed df_conv and added shape-specific attention instantiations. Re-measure on a Spark before serving:
+/// nvcc -Xptxas=-v -arch=sm_121 -c zig/kernels/cuda/glm_dflash.cu -o /tmp/glm_dflash.o
+/// cuobjdump --res-usage /tmp/glm_dflash.o
+/// nvcc 13.0's usage, the compiler of the release fatbins. The GLM-shaped DFlash records are pending that measurement.
 pub const cuda = [_]registry.CudaRecord{
     .{ .launch = .{ .name = "glm_mm16_16", .symbol = "glm_mm16_16", .image = "glm_mm", .threads = 128, .dynamic = 31104, .opt_in = true, .min_sm = 80 }, .usage = .{ .{ .regs = 95, .static = 0, .bound = 128 }, .{ .regs = 95, .static = 0, .bound = 128 }, .{ .regs = 95, .static = 0, .bound = 128 }, .{ .regs = 52, .static = 0, .bound = 128 }, .{ .regs = 52, .static = 0, .bound = 128 } } },
     .{ .launch = .{ .name = "glm_mm16_32", .symbol = "glm_mm16_32", .image = "glm_mm", .threads = 128, .dynamic = 37248, .opt_in = true, .min_sm = 80 }, .usage = .{ .{ .regs = 95, .static = 0, .bound = 128 }, .{ .regs = 95, .static = 0, .bound = 128 }, .{ .regs = 95, .static = 0, .bound = 128 }, .{ .regs = 64, .static = 0, .bound = 128 }, .{ .regs = 64, .static = 0, .bound = 128 } } },
@@ -35,6 +40,18 @@ pub const cuda = [_]registry.CudaRecord{
     .{ .launch = .{ .name = "df_sum2", .symbol = "df_sum2", .image = "glm_dflash", .threads = 256, .min_sm = 80 }, .usage = .{ .{ .regs = 16, .static = 0, .bound = 0 }, .{ .regs = 16, .static = 0, .bound = 0 }, .{ .regs = 16, .static = 0, .bound = 0 }, .{ .regs = 38, .static = 0, .bound = 0 }, .{ .regs = 38, .static = 0, .bound = 0 } } },
     .{ .launch = .{ .name = "df_top16_part", .symbol = "df_top16_part", .image = "glm_dflash", .threads = 256, .min_sm = 80 }, .usage = .{ .{ .regs = 32, .static = 32864, .bound = 256 }, .{ .regs = 32, .static = 32864, .bound = 256 }, .{ .regs = 32, .static = 32864, .bound = 256 }, .{ .regs = 30, .static = 32864, .bound = 256 }, .{ .regs = 30, .static = 32864, .bound = 256 } } },
     .{ .launch = .{ .name = "df_top16_merge", .symbol = "df_top16_merge", .image = "glm_dflash", .threads = 256, .min_sm = 80 }, .usage = .{ .{ .regs = 23, .static = 8416, .bound = 256 }, .{ .regs = 23, .static = 8416, .bound = 256 }, .{ .regs = 23, .static = 8416, .bound = 256 }, .{ .regs = 23, .static = 8416, .bound = 256 }, .{ .regs = 23, .static = 8416, .bound = 256 } } },
+    .{ .launch = .{ .name = "df_tap_glm", .symbol = "df_tap_glm", .image = "glm_dflash", .threads = 256, .min_sm = 80 }, .usage = registry.none, .geometry_pending = true },
+    .{ .launch = .{ .name = "df_block_qkv_glm", .symbol = "df_block_qkv_glm", .image = "glm_dflash", .threads = 64, .min_sm = 80 }, .usage = registry.none, .geometry_pending = true },
+    .{ .launch = .{ .name = "df_ctx_kv_glm", .symbol = "df_ctx_kv_glm", .image = "glm_dflash", .threads = 64, .min_sm = 80 }, .usage = registry.none, .geometry_pending = true },
+    .{ .launch = .{ .name = "df_conv_glm", .symbol = "df_conv_glm", .image = "glm_dflash", .threads = 256, .min_sm = 80 }, .usage = registry.none, .geometry_pending = true },
+    .{ .launch = .{ .name = "df_attn_part_glm", .symbol = "df_attn_part_glm", .image = "glm_dflash", .threads = 256, .min_sm = 80 }, .usage = registry.none, .geometry_pending = true },
+    .{ .launch = .{ .name = "df_attn_part_h8_glm", .symbol = "df_attn_part_h8_glm", .image = "glm_dflash", .threads = 256, .min_sm = 80 }, .usage = registry.none, .geometry_pending = true },
+    .{ .launch = .{ .name = "df_attn_merge_glm", .symbol = "df_attn_merge_glm", .image = "glm_dflash", .threads = 128, .min_sm = 80 }, .usage = registry.none, .geometry_pending = true },
+    .{ .launch = .{ .name = "df_sum2_glm", .symbol = "df_sum2_glm", .image = "glm_dflash", .threads = 256, .min_sm = 80 }, .usage = registry.none, .geometry_pending = true },
+    .{ .launch = .{ .name = "df_top16_part_glm", .symbol = "df_top16_part_glm", .image = "glm_dflash", .threads = 256, .min_sm = 80 }, .usage = registry.none, .geometry_pending = true },
+    .{ .launch = .{ .name = "df_top16_merge_glm", .symbol = "df_top16_merge_glm", .image = "glm_dflash", .threads = 256, .min_sm = 80 }, .usage = registry.none, .geometry_pending = true },
+    .{ .launch = .{ .name = "df_ctx_kv_h8_glm", .symbol = "df_ctx_kv_h8_glm", .image = "glm_dflash", .threads = 64, .min_sm = 80 }, .usage = registry.none, .geometry_pending = true },
+    .{ .launch = .{ .name = "df_add_glm", .symbol = "df_add_glm", .image = "glm_dflash", .threads = 256, .min_sm = 80 }, .usage = registry.none, .geometry_pending = true },
     .{ .launch = .{ .name = "df_gsum", .symbol = "df_gsum", .image = "glm_dflash", .threads = 128, .min_sm = 80 }, .usage = .{ .{ .regs = 30, .static = 0, .bound = 0 }, .{ .regs = 38, .static = 0, .bound = 0 }, .{ .regs = 38, .static = 0, .bound = 0 }, .{ .regs = 38, .static = 0, .bound = 0 }, .{ .regs = 38, .static = 0, .bound = 0 } } },
 };
 

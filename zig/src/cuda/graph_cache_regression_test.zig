@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! Failure ownership, rank verdict counts and bounded-cap regressions for the graph cache.
 
 const std = @import("std");
@@ -41,6 +43,12 @@ const Engine = struct {
     }
 };
 
+const SameThousand = struct {
+    fn same(a: u32, b: u32) bool {
+        return a / 1000 == b / 1000;
+    }
+};
+
 const Peer = struct {
     verdicts: []const bool,
     at: usize = 0,
@@ -70,6 +78,39 @@ test "graph cache regression: capture agreement throw frees the not-yet-inserted
     try equal(@as(usize, 0), e.live);
     try equal(@as(usize, 0), c.count());
     try equal(@as(usize, 2), p.at);
+}
+
+test "graph cache regression: same_slot keeps one live graph per slot" {
+    var e: Engine = .{};
+    var c = cache.Cache(u32).init(std.testing.allocator, e.engine(), .{ .max = 4 });
+    defer c.deinit();
+    c.same_slot = SameThousand.same;
+    try equal(cache.Outcome.captured, try c.run(1001, no_stream, 7, e.body()));
+    try equal(cache.Outcome.captured, try c.run(8001, no_stream, 7, e.body()));
+    try equal(cache.Outcome.captured, try c.run(1002, no_stream, 7, e.body()));
+    try expect(!c.has(1001));
+    try expect(c.has(1002));
+    try expect(c.has(8001));
+    try equal(@as(usize, 2), c.count());
+    try equal(@as(usize, 2), e.live);
+    try equal(@as(u64, 1), c.stats.slot_swaps);
+    try equal(@as(u64, 1), c.stats.evicted);
+    try equal(cache.Outcome.replayed, try c.run(8001, no_stream, 7, e.body()));
+    try equal(cache.Outcome.captured, try c.run(1001, no_stream, 7, e.body()));
+    try expect(!c.has(1002));
+    try equal(@as(usize, 2), e.live);
+}
+
+test "graph cache regression: no same_slot keeps the old policy" {
+    var e: Engine = .{};
+    var c = cache.Cache(u32).init(std.testing.allocator, e.engine(), .{ .max = 4 });
+    defer c.deinit();
+    try equal(cache.Outcome.captured, try c.run(1001, no_stream, 7, e.body()));
+    try equal(cache.Outcome.captured, try c.run(8001, no_stream, 7, e.body()));
+    try equal(cache.Outcome.captured, try c.run(1002, no_stream, 7, e.body()));
+    try equal(@as(usize, 3), c.count());
+    try equal(@as(usize, 3), e.live);
+    try equal(@as(u64, 0), c.stats.slot_swaps);
 }
 
 test "graph cache regression: local map OOM declines before any capture and can recover" {

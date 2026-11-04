@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! Structured output: libtfgrammar (xgrammar, loaded at the first structured request) and a stream's grammar walk.
 
 const std = @import("std");
@@ -19,6 +21,8 @@ const Fns = struct {
     fill: *const fn (*anyopaque, [*]i32, c_int) callconv(.c) c_int,
     drafts: *const fn (*anyopaque, [*]i32, c_int) callconv(.c) c_int,
 };
+
+pub const Library = Fns;
 
 var lib: ?Fns = null;
 var lib_failed = false;

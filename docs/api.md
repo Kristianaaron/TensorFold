@@ -135,6 +135,7 @@ delete runs gets 503, an id that is not a number 400, and an id the graph does n
 | `messages` | Text messages, including system, developer, assistant tool calls and tool results | Both |
 | `tools` | OpenAI function tools | Both |
 | `tool_choice` | `none` hides tools from the template; `required` or a named function makes the reply call a tool | Both |
+| `TENSORFOLD_TOOL_GRAMMAR=1` | Native server: also constrain auto tool calls to each tool's schema; strict tools are constrained by default when the backend supports grammar masks | Native |
 | `parallel_tool_calls` | False returns at most one completed call | Both |
 | `max_tokens`, `max_completion_tokens` | Explicit reply limit; rejected if prompt plus reply exceeds the window | Both |
 | `temperature`, `top_p`, `top_k`, `min_p` | Sampling overrides; zero temperature is greedy | Both |
@@ -362,6 +363,13 @@ cycle of at most eight tokens after 256 predecessor matches, when the detected r
 in; the reply continues after the forced close, and reports `runtime.loop: {"period": N}` plus `loop=period:N` in the
 server log. The native engine refuses the flag on backends that do not enforce it, and prints that refusal as
 a startup error.
+
+For GLM-5.3, `TF_GLM53_SOFT_BUDGET=1` extends a positive thinking budget to the next sentence or line boundary.
+`TF_GLM53_SOFT_BUDGET_CAP` sets the extra-token cap (default 256, range 1..4096).
+`TF_GLM53_LOOP_GUARD_LONG=1` enables the v2 long-period guard.
+`TF_GLM53_LOOP_GUARD_REPEATS` sets its repeat threshold (default 3, range 2..16).
+`TF_GLM53_LOOP_GUARD_MIN_SPAN` sets its minimum span (default 256, range 64..4096). The long guard also requires
+the native `--loop-guard` serve flag.
 
 ## Context and errors
 

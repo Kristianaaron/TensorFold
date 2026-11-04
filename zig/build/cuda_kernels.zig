@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! CUDA image names and qualification flags.
 
 /// Each .cu in zig/kernels/cuda (`src`, else `name`) with the flags its Python extension passes in `extra_cuda_cflags`.
@@ -91,17 +93,28 @@ pub const kernels = [_]Kernel{
     .{ .name = "glm_quant", .flags = torch_ops }, // ours: GLM's draft-only weight quantizers, torch at load in the Python family
     .{ .name = "exl3_linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/linear.cu's device code, tensorfold_exl3_linear_v5
     .{ .name = "exl3_experts", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/experts.cu's device code, tensorfold_exl3_experts
+    .{ .name = "glm53_pmx", .src = "glm_dsa/pmx", .min_sm = 89, .flags = &.{ "-O3", "--expt-relaxed-constexpr" } },
+    .{ .name = "glm53_p5a", .src = "glm_dsa/p5a", .min_sm = 89, .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // GLM-5.3 TF_GLM53_PROMPT_EXPERTS=10 small-item prompt experts
+    .{ .name = "dsv41_exl3_experts", .src = "exl3_block/exl3_experts", .flags = &.{"-O3"} }, // DeepSeek EXL3 tile dequantizer and grouped expert kernels
     .{ .name = "exl3_candidate", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // #806's EXL3 tiles: Dense's candidate
     .{ .name = "glm_vision", .flags = &.{"-O3"} }, // ours: GLM's image tower steps around cuBLASLt (norms, rotary, softmax, merger)
     .{ .name = "glm_mm", .flags = &.{"-O3"} }, // ours: GLM's bf16 linears on tensor cores, weights tiled at load, row-stable
     .{ .name = "glm_dflash", .flags = &.{"-O3"} }, // the DFlash2 block drafter
+    .{ .name = "glm53_index", .src = "glm_dsa/index", .min_sm = 90, .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // GLM-5.3 DSA indexer, radix top-k, DCP2
+    .{ .name = "glm53_mla", .src = "glm_dsa/mla", .min_sm = 90, .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // GLM-5.3 MLA prep, FP8 absorb/expand and DCP attention
+    .{ .name = "glm53_glue", .src = "glm_dsa/glue", .min_sm = 90, .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // GLM-5.3 MoE low-rank and embed glue
+    .{ .name = "glm53_fp8_mma", .src = "glm_dsa/fp8_mma", .min_sm = 89, .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // GLM-5.3 W8A8 FP8 quantization and block-scaled GEMM
+    .{ .name = "glm53_x3e4", .src = "glm_dsa/x3e4", .min_sm = 89, .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // GLM-5.3 X3E4 trellis fragments and MXFP8 expert prefill
+    .{ .name = "glm53_w8a8", .src = "glm_dsa/w8a8", .min_sm = 89, .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // GLM-5.3 TF_GLM53_PREFILL_W8A8 o_proj: e4m3 rows x FP8B weights, m16n8k32
+    .{ .name = "glm53_head", .src = "glm_dsa/head", .min_sm = 90, .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // GLM-5.3 fp32 logits, candidates, gate gather/mass and local LSE; candidate k<=2048
+    .{ .name = "glm53_megakernel", .src = "glm_dsa/megakernel", .min_sm = 90, .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // GLM-5.3 persistent dependency scheduler and task interpreter
     .{ .name = "torch_argmax", .src = "torch_ops/argmax", .flags = torch_ops },
     .{ .name = "torch_topk", .src = "torch_ops/topk", .flags = torch_ops },
     .{ .name = "torch_pointwise", .src = "torch_ops/pointwise", .flags = torch_ops },
     .{ .name = "torch_indexing", .src = "torch_ops/indexing", .flags = torch_ops },
     .{ .name = "torch_movement", .src = "torch_ops/movement", .flags = torch_ops },
     .{ .name = "torch_nemotron_constants", .src = "torch_ops/nemotron_constants", .flags = torch_ops },
-    .{ .name = "roce_gather", .src = "roce_gather", .flags = &.{"-O3"} }, // b12x's one-shot RoCE all-gather, two ranks
+    .{ .name = "roce_gather", .src = "roce_gather", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // b12x one-shot RoCE all-gather and rank-order all-reduce
     .{ .name = "drama3_staged_gemv", .flags = glue },
     .{ .name = "drama3", .flags = &.{"-O3"} },
     .{ .name = "drama3_fp8", .flags = &.{"-O3"} },

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! The lane round loop (Python FamilyRounds and SharedRounds): every decision and cost update in Python's order.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -68,6 +70,7 @@ pub const Engine = struct {
                 .draft_step_ms = cfg.draft_step_ms,
                 .plain_guard = cfg.plain_guard,
                 .node_probabilities = cfg.node_probabilities,
+                .granted_depth = cfg.granted_depth,
                 .confidence_floor = cfg.draft_confidence,
                 .batch_rows = cfg.batch_rows,
                 .batched_heads = cfg.draft_streams,
@@ -317,7 +320,6 @@ pub const Engine = struct {
             path = try accept.acceptPath(a, tokens, parents, sampled);
             for (path[1..]) |r| try committed.append(a, tokens[r]);
             try committed.append(a, sampled[path[path.len - 1]]);
-            if (s.proposer) |pr| pr.round(@intCast(rows), @intCast(path.len - 1));
             if (rows > 1) {
                 const kept = path.len - 1;
                 e.drafted += rows - 1;
@@ -371,6 +373,8 @@ pub const Engine = struct {
                 }
             }
             if (s.recall) |r| if (p.kind != .copy) r.noteHead(path.len); // its own rounds: the bar a copy must beat
+            // Let the proposer observe the completed outcome after its accepted count is recorded.
+            if (s.proposer) |pr| pr.round(@intCast(rows), @intCast(path.len - 1), p.kind == .copy and !p.recalled);
         }
         if (e.trim) |t| if (p.kind != .forced) {
             const chain = parents.len == 0 or accept.isChain(parents);
@@ -391,6 +395,11 @@ pub const Engine = struct {
             try committed.append(a, try s.startClose(e.gpa));
         }
         s.rounds += 1;
+        if (p.kind == .head) {
+            s.head_rounds += 1;
+            s.head_multi_rounds += @intFromBool(rows > 1);
+            s.head_rows += rows;
+        }
         var committed_rows: []LogRow = &.{};
         if (rows_lp.len > 0) {
             committed_rows = try a.alloc(LogRow, committed.items.len);

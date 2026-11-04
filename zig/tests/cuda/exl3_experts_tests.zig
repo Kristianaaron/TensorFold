@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! The EXL3 routed experts: the f64 checks, row and chunk invariance, and the Python engine's recorded bytes.
 const std = @import("std");
 const check = @import("check.zig");
@@ -26,6 +28,23 @@ pub fn run(r: *Rig, state: *Run, dir: []const u8) !void {
     }
     {
         var ok = true;
+        l2DepthParity(r, &exp) catch |e| {
+            state.fail(e, "exl3.experts.l2d");
+            ok = false;
+        };
+        if (ok) check.pass("exl3.experts.l2d", .{});
+    }
+    if (std.c.getenv("TF_EXL3_PROMPT_BENCH") != null) ref.promptBench(r, &exp) catch |e| state.fail(e, "exl3.prompt.bench");
+    {
+        var ok = true;
+        ref.promptMixed(r, &exp) catch |e| {
+            state.fail(e, "exl3.prompt.mixed");
+            ok = false;
+        };
+        if (ok) check.pass("exl3.prompt.mixed", .{});
+    }
+    {
+        var ok = true;
         ref.prompt(r, &exp) catch |e| {
             state.fail(e, "exl3.prompt.experts.f64");
             ok = false;
@@ -47,6 +66,24 @@ pub fn run(r: *Rig, state: *Run, dir: []const u8) !void {
             ok = false;
         };
         if (ok) check.pass("exl3.experts.python", .{});
+    }
+}
+
+/// The grouped kernel's L2 hint depth changes no output bytes, including its gate/up intermediate.
+fn l2DepthParity(r: *Rig, exp: *const exl3e.Experts) !void {
+    const previous = exl3e.l2_depth;
+    defer exl3e.l2_depth = previous;
+    const bits: [ref.E]u32 = .{ 6, 4, 5, 6, 4, 5, 6, 4, 5 };
+    const b = try ref.buildLayer(r, &bits);
+    exl3e.l2_depth = 0;
+    const baseline_run = try ref.runSlice(r, exp, b.layer, b.dx, b.dpick, b.dwts, 3);
+    const baseline_out = try r.back(baseline_run.out, 3 * ref.D * 4);
+    const baseline_y = try r.back(baseline_run.y, 3 * ref.SLOTS * ref.D * 4);
+    for ([_]i32{ 0, 2, 4, 8 }) |depth| {
+        exl3e.l2_depth = depth;
+        const current = try ref.runSlice(r, exp, b.layer, b.dx, b.dpick, b.dwts, 3);
+        try check.sameBytes("exl3.experts.l2d out", try r.back(current.out, 3 * ref.D * 4), baseline_out);
+        try check.sameBytes("exl3.experts.l2d y", try r.back(current.y, 3 * ref.SLOTS * ref.D * 4), baseline_y);
     }
 }
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! The EXL3 routed experts' float64 reference: the mirrored chain and each output's worst-case error bound.
 const std = @import("std");
 const check = @import("check.zig");
@@ -12,10 +14,10 @@ const Run = exl3t.Run;
 
 pub const E = 9; // experts of a synthetic layer
 pub const D = 512; // model width
-const I = 256; // expert width
+pub const I = 256; // expert width
 pub const SLOTS = 8;
 const LIMIT: f32 = 10.0; // the SwiGLU clamp
-const CAP = 300; // rows of x, pick and wts the builders make (the f64 checks use the first 128)
+const CAP = 300; // baseline rows of x, pick and wts the builders make
 const rows = [_]usize{ 1, 3, 8, 16, 17, 64, 128 }; // the f64 checks' row counts (the reference builds 128 rows)
 
 const f64_ids = [_][]const u8{ "exl3.experts.f64.mul1.4", "exl3.experts.f64.mul1.5", "exl3.experts.f64.mul1.6" };
@@ -24,6 +26,10 @@ const f64_ids = [_][]const u8{ "exl3.experts.f64.mul1.4", "exl3.experts.f64.mul1
 pub const Built = struct {
     layer: exl3e.Layer,
     bits: []const u32,
+    rows: usize,
+    gh: []const u32,
+    uh: []const u32,
+    dh: []const u32,
     gate: [E][]i16,
     up: [E][]i16,
     down: [E][]i16,
@@ -36,9 +42,9 @@ pub const Built = struct {
     dx: u64,
     dpick: u64,
     dwts: u64,
-    x: []u16, // bf16 [CAP, D]
-    pick: []i32, // [CAP, SLOTS]
-    wts: []f32, // [CAP, SLOTS]
+    x: []u16, // bf16 [rows, D]
+    pick: []i32, // [rows, SLOTS]
+    wts: []f32, // [rows, SLOTS]
 };
 
 /// The f64 id checks: every width alone, then the mixed layer folded into the .6 id (the contract's ids).
@@ -65,8 +71,25 @@ fn allBits(bits: u32) [E]u32 {
     return .{ bits, bits, bits, bits, bits, bits, bits, bits, bits };
 }
 
-fn widthOf(bits: u32) exl3fmt.Width {
+pub fn widthOf(bits: u32) exl3fmt.Width {
     return .{ .halves = @intCast(2 * bits) };
+}
+
+fn halvesOf(halves: u32) exl3fmt.Width {
+    return .{ .halves = @intCast(halves) };
+}
+
+fn unpackProjection(b: *const Built, bits2: u32, trellis: []const i16, k_tiles: usize, n_tiles: usize, out: []f16) void {
+    const codebook: exl3fmt.Codebook = switch (b.layer.codebook) {
+        .inst3 => .inst3,
+        .mcg => .mcg,
+        .mul1 => .mul1,
+        .mcg_e4m3 => .mcg,
+    };
+    exl3fmt.unpack(halvesOf(bits2), codebook, trellis, k_tiles, n_tiles, out);
+    if (b.layer.codebook == .mcg_e4m3) {
+        for (out) |*v| v.* = @floatCast(cuda.exl3.roundE4m3(@floatCast(v.*)));
+    }
 }
 
 fn f16v(v: u16) f64 {
@@ -80,9 +103,25 @@ fn bf16r(v: f64) f64 {
 }
 
 pub fn buildLayer(r: *Rig, bits: []const u32) !Built {
+    var halves: [E]u32 = undefined;
+    for (&halves, bits) |*h, v| h.* = 2 * v;
+    return buildLayerWith(r, bits, &halves, &halves, &halves, .mul1);
+}
+
+/// `buildLayer` with each projection's half-bit width per expert and the codebook (the prompt path's mixed cases);
+/// `bits` is only what the f64 checks print.
+pub fn buildLayerWith(r: *Rig, bits: []const u32, gh: []const u32, uh: []const u32, dh: []const u32, codebook: exl3e.Codebook) !Built {
+    return buildLayerWithRows(r, bits, gh, uh, dh, codebook, CAP);
+}
+
+pub fn buildLayerWithRows(r: *Rig, bits: []const u32, gh: []const u32, uh: []const u32, dh: []const u32, codebook: exl3e.Codebook, rows_n: usize) !Built {
     var b: Built = .{
         .layer = undefined,
         .bits = bits,
+        .rows = rows_n,
+        .gh = gh,
+        .uh = uh,
+        .dh = dh,
         .gate = undefined,
         .up = undefined,
         .down = undefined,
@@ -112,15 +151,15 @@ pub fn buildLayer(r: *Rig, bits: []const u32) !Built {
     const suh_d = try r.a.alloc(u16, E * I);
     const svh_d = try r.a.alloc(u16, E * D);
     for (0..E) |e| {
-        b.gate[e] = try randI16(r, (D / 16) * (I / 16) * widthOf(bits[e]).tileWords());
-        b.up[e] = try randI16(r, (D / 16) * (I / 16) * widthOf(bits[e]).tileWords());
-        b.down[e] = try randI16(r, (I / 16) * (D / 16) * widthOf(bits[e]).tileWords());
+        b.gate[e] = try randI16(r, (D / 16) * (I / 16) * halvesOf(gh[e]).tileWords());
+        b.up[e] = try randI16(r, (D / 16) * (I / 16) * halvesOf(uh[e]).tileWords());
+        b.down[e] = try randI16(r, (I / 16) * (D / 16) * halvesOf(dh[e]).tileWords());
         gate_p[e] = try r.dev(std.mem.sliceAsBytes(b.gate[e]));
         up_p[e] = try r.dev(std.mem.sliceAsBytes(b.up[e]));
         down_p[e] = try r.dev(std.mem.sliceAsBytes(b.down[e]));
-        gk2[e] = @intCast(2 * bits[e]);
-        uk2[e] = gk2[e];
-        dk2[e] = gk2[e];
+        gk2[e] = @intCast(gh[e]);
+        uk2[e] = @intCast(uh[e]);
+        dk2[e] = @intCast(dh[e]);
         randScale(r, suh_g[e * D ..][0..D]);
         randScale(r, suh_u[e * D ..][0..D]);
         randScale(r, svh_g[e * I ..][0..I]);
@@ -150,13 +189,14 @@ pub fn buildLayer(r: *Rig, bits: []const u32) !Built {
         .experts = E,
         .dims = D,
         .width = I,
-        .codebook = .mul1,
+        .codebook = codebook,
+        .widths_ok = codebook != .mul1,
         .limit = LIMIT,
         .act_mode = 0,
     };
-    b.x = try r.bfs(CAP * D, 0.5); // half-range x, with the small scales, keeps the SwiGLU inputs moderate
-    b.pick = try picks(r, CAP);
-    b.wts = try wtsOf(r, CAP);
+    b.x = try r.bfs(rows_n * D, 0.5); // half-range x, with the small scales, keeps the SwiGLU inputs moderate
+    b.pick = try picks(r, rows_n);
+    b.wts = try wtsOf(r, rows_n);
     b.dx = try r.dev(std.mem.sliceAsBytes(b.x));
     b.dpick = try r.dev(std.mem.sliceAsBytes(b.pick));
     b.dwts = try r.dev(std.mem.sliceAsBytes(b.wts));
@@ -258,7 +298,7 @@ pub fn prompt(r: *Rig, exp: *const exl3e.Experts) !void {
 }
 
 /// The f64 reference: the kernel's chain mirrored in f64, each output's error its per-element worst case.
-fn reference(r: *Rig, b: *const Built, rows_n: usize) !struct { want: []f64, tol: []f64 } {
+pub fn reference(r: *Rig, b: *const Built, rows_n: usize) !struct { want: []f64, tol: []f64 } {
     const p = rows_n * SLOTS;
     // xg: fp16((x * suh_g) @ H) per slot; |xg| and its error <= V, the block's sum of |x * suh| over sqrt(128)
     const xs = try r.a.alloc(f64, p * D);
@@ -288,12 +328,12 @@ fn reference(r: *Rig, b: *const Built, rows_n: usize) !struct { want: []f64, tol
     @memset(eg, 0);
     @memset(eu, 0);
     for (0..E) |ex| {
-        exl3fmt.unpack(widthOf(b.bits[ex]), .mul1, b.gate[ex], D / 16, I / 16, wq[0 .. D * I]);
+        unpackProjection(b, b.gh[ex], b.gate[ex], D / 16, I / 16, wq[0 .. D * I]);
         for (0..p) |s0| {
             if (b.pick[s0] != @as(i32, @intCast(ex))) continue;
             gemmK(xg[s0 * D ..][0..D], wq, zg[s0..], s1g[s0..], eg[s0..], xgerr[s0 * D ..][0..D], D, I, p);
         }
-        exl3fmt.unpack(widthOf(b.bits[ex]), .mul1, b.up[ex], D / 16, I / 16, wq[0 .. D * I]);
+        unpackProjection(b, b.uh[ex], b.up[ex], D / 16, I / 16, wq[0 .. D * I]);
         for (0..p) |s0| {
             if (b.pick[s0] != @as(i32, @intCast(ex))) continue;
             gemmK(xg[s0 * D ..][0..D], wq, zu[s0..], s1u[s0..], eu[s0..], xgerr[s0 * D ..][0..D], D, I, p);
@@ -362,7 +402,7 @@ fn reference(r: *Rig, b: *const Built, rows_n: usize) !struct { want: []f64, tol
     @memset(s1d, 0);
     @memset(de, 0);
     for (0..E) |ex| {
-        exl3fmt.unpack(widthOf(b.bits[ex]), .mul1, b.down[ex], I / 16, D / 16, wq[0 .. I * D]);
+        unpackProjection(b, b.dh[ex], b.down[ex], I / 16, D / 16, wq[0 .. I * D]);
         for (0..p) |s0| {
             if (b.pick[s0] != @as(i32, @intCast(ex))) continue;
             for (0..I) |ki| {
@@ -460,4 +500,220 @@ fn absRotateCols(x: []f64, nrows: usize, cols: usize) void {
             for (0..128) |n| x[row * cols + c + n] = s;
         }
     }
+}
+
+/// The tensor-core prompt path (exl3_prompt.run: mixed widths, mcg and mcg_e4m3) against the decode path (runSlots) on
+/// the same rows, slot by slot; and the prompt path in two calls == one call, bit for bit.
+pub fn promptMixed(r: *Rig, exp: *const exl3e.Experts) !void {
+    var experts_mod = try cuda.Module.load(r.gpu.d, cuda.kernels.experts);
+    defer experts_mod.unload();
+    const router = try cuda.grouped.Router.resolve(experts_mod);
+    const all4: [E]u32 = @splat(4);
+    const all6: [E]u32 = @splat(6);
+    const all8: [E]u32 = @splat(8);
+    const mixed: [E]u32 = .{ 2, 4, 6, 8, 2, 4, 6, 8, 2 };
+    const gate4_up6: [E]u32 = @splat(4);
+    const gate4_up6_u: [E]u32 = @splat(6);
+    const down4: [E]u32 = @splat(4);
+    const Case = struct { name: []const u8, g: []const u32, u: []const u32, d: []const u32, cb: exl3e.Codebook };
+    const cases = [_]Case{
+        .{ .name = "mcg all-4", .g = &all4, .u = &all4, .d = &all4, .cb = .mcg },
+        .{ .name = "mcg all-6", .g = &all6, .u = &all6, .d = &all6, .cb = .mcg },
+        .{ .name = "mcg all-8", .g = &all8, .u = &all8, .d = &all8, .cb = .mcg },
+        .{ .name = "mcg mixed 2-4-6-8", .g = &mixed, .u = &mixed, .d = &mixed, .cb = .mcg },
+        .{ .name = "mcg gate4-up6", .g = &gate4_up6, .u = &gate4_up6_u, .d = &down4, .cb = .mcg },
+        .{ .name = "mcg_e4m3 all-4", .g = &all4, .u = &all4, .d = &all4, .cb = .mcg_e4m3 },
+        .{ .name = "mcg_e4m3 all-6", .g = &all6, .u = &all6, .d = &all6, .cb = .mcg_e4m3 },
+        .{ .name = "mcg_e4m3 all-8", .g = &all8, .u = &all8, .d = &all8, .cb = .mcg_e4m3 },
+        .{ .name = "mcg_e4m3 mixed 2-4-6-8", .g = &mixed, .u = &mixed, .d = &mixed, .cb = .mcg_e4m3 },
+        .{ .name = "mcg_e4m3 gate4-up6", .g = &gate4_up6, .u = &gate4_up6_u, .d = &down4, .cb = .mcg_e4m3 },
+    };
+    for (cases) |c| {
+        var bits: [E]u32 = undefined;
+        for (&bits, c.g) |*o, v| o.* = v;
+        const b = try buildLayerWithRows(r, &bits, c.g, c.u, c.d, c.cb, 2048);
+        if (!exl3e.prompt.eligible(b.layer)) return error.PromptNotEligible;
+        var row_baseline: ?[]u8 = null;
+        for ([_]usize{ 128, 512, 2048, 1, 17, 64, 300 }) |n| {
+            const whole = try promptRun(r, exp, router, b.layer, b.dx, b.dpick, n);
+            const over = try promptRunOverlay(r, exp, router, b.layer, b.dx, b.dpick, n);
+            const decode_run = try runSlice(r, exp, b.layer, b.dx, b.dpick, b.dwts, n);
+            const dec = decode_run.y;
+            const got = try r.back(whole, n * SLOTS * D * 4);
+            const over_got = try r.back(over, n * SLOTS * D * 4);
+            if (!std.mem.eql(u8, got, over_got)) return error.PromptOverlayMismatch;
+            const want = try r.back(dec, n * SLOTS * D * 4);
+            if (n == 128) {
+                row_baseline = try r.a.dupe(u8, got);
+            } else if (n > 128 and !std.mem.eql(u8, row_baseline.?, got[0..row_baseline.?.len])) {
+                std.debug.print("FAIL glm53-prompt-experts {s} rows={d}: first 128 rows changed with batch size\n", .{ c.name, n });
+                return error.PromptRowInvariance;
+            }
+            var max_abs: f64 = 0;
+            var max_rel: f64 = 0;
+            for (0..n * SLOTS) |ps| {
+                var scale: f64 = 0;
+                for (0..D) |i| scale = @max(scale, @abs(@as(f64, std.mem.bytesToValue(f32, want[4 * (ps * D + i) ..][0..4]))));
+                for (0..D) |i| {
+                    const pv: f64 = std.mem.bytesToValue(f32, got[4 * (ps * D + i) ..][0..4]);
+                    const dv: f64 = std.mem.bytesToValue(f32, want[4 * (ps * D + i) ..][0..4]);
+                    const diff = @abs(pv - dv);
+                    max_abs = @max(max_abs, diff);
+                    if (scale > 0) max_rel = @max(max_rel, diff / scale);
+                    if (!std.math.isFinite(pv) or diff > 5e-3 * scale + 1e-6) {
+                        std.debug.print("FAIL exl3-prompt-mixed {s} rows={d}: pair-slot {d} col {d} prompt {e} decode {e} (row-slot max {e})\n", .{ c.name, n, ps, i, pv, dv, scale });
+                        return error.TestFailed;
+                    }
+                }
+            }
+            const prompt_out = try r.zeros(n * D * 4);
+            const invalid_ids = try r.zeros(n * SLOTS * 4);
+            try exp.combinePrompt(r.s, b.layer, whole, b.dwts, n, SLOTS, prompt_out, invalid_ids);
+            try r.s.synchronize();
+            const combined = try r.back(prompt_out, n * D * 4);
+            const decode_combined = try r.back(decode_run.out, n * D * 4);
+            var max_combined: f64 = 0;
+            for (0..n * D) |i| {
+                const pv: f64 = std.mem.bytesToValue(f32, combined[4 * i ..][0..4]);
+                const dv: f64 = std.mem.bytesToValue(f32, decode_combined[4 * i ..][0..4]);
+                max_combined = @max(max_combined, @abs(pv - dv));
+                if (!std.math.isFinite(pv) or @abs(pv - dv) > 8e-3 * @abs(dv) + 2e-5) return error.PromptCombineMismatch;
+            }
+            var f64_ratio: f64 = 0;
+            var row0: usize = 0;
+            while (row0 + 128 <= n) : (row0 += 128) {
+                f64_ratio = @max(f64_ratio, try referenceWindow(r, &b, combined, row0));
+            }
+            std.debug.print("RESULT glm53-prompt-experts {s} rows={d}: max_abs {e:.3}, f64_tolerance_ratio {d:.4}\n", .{ c.name, n, max_combined, f64_ratio });
+            if (f64_ratio > 1) return error.PromptF64Mismatch;
+            if (n > 128) { // two calls: rows 0..127 then 128..n-1, each writing its own rows
+                const first = try promptRun(r, exp, router, b.layer, b.dx, b.dpick, 128);
+                const second = try promptRun(r, exp, router, b.layer, b.dx + 128 * D * 2, b.dpick + 128 * SLOTS * 4, n - 128);
+                const a = try r.back(first, 128 * SLOTS * D * 4);
+                const z = try r.back(second, (n - 128) * SLOTS * D * 4);
+                if (!std.mem.eql(u8, a, got[0..a.len]) or !std.mem.eql(u8, z, got[a.len..][0..z.len])) {
+                    std.debug.print("FAIL exl3-prompt-mixed {s} rows={d}: two calls differ from one call\n", .{ c.name, n });
+                    return error.TestFailed;
+                }
+            }
+            std.debug.print("PASS exl3-prompt-mixed {s} rows={d}: slots max_abs {e:.3} max_rel {e:.3}; weighted max_abs {e:.3} vs decode{s}\n", .{ c.name, n, max_abs, max_rel, max_combined, if (n > 128) "; two calls == one" else "" });
+        }
+    }
+}
+
+fn referenceWindow(r: *Rig, b: *const Built, output: []const u8, row0: usize) !f64 {
+    var arena = std.heap.ArenaAllocator.init(r.gpu.gpa);
+    defer arena.deinit();
+    var ref_rig = r.*;
+    ref_rig.a = arena.allocator();
+    var ref_b = b.*;
+    ref_b.x = b.x[row0 * D ..];
+    ref_b.pick = b.pick[row0 * SLOTS ..];
+    ref_b.wts = b.wts[row0 * SLOTS ..];
+    const reference_rows = try reference(&ref_rig, &ref_b, 128);
+    var ratio: f64 = 0;
+    for (0..128 * D) |i| {
+        const got: f64 = std.mem.bytesToValue(f32, output[4 * (row0 * D + i) ..][0..4]);
+        ratio = @max(ratio, @abs(got - reference_rows.want[i]) / reference_rows.tol[i]);
+    }
+    return ratio;
+}
+
+/// One prompt-path call over `rows` rows: y [rows][SLOTS][D] fp32 (fresh scratch and plan).
+fn promptRun(r: *Rig, exp: *const exl3e.Experts, router: cuda.grouped.Router, layer: exl3e.Layer, x: u64, pick: u64, rows_n: usize) !u64 {
+    return promptRunLayout(r, exp, router, layer, x, pick, rows_n, false);
+}
+
+fn promptRunOverlay(r: *Rig, exp: *const exl3e.Experts, router: cuda.grouped.Router, layer: exl3e.Layer, x: u64, pick: u64, rows_n: usize) !u64 {
+    return promptRunLayout(r, exp, router, layer, x, pick, rows_n, true);
+}
+
+fn promptRunLayout(r: *Rig, exp: *const exl3e.Experts, router: cuda.grouped.Router, layer: exl3e.Layer, x: u64, pick: u64, rows_n: usize, overlay: bool) !u64 {
+    const P = rows_n * SLOTS;
+    const tile = exl3e.prompt.tile;
+    const wide = P > cuda.grouped.small;
+    const plan: cuda.grouped.Plan = .{
+        .members = try r.zeros(P * 4),
+        .items = try r.zeros(cuda.grouped.maxItems(P, E, tile) * 12),
+        .counts = try r.zeros(8),
+        .rank = try r.zeros((if (wide) P else 1) * 4),
+        .hist = try r.zeros((if (wide) (P + 1023) / 1024 * E else 1) * 4),
+    };
+    const base = try r.zeros(try exl3e.prompt.bytes(layer, rows_n, SLOTS, overlay));
+    const sc = try exl3e.prompt.scratch(base, layer, rows_n, SLOTS, overlay);
+    try exp.prompt.runTile(exp, router, r.s, layer, x, D, pick, rows_n, sc, plan, tile);
+    try r.s.synchronize();
+    return sc.y;
+}
+
+/// `tf-cuda-test exl3-prompt-bench`: one GLM-5.3-shaped routed layer (256 experts, D 6144, rank width 1024, 8 slots,
+/// mcg_e4m3, mixed widths: mostly K2 with some K1 and K3; random trellis bits), 4096 prompt rows:
+/// the tensor-core prompt path against the decode path in the row chunks GLM-5.3's runPrompt used before (<= 1024).
+pub fn promptBench(r: *Rig, exp: *const exl3e.Experts) !void {
+    const BE = 256;
+    const BD = 6144;
+    const BI = 1024;
+    const rows_n: usize = 4096;
+    var experts_mod = try cuda.Module.load(r.gpu.d, cuda.kernels.experts);
+    defer experts_mod.unload();
+    const router = try cuda.grouped.Router.resolve(experts_mod);
+    var ptrs: [3][BE]u64 = undefined;
+    var k2s: [3][BE]i32 = undefined;
+    for (0..BE) |e| for (0..3) |m| {
+        const h: u32 = if (e % 16 == 0) 2 else if (e % 9 == 0) 6 else 4; // a fixed mixed-width pattern
+        k2s[m][e] = @intCast(h);
+        const words = (BD / 16) * (BI / 16) * halvesOf(h).tileWords();
+        const t = try randI16(r, words);
+        ptrs[m][e] = try r.dev(std.mem.sliceAsBytes(t));
+        r.a.free(t);
+    };
+    const sv = try r.a.alloc(u16, BE * BD);
+    randScale(r, sv);
+    const s_d = try r.dev(std.mem.sliceAsBytes(sv));
+    const s_i = try r.dev(std.mem.sliceAsBytes(sv[0 .. BE * BI]));
+    var layer: exl3e.Layer = .{ .gate = try r.dev(std.mem.sliceAsBytes(ptrs[0][0..])), .up = try r.dev(std.mem.sliceAsBytes(ptrs[1][0..])), .down = try r.dev(std.mem.sliceAsBytes(ptrs[2][0..])), .gate_k2 = try r.dev(std.mem.sliceAsBytes(k2s[0][0..])), .up_k2 = try r.dev(std.mem.sliceAsBytes(k2s[1][0..])), .down_k2 = try r.dev(std.mem.sliceAsBytes(k2s[2][0..])), .suh_g = s_d, .suh_u = s_d, .svh_g = s_i, .svh_u = s_i, .suh_d = s_i, .svh_d = s_d, .experts = BE, .dims = BD, .width = BI, .codebook = .mcg_e4m3, .widths_ok = true, .limit = LIMIT, .act_mode = 0 };
+    const x = try r.bfs(rows_n * BD, 0.5);
+    const pk = try r.a.alloc(i32, rows_n * SLOTS);
+    for (0..rows_n) |row| for (0..SLOTS) |k| {
+        pk[row * SLOTS + k] = @intCast((row * 37 + k * 97 + (row / 13) * 5) % BE); // spread, distinct within a row
+    };
+    for (0..rows_n) |row| {
+        for (0..SLOTS) |k| for (0..k) |j| if (pk[row * SLOTS + k] == pk[row * SLOTS + j]) {
+            pk[row * SLOTS + k] = @intCast((@as(usize, @intCast(pk[row * SLOTS + k])) + 1 + k) % BE);
+        };
+    }
+    const dx = try r.dev(std.mem.sliceAsBytes(x));
+    const dpk = try r.dev(std.mem.sliceAsBytes(pk));
+    const wts = try wtsOf(r, rows_n);
+    const dw = try r.dev(std.mem.sliceAsBytes(wts));
+    // prompt path: one call for all rows (fresh plan and scratch outside the timing)
+    const P = rows_n * SLOTS;
+    const tile = exl3e.prompt.tile;
+    const plan: cuda.grouped.Plan = .{ .members = try r.zeros(P * 4), .items = try r.zeros(cuda.grouped.maxItems(P, BE, tile) * 12), .counts = try r.zeros(8), .rank = try r.zeros(P * 4), .hist = try r.zeros((P + 1023) / 1024 * BE * 4) };
+    const psc = try exl3e.prompt.scratch(try r.zeros(try exl3e.prompt.bytes(layer, rows_n, SLOTS, false)), layer, rows_n, SLOTS, false);
+    var ev0 = try cuda.Event.init(r.gpu.d, true);
+    defer ev0.deinit();
+    var ev1 = try cuda.Event.init(r.gpu.d, true);
+    defer ev1.deinit();
+    for (0..2) |_| try exp.prompt.run(exp, router, r.s, layer, dx, BD, dpk, rows_n, psc, plan);
+    try ev0.record(r.s);
+    const reps = 5;
+    for (0..reps) |_| try exp.prompt.run(exp, router, r.s, layer, dx, BD, dpk, rows_n, psc, plan);
+    try ev1.record(r.s);
+    try r.s.synchronize();
+    const prompt_ms = (try ev0.elapsedMs(ev1)) / reps;
+    // decode path in 1024-row chunks (exp.run: routed + combine), as the fallback ran
+    const chunk: usize = 1024;
+    const dsc = try exl3e.scratch(try r.zeros(try exl3e.scratchBytes(layer, chunk, SLOTS)), layer, chunk, SLOTS);
+    const out = try r.zeros(chunk * BD * 4);
+    layer.widths_ok = true;
+    try exp.run(r.s, layer, dx, BD, .bf16, dpk, dw, chunk, out, dsc);
+    try ev0.record(r.s);
+    var at: usize = 0;
+    while (at < rows_n) : (at += chunk) try exp.run(r.s, layer, dx + at * BD * 2, BD, .bf16, dpk + at * SLOTS * 4, dw + at * SLOTS * 4, chunk, out, dsc);
+    try ev1.record(r.s);
+    try r.s.synchronize();
+    const decode_ms = try ev0.elapsedMs(ev1);
+    const flop = 2.0 * @as(f64, @floatFromInt(P)) * (2.0 * BD * BI + BI * BD);
+    std.debug.print("BENCH exl3-prompt GLM-5.3 layer (256 x 6144 x 1024 rank half, mcg_e4m3 mixed K1/K2/K3), {d} rows x 8 slots: prompt path {d:.2} ms ({d:.1} TFLOP/s) | decode path (1024-row chunks) {d:.2} ms ({d:.1} TFLOP/s) | {d:.2}x\n", .{ rows_n, prompt_ms, flop / prompt_ms / 1e9, decode_ms, flop / decode_ms / 1e9, decode_ms / prompt_ms });
 }

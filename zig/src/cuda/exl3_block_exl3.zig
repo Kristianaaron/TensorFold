@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! DeepSeek-V4.1's routed EXL3 expert kernels: x3ld, x3pf, x3gm and the grouped kernel with its helpers.
 
 const std = @import("std");
@@ -428,7 +430,7 @@ pub const Ops = struct {
         var a: cuda.Args = .{};
         for ([_]u64{ z, pick, svh_d, y, wts, out }) |v| a.add(v);
         for ([_]usize{ P, D, SK, E, slots }) |v| a.add(int(v));
-        try go(o.f.down_combine[@intFromBool(out_bf16)], o.s, .{ rows, D / 128, 1 }, 32 * slots, 0, false, &a);
+        try go(o.f.down_combine[@intFromBool(out_bf16)], o.s, .{ rows, D / 128, 1 }, 32 * slots, 16_384, false, &a);
     }
 
     /// exl3x_dequant_cuda at cb 2: W_q [K, N] fp16 through the grouped kernels' lane decode (tests).

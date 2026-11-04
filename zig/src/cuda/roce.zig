@@ -1,4 +1,7 @@
-//! Two-rank all-gathers as one-shot RoCE writes after b12x's RoCEnante (local-inference-lab/b12x, Apache-2.0).
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
+//! Two-rank all-gathers and rank-order all-reduces as one-shot RoCE writes after b12x's RoCEnante
+//! (`flashinfer/experimental/b12x/comm/roce/_oneshot_cute.py`, local-inference-lab/flashinfer@4092b28, Apache-2.0).
 
 const std = @import("std");
 const abi = @import("abi.zig");
@@ -20,7 +23,32 @@ const threads = 512;
 const max_blocks = 8; // the largest grid; smaller shards launch fewer (a power of two)
 const classes = 4; // grid size classes 1, 2, 4, 8 (each its own arrival counters)
 const idle_spins: u64 = 20_000_000; // doorbell polls before the proxy naps between them (a model's gaps are short)
-const spin_limit: u32 = 100_000_000; // the kernel's flag polls before it gives up and poisons the exchange
+const glm_timeout_ms: u32 = 2_000;
+const default_timeout_ms: u32 = 120_000;
+const poison_bits: u32 = 0xffff_ffff;
+
+pub fn sameStream(bound: ?abi.Stream, s: abi.Stream) bool {
+    return if (bound) |b| b == s else false;
+}
+
+/// Plain TF_ROCE gathers retain the prior long wait; GLM's opt-in defaults to the reviewed two-second bound.
+pub fn timeoutMs(value: ?[*:0]const u8, glm: bool) !u32 {
+    const default = if (glm) glm_timeout_ms else default_timeout_ms;
+    const raw = value orelse return default;
+    const text = std.mem.span(raw);
+    const parsed = std.fmt.parseInt(u32, text, 10) catch return error.InvalidRoceTimeout;
+    if (parsed == 0 or parsed > 3_600_000) return error.InvalidRoceTimeout;
+    return parsed;
+}
+
+pub fn poisonBits() u32 {
+    return poison_bits;
+}
+
+/// Model the zeroed epoch and poison words written during a complete Gather setup.
+pub fn resetPoisonState(words: []u32) void {
+    @memset(words, 0);
+}
 
 // -- libibverbs (the ABI of rdma-core's verbs.h; offsets checked against its headers) ---------------------------------
 const Device = opaque {};
@@ -144,7 +172,14 @@ fn opsCall(comptime T: type, ctx: *Context, offset: usize) T {
     return slot.*;
 }
 
-pub const Error = error{ VerbsUnavailable, NoHca, HcaFailed, PeerRefused, ProxyFailed, ExchangeTimedOut, Misaligned };
+pub const Error = error{ VerbsUnavailable, NoHca, HcaFailed, PeerRefused, ProxyFailed, ExchangeTimedOut, Misaligned, StreamMismatch };
+
+/// Host oracle for the reducer's BF16 conversion; round to nearest, ties to even.
+pub fn f32ToBf16(x: f32) u16 {
+    const bits: u32 = @bitCast(x);
+    if (std.math.isNan(x)) return @intCast((bits >> 16) | 0x40);
+    return @intCast((bits +% (0x7fff + ((bits >> 16) & 1))) >> 16);
+}
 
 /// TF_ROCE=0 keeps every gather on NCCL; unset or any other value asks for this path (both ranks must ask).
 pub fn wanted() bool {
@@ -181,6 +216,45 @@ const c_seq = 0;
 const c_nbytes = 1; // + slot
 const c_error = 3;
 const c_hca = 4;
+const c_error_seq = 5;
+const c_abort = 6;
+const c_error_kind = 7;
+
+pub const SeqState = struct { next: u32, pending: u32 };
+
+/// Sequence arithmetic deliberately wraps; zero is a valid sequence, never an error flag.
+pub fn sequenceState(last: u32, published: u32) ?SeqState {
+    const pending = published -% last;
+    if (pending == 0 or pending > slots) return null;
+    return .{ .next = last +% 1, .pending = pending };
+}
+
+pub fn errorFlag(_: u32) u32 {
+    return 1;
+}
+
+pub fn aligned16(ptr: abi.DevicePtr) bool {
+    return ptr % 16 == 0;
+}
+
+pub fn completionMatches(expected_seq: u32, expected_bytes: u32, received_seq: u32, received_bytes: u32) bool {
+    return expected_seq == received_seq and expected_bytes == received_bytes;
+}
+
+pub fn reduceF32(a: f32, b: f32, poisoned: bool) f32 {
+    return if (poisoned) @bitCast(poison_bits) else a + b;
+}
+
+pub fn reduceBf16(a: u16, b: u16, poisoned: bool) u16 {
+    if (poisoned) return 0xffff;
+    return f32ToBf16(@as(f32, @bitCast(@as(u32, a) << 16)) + @as(f32, @bitCast(@as(u32, b) << 16)));
+}
+
+pub const TokenStatus = struct { token: u32, status: u32 };
+
+pub fn gateToken(token: u32, poisoned: bool) TokenStatus {
+    return if (poisoned) .{ .token = 0xffff_ffff, .status = 1 } else .{ .token = token, .status = 0 };
+}
 
 /// What a rank tells its peer to connect: its region, and per HCA its key, address and queue pair.
 const Blob = extern struct {
@@ -223,7 +297,12 @@ pub const Gather = struct {
     counters: memory.DeviceBuffer,
     module: Module,
     f: Function,
+    reduce_f32: Function,
+    reduce_bf16: Function,
+    status_gate: Function,
+    reduce_scratch: memory.DeviceBuffer,
     max_bytes: usize,
+    timeout_ns: u64,
     peer_addr: u64 = 0,
     peer_rkey: [max_hcas]u32 = @splat(0),
     last_seq: u32 = 0,
@@ -232,15 +311,16 @@ pub const Gather = struct {
     thread: ?std.Thread = null,
     err: [256]u8 = @splat(0),
     gathers: u64 = 0,
+    stream_handle: ?abi.Stream = null,
 
     /// Both ranks' exchange or null on both; setup crosses ``group``'s communicator on ``s``. ``max_bytes``: a shard.
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const Driver, group: *const tp_group.Group, s: Stream, want: bool, max_bytes: usize) !?*Gather {
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const Driver, group: *const tp_group.Group, s: Stream, want: bool, max_bytes: usize, timeout_ms: u32) !?*Gather {
         if (group.world != 2) return error.PeerRefused;
         const g = try gpa.create(Gather);
         var mine: Blob = std.mem.zeroes(Blob);
         const ok = want and blk: {
             g.setup(gpa, io, d, @intCast(group.rank), max_bytes) catch |e| {
-                std.log.warn("RoCE all-gather: {s} ({s}); NCCL carries every gather", .{ @errorName(e), std.mem.sliceTo(&g.err, 0) });
+                std.log.warn("RoCE setup unavailable: {s} ({s})", .{ @errorName(e), std.mem.sliceTo(&g.err, 0) });
                 break :blk false;
             };
             break :blk true;
@@ -257,9 +337,10 @@ pub const Gather = struct {
             return null;
         }
         g.max_bytes = agreedCap(mine.max_bytes, theirs.max_bytes); // one cap for fits on both ranks
+        g.timeout_ns = @as(u64, timeout_ms) * std.time.ns_per_ms;
         const connected = blk: {
             g.connect(&theirs) catch |e| {
-                std.log.warn("RoCE all-gather: {s} ({s}); NCCL carries every gather", .{ @errorName(e), std.mem.sliceTo(&g.err, 0) });
+                std.log.warn("RoCE peer setup unavailable: {s} ({s})", .{ @errorName(e), std.mem.sliceTo(&g.err, 0) });
                 break :blk false;
             };
             break :blk true;
@@ -274,6 +355,7 @@ pub const Gather = struct {
             gpa.destroy(g);
             return null;
         }
+        g.stream_handle = s.handle;
         std.log.info("RoCE all-gather: {d} HCA(s), shards up to {d} KiB by RDMA writes", .{ g.n_hca, g.max_bytes >> 10 });
         return g;
     }
@@ -283,7 +365,7 @@ pub const Gather = struct {
     }
 
     fn setup(g: *Gather, gpa: std.mem.Allocator, io: std.Io, d: *const Driver, rank: u8, max_bytes: usize) !void {
-        g.* = .{ .gpa = gpa, .d = d, .lib = undefined, .api = undefined, .rank = rank, .layout = .of(max_bytes), .region = undefined, .region_dev = 0, .counters = undefined, .module = undefined, .f = undefined, .max_bytes = max_bytes };
+        g.* = .{ .gpa = gpa, .d = d, .lib = undefined, .api = undefined, .rank = rank, .layout = .of(max_bytes), .region = undefined, .region_dev = 0, .counters = undefined, .module = undefined, .f = undefined, .reduce_f32 = undefined, .reduce_bf16 = undefined, .status_gate = undefined, .reduce_scratch = undefined, .max_bytes = max_bytes, .timeout_ns = 0 };
         g.lib = std.DynLib.open("libibverbs.so.1") catch return @import("sys").optional_libraries.unavailable(.verbs);
         errdefer g.lib.close();
         const info = @typeInfo(Api).@"struct";
@@ -299,11 +381,17 @@ pub const Gather = struct {
         g.region_dev = try g.region.device();
         g.counters = try memory.DeviceBuffer.alloc(d, 64 * 4);
         errdefer g.counters.free();
-        const zeros: [64 * 4]u8 = @splat(0);
-        try g.counters.upload(0, &zeros);
+        var counter_state: [64]u32 = undefined;
+        resetPoisonState(&counter_state);
+        try g.counters.upload(0, std.mem.sliceAsBytes(&counter_state));
         g.module = try Module.load(d, kernels.roce_gather);
         errdefer g.module.unload();
         g.f = try g.module.function("roce_gather");
+        g.reduce_f32 = try g.module.function("roce_reduce_f32");
+        g.reduce_bf16 = try g.module.function("roce_reduce_bf16");
+        g.status_gate = try g.module.function("roce_status_gate");
+        g.reduce_scratch = try memory.DeviceBuffer.alloc(d, 2 * max_bytes);
+        errdefer g.reduce_scratch.free();
         errdefer g.closeHcas();
         for (0..g.n_hca) |h| try g.openHca(io, gpa, h, names[h][0..lens[h]]);
     }
@@ -420,7 +508,8 @@ pub const Gather = struct {
         const slot: u64 = seq & 1;
         const base = @intFromPtr(g.region.bytes.ptr);
         const packs = nbytes / 16;
-        var seq_copy: u32 = seq;
+        const Completion = extern struct { seq: u32, nbytes: u32 };
+        var completion: Completion = .{ .seq = seq, .nbytes = nbytes };
         var offset: u64 = 0;
         for (0..g.n_hca) |h| {
             const x = &g.hcas[h];
@@ -431,7 +520,7 @@ pub const Gather = struct {
             var n = packs / g.n_hca;
             if (h < packs % g.n_hca) n += 1;
             const bytes: u32 = n * 16;
-            var flag_sge: Sge = .{ .addr = @intFromPtr(&seq_copy), .length = 4, .lkey = 0 };
+            var flag_sge: Sge = .{ .addr = @intFromPtr(&completion), .length = @sizeOf(Completion), .lkey = 0 };
             var flag: SendWr = .{ .wr_id = h, .sg_list = &flag_sge, .num_sge = 1, .opcode = wr_rdma_write, .send_flags = send_signaled | send_inline, .remote_addr = g.peer_addr + g.layout.flags + (slot * g.n_hca + h) * flag_stride, .rkey = g.peer_rkey[h] };
             var data_sge: Sge = .{ .addr = base + g.layout.send + slot * g.layout.slot_bytes + offset, .length = bytes, .lkey = x.mr.?.lkey };
             var data: SendWr = .{ .wr_id = h, .next = &flag, .sg_list = &data_sge, .num_sge = 1, .opcode = wr_rdma_write, .remote_addr = g.peer_addr + g.layout.recv + slot * g.layout.slot_bytes + offset, .rkey = g.peer_rkey[h] };
@@ -458,6 +547,7 @@ pub const Gather = struct {
             if (seq == g.last_seq) {
                 idle += 1;
                 if (idle % 64 == 0) for (0..g.n_hca) |h| g.drain(h) catch {
+                    g.setAbort();
                     g.failed.store(true, .release);
                     return;
                 };
@@ -466,19 +556,22 @@ pub const Gather = struct {
             }
             idle = 0;
             // a rank's next gather can ring before this thread saw the last one; peers stay within a slot's distance
-            var pending = seq -% g.last_seq;
-            if (pending > slots) {
+            if (sequenceState(g.last_seq, seq) == null) {
+                const pending = seq -% g.last_seq;
                 g.fail("the doorbell skipped {d} sequences (last {d}, now {d})", .{ pending, g.last_seq, seq });
+                g.setAbort();
                 g.failed.store(true, .release);
                 return;
             }
-            var s = g.last_seq +% 1;
-            while (pending > 0) : ({
+            var state = sequenceState(g.last_seq, seq).?;
+            var s = state.next;
+            while (state.pending > 0) : ({
                 s +%= 1;
-                pending -= 1;
+                state.pending -= 1;
             }) {
                 const nbytes = @atomicLoad(u32, &c[c_nbytes + (s & 1)], .acquire);
                 g.post(s, nbytes) catch {
+                    g.setAbort();
                     g.failed.store(true, .release);
                     return;
                 };
@@ -492,14 +585,31 @@ pub const Gather = struct {
         return @intCast(@min(mine, theirs));
     }
 
+    pub fn dispatchRoce(glm: bool, world: usize, dtype: u32, sum: bool, count: usize, max_bytes: usize) bool {
+        if (!glm or world != 2 or !sum or dtype > 1) return false;
+        const width: usize = if (dtype == 0) 4 else 2;
+        const bytes = std.math.mul(usize, count, width) catch return false;
+        return count != 0 and bytes <= max_bytes and bytes % 16 == 0 and !(dtype == 0 and count % 4 != 0);
+    }
+
     /// Whether a gather of ``bytes`` a rank goes this way: the size alone decides, so both ranks pick the same path.
     pub fn fits(g: *const Gather, bytes: usize) bool {
         return bytes > 0 and bytes <= g.max_bytes and bytes % 16 == 0;
     }
 
+    pub fn boundTo(g: *const Gather, stream: abi.Stream) bool {
+        return sameStream(g.stream_handle, stream);
+    }
+
+    /// Startup alignment check for the actual exposed RoCE and CUDA allocations.
+    pub fn buffersAligned16(g: *const Gather) bool {
+        return aligned16(g.region_dev) and aligned16(g.counters.ptr) and aligned16(g.reduce_scratch.ptr);
+    }
+
     /// Both ranks' ``bytes`` from ``send`` into ``recv`` in rank order (as ncclAllGather); misaligned is an error.
     pub fn gather(g: *Gather, stream: abi.Stream, send: abi.DevicePtr, recv: abi.DevicePtr, bytes: usize) !void {
-        if (send % 16 != 0 or recv % 16 != 0) return error.Misaligned;
+        if (!g.boundTo(stream)) return error.StreamMismatch;
+        if (!aligned16(send) or !aligned16(recv)) return error.Misaligned;
         const packs = bytes / 16;
         const need = @max(1, std.math.divCeil(usize, packs, 2 * threads) catch unreachable);
         const grid: u32 = @intCast(@min(std.math.ceilPowerOfTwo(usize, need) catch max_blocks, max_blocks));
@@ -517,10 +627,28 @@ pub const Gather = struct {
         a.add(@as(i64, @intCast(g.layout.slot_bytes)));
         a.add(g.counters.ptr);
         a.add(klass);
-        a.add(spin_limit);
+        a.add(g.timeout_ns);
         a.add(@as(i32, @intCast(g.n_hca)));
         try launch.launch(g.f, .{ .grid = .{ .x = grid }, .block = .{ .x = threads } }, .{ .handle = stream, .d = g.d }, &a);
         g.gathers += 1;
+    }
+
+    /// Two-rank sum: gather both operands in rank order, then reduce on the same stream.
+    /// `dtype` is 0 for fp32 and 1 for bf16; other types are left to NCCL by the caller.
+    pub fn allReduce(g: *Gather, stream: abi.Stream, send: abi.DevicePtr, recv: abi.DevicePtr, count: usize, dtype: u32) !void {
+        if (dtype > 1) return error.UnsupportedType;
+        const size: usize = if (dtype == 0) 4 else 2;
+        const bytes = std.math.mul(usize, count, size) catch return error.Misaligned;
+        if (!g.fits(bytes) or (dtype == 0 and count % 4 != 0)) return error.Misaligned;
+        try g.gather(stream, send, g.reduce_scratch.ptr, bytes);
+        var a: launch.Args = .{};
+        a.add(g.reduce_scratch.ptr);
+        a.add(recv);
+        a.add(g.region_dev + g.layout.ctrl);
+        a.add(@as(i32, @intCast(count)));
+        const f = if (dtype == 0) g.reduce_f32 else g.reduce_bf16;
+        const blocks = std.math.divCeil(usize, count, 256) catch unreachable;
+        try launch.launch(f, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = 256 } }, .{ .handle = stream, .d = g.d }, &a);
     }
 
     /// An error if a wait timed out on the GPU or the proxy failed (the host checks after a synchronize).
@@ -528,14 +656,49 @@ pub const Gather = struct {
         const c = g.ctrl();
         const bad = @atomicLoad(u32, &c[c_error], .acquire);
         if (bad == 0 and !g.failed.load(.acquire)) return;
-        std.log.err("RoCE all-gather failed (sequence {d}, HCA {d}): {s}", .{ bad, c[c_hca], std.mem.sliceTo(&g.err, 0) });
+        const kind = switch (c[c_error_kind]) {
+            1 => "peer wait timeout",
+            2 => "peer byte-count mismatch",
+            3 => "host proxy or group abort",
+            else => "exchange failed",
+        };
+        std.log.err("RoCE all-gather failed ({s}, sequence {d}, HCA {d}): {s}", .{ kind, c[c_error_seq], c[c_hca], std.mem.sliceTo(&g.err, 0) });
         return error.ProxyFailed;
+    }
+
+    fn setAbort(g: *Gather) void {
+        const c = g.ctrl();
+        if (@atomicLoad(u32, &c[c_error], .acquire) == 0) {
+            @atomicStore(u32, &c[c_error_seq], @atomicLoad(u32, &c[c_seq], .acquire), .monotonic);
+            @atomicStore(u32, &c[c_error_kind], 3, .monotonic);
+            @atomicStore(u32, &c[c_error], errorFlag(0), .release);
+        }
+        @atomicStore(u32, &c[c_abort], 1, .release);
+    }
+
+    pub fn abort(g: *Gather) void {
+        g.setAbort();
+    }
+
+    /// Spark fault-injection hook: stop the host proxy without publishing abort, forcing the GPU deadline path.
+    pub fn stopProxyForTest(g: *Gather) void {
+        if (g.running.swap(false, .acq_rel)) if (g.thread) |thread| thread.join();
+    }
+
+    /// Poison a graph's host-visible token/status result after its model work completes.
+    pub fn gateResult(g: *Gather, stream: abi.Stream, token: abi.DevicePtr, status: abi.DevicePtr) !void {
+        var a: launch.Args = .{};
+        a.add(g.region_dev + g.layout.ctrl);
+        a.add(token);
+        a.add(status);
+        try launch.launch(g.status_gate, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1 } }, .{ .handle = stream, .d = g.d }, &a);
     }
 
     fn teardown(g: *Gather) void {
         if (g.running.swap(false, .acq_rel)) if (g.thread) |t| t.join();
         g.closeHcas();
         g.module.unload();
+        g.reduce_scratch.free();
         g.counters.free();
         g.region.free();
         g.lib.close();
@@ -575,15 +738,36 @@ fn gidIndex(io: std.Io, gpa: std.mem.Allocator, name: []const u8) !c_int {
     while (i < 16) : (i += 1) {
         var pbuf: [160]u8 = undefined;
         const tpath = try std.fmt.bufPrint(&pbuf, "/sys/class/infiniband/{s}/ports/1/gid_attrs/types/{d}", .{ name, i });
-        const t = cwd.readFileAlloc(io, tpath, gpa, .limited(64)) catch continue;
+        const t = readSysfsText(cwd, io, gpa, tpath) catch continue;
         defer gpa.free(t);
         if (!std.mem.startsWith(u8, t, "RoCE v2")) continue;
         const gpath = try std.fmt.bufPrint(&pbuf, "/sys/class/infiniband/{s}/ports/1/gids/{d}", .{ name, i });
-        const gid = cwd.readFileAlloc(io, gpath, gpa, .limited(64)) catch continue;
+        const gid = readSysfsText(cwd, io, gpa, gpath) catch continue;
         defer gpa.free(gid);
         if (std.mem.startsWith(u8, gid, "0000:0000:0000:0000:0000:ffff:")) return i;
     }
     return error.NoHca;
+}
+
+/// Read a sysfs attribute to EOF; sysfs files report a zero stat size, so readFileAlloc can return no contents.
+fn readSysfsText(dir: std.Io.Dir, io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+    var file = try dir.openFile(io, path, .{});
+    defer file.close(io);
+    var scratch: [128]u8 = undefined;
+    var reader = file.readerStreaming(io, &scratch);
+    return reader.interface.allocRemaining(gpa, .limited(64));
+}
+
+test "sysfs text helper reads to EOF without using stat size" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const expected = "RoCE v2\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "gid_type", .data = expected });
+    const got = try readSysfsText(tmp.dir, io, gpa, "gid_type");
+    defer gpa.free(got);
+    try std.testing.expectEqualSlices(u8, expected, got);
 }
 
 test "RoCE gather: both ranks agree one cap" {
@@ -593,4 +777,63 @@ test "RoCE gather: both ranks agree one cap" {
     const b = Gather.agreedCap(512 << 10, 511 << 10);
     try std.testing.expectEqual(a, b);
     try std.testing.expectEqual(@as(usize, 511 << 10), a);
+}
+
+test "RoCE GLM all-reduce sizes and rank-order host reference" {
+    for (1..9) |rows| {
+        const bytes = rows * 6144 * @sizeOf(f32);
+        try std.testing.expectEqual(@as(usize, 24 * 1024 * rows), bytes);
+        try std.testing.expect(bytes % 16 == 0);
+    }
+    const rank0 = [_]f32{ 1.0, -2.5, 0.125, 1024.0 };
+    const rank1 = [_]f32{ 0.25, 3.0, -0.0625, -1.0 };
+    var out0: [4]f32 = undefined;
+    var out1: [4]f32 = undefined;
+    var bf0: [4]u16 = undefined;
+    var bf1: [4]u16 = undefined;
+    for (&out0, &out1, &bf0, &bf1, rank0, rank1) |*a, *b, *ba, *bb, x, y| {
+        a.* = x + y;
+        b.* = x + y;
+        ba.* = f32ToBf16(x + y);
+        bb.* = f32ToBf16(x + y);
+    }
+    try std.testing.expectEqualSlices(f32, &.{ 1.25, 0.5, 0.0625, 1023.0 }, &out0);
+    try std.testing.expectEqualSlices(f32, &out0, &out1);
+    try std.testing.expectEqualSlices(u16, &bf0, &bf1);
+    try std.testing.expectEqualSlices(u16, &.{ 0x3FA0, 0x3F00, 0x3D80, 0x4480 }, &bf0);
+}
+
+test "RoCE sequence wrap and nonzero error encoding" {
+    try std.testing.expectEqual(SeqState{ .next = 0xffff_ffff, .pending = 1 }, sequenceState(0xffff_fffe, 0xffff_ffff).?);
+    try std.testing.expectEqual(SeqState{ .next = 0xffff_ffff, .pending = 2 }, sequenceState(0xffff_fffe, 0).?);
+    try std.testing.expectEqual(SeqState{ .next = 0, .pending = 1 }, sequenceState(0xffff_ffff, 0).?);
+    try std.testing.expect(sequenceState(9, 9) == null);
+    try std.testing.expect(sequenceState(9, 12) == null);
+    try std.testing.expectEqual(@as(u32, 1), errorFlag(0));
+    try std.testing.expectEqual(@as(u32, 1), errorFlag(0xffff_ffff));
+    try std.testing.expect(aligned16(0x1000));
+    try std.testing.expect(!aligned16(0x1008));
+}
+
+test "RoCE all-reduce dispatch is symmetric and respects dtype, op, size, and opt-in" {
+    const max_bytes = 512 * 1024;
+    try std.testing.expect(!Gather.dispatchRoce(false, 2, 0, true, 6144, max_bytes));
+    try std.testing.expect(!Gather.dispatchRoce(true, 2, 2, true, 6144, max_bytes));
+    try std.testing.expect(!Gather.dispatchRoce(true, 2, 0, false, 6144, max_bytes));
+    try std.testing.expect(!Gather.dispatchRoce(true, 2, 0, true, max_bytes, max_bytes));
+    try std.testing.expect(!Gather.dispatchRoce(true, 2, 1, true, 3, max_bytes));
+    for (1..9) |rows| try std.testing.expect(Gather.dispatchRoce(true, 2, 0, true, rows * 6144, max_bytes));
+}
+
+test "RoCE stream identity is explicit" {
+    const a: abi.Stream = @ptrFromInt(0x1000);
+    const b: abi.Stream = @ptrFromInt(0x2000);
+    try std.testing.expect(!sameStream(null, a));
+    try std.testing.expect(sameStream(a, a));
+    try std.testing.expect(!sameStream(a, b));
+}
+
+test {
+    std.testing.refAllDecls(@This());
+    std.testing.refAllDecls(Gather);
 }

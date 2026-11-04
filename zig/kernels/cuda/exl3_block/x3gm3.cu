@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
+#include "../tf_vblock.cuh"
 // x3gm v3: gm2_kernel's items, chains and epilogue (x3gm.cu) with claim-ahead items, LEAN decode and MTL 1 warps.
 
 #define DSV41_X3GM_NO_INSTANCES
@@ -66,7 +69,7 @@ __device__ __forceinline__ void kloop3(float (&acc)[MTL][NG][4], const unsigned 
         cp_commit();
     }
     cp_wait<NSA - 2>();
-    __syncthreads();
+    TF_TASK_SYNC();
     for (int s = 0; s < S; ++s) {
         side(s);
         if (s + NSA - 1 < S) load_stage(s + NSA - 1);
@@ -100,7 +103,7 @@ __device__ __forceinline__ void kloop3(float (&acc)[MTL][NG][4], const unsigned 
             }
         }
         cp_wait<NSA - 2>();
-        __syncthreads();
+        TF_TASK_SYNC();
     }
 }
 
@@ -194,7 +197,7 @@ __device__ __forceinline__ void gm3_item(const Args& a, unsigned char* smem, con
     // epilogue: gm_kernel's
 #pragma unroll
     for (int rd = 0; rd < C::ROUNDS; ++rd) {
-        if (rd) __syncthreads();
+        if (rd) TF_TASK_SYNC();
         if (ER * rd < cnt) {
 #pragma unroll
             for (int n = 0; n < NGR; ++n) {
@@ -209,7 +212,7 @@ __device__ __forceinline__ void gm3_item(const Args& a, unsigned char* smem, con
                 }
             }
         }
-        __syncthreads();
+        TF_TASK_SYNC();
         for (int r = warp; r < ER && ER * rd + r < cnt; r += W) {
             const int row = rows_sh[ER * rd + r];
             const int c0 = 4 * lane;
@@ -254,13 +257,14 @@ __device__ __forceinline__ int ld_relaxed(const int* p) {
 template <int MATS, int XM, int MTL, int NG, int KS, int NSA, int NGR, int LEAN>
 __global__ void __launch_bounds__(Smem2<MATS, XM, MTL, NG, KS, NSA, NGR>::THREADS,
                                   Smem2<MATS, XM, MTL, NG, KS, NSA, NGR>::MINB) gm3_kernel(const Args a) {
+    TF_VBLOCK_ENTER();
     constexpr int BM = NG * 8, THREADS = Smem2<MATS, XM, MTL, NG, KS, NSA, NGR>::THREADS, AHEAD = 5;
     constexpr int RPT = (BM + THREADS - 1) / THREADS;          // member rows a thread reads ahead
     extern __shared__ __align__(16) unsigned char smem[];
     __shared__ int rows_sh[2][BM];
     __shared__ int meta_sh[2][4];                               // item, expert, first index, members
     const int NBLK = a.N >> 7, total = a.npass[0] * NBLK;
-    int next = blockIdx.x;
+    int next = TF_VBID.x;
     // the first item, claimed and read as gm2_kernel does
     if (threadIdx.x == 0) {
         const int item = a.ticket ? atomicAdd(a.ticket, 1) : next;
@@ -272,7 +276,7 @@ __global__ void __launch_bounds__(Smem2<MATS, XM, MTL, NG, KS, NSA, NGR>::THREAD
             meta_sh[0][3] = a.pcnt[tt];
         }
     }
-    next += gridDim.x;
+    next += TF_VNBLK.x;
     __syncthreads();
     if (meta_sh[0][0] < total)
         for (int i = threadIdx.x; i < BM; i += THREADS) rows_sh[0][i] = i < meta_sh[0][3] ? a.order[meta_sh[0][2] + i] : -1;
@@ -288,7 +292,7 @@ __global__ void __launch_bounds__(Smem2<MATS, XM, MTL, NG, KS, NSA, NGR>::THREAD
         auto side = [&](int s) {
             if (s == 0) {
                 if (threadIdx.x == 0) claim = a.ticket ? atomicAdd(a.ticket, 1) : next;
-                next += gridDim.x;
+                next += TF_VNBLK.x;
             } else if (s == 1) {
                 if (threadIdx.x == 0 && claim < total) {
                     const int tt = claim / NBLK;

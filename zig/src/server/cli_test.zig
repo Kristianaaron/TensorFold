@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! cli.zig's public surface: what parse reads, what capabilities lists and what request asks an engine for.
 const std = @import("std");
 const api = @import("engine_api");
@@ -87,16 +89,17 @@ test "an engine is asked for what the flags say, and the defaults of the flags n
     const a = arena.allocator();
     const plain = try request(a, "d", "t", .{});
     const want: api.Open = .{ .dir = "d", .model_type = "t", .learn = null };
-    inline for (.{ "mtp_drafts", "mtp_confidence", "keep", "tp", "rank", "master_port", "lanes", "drafts", "device", "segments" }) |field| try std.testing.expectEqual(@field(want, field), @field(plain, field));
+    inline for (.{ "mtp_drafts", "mtp_confidence", "manifest", "keep", "tp", "rank", "master_port", "lanes", "drafts", "device", "segments" }) |field| try std.testing.expectEqual(@field(want, field), @field(plain, field));
     try std.testing.expectEqualStrings("", plain.policy);
     try std.testing.expectEqualStrings("", plain.master);
-    const gpu = try request(a, "d", "t", .{ .tp = 4, .rank = 1, .master = "node0", .master_port = 29600, .mtp_drafts = 2, .mtp_confidence = 0.5, .checkpoint_slots = 3, .policy = "matrix=off" });
+    const gpu = try request(a, "d", "t", .{ .tp = 4, .rank = 1, .master = "node0", .master_port = 29600, .mtp_drafts = 2, .mtp_confidence = 0.5, .checkpoint_slots = 3, .policy = "matrix=off", .manifest = "example262k" });
     try std.testing.expectEqual(@as(u32, 4), gpu.tp);
     try std.testing.expectEqual(@as(u32, 1), gpu.rank);
     try std.testing.expectEqualStrings("node0", gpu.master);
     try std.testing.expectEqual(@as(u16, 29600), gpu.master_port);
     try std.testing.expectEqual(@as(?u32, 2), gpu.mtp_drafts);
     try std.testing.expectEqual(@as(?f64, 0.5), gpu.mtp_confidence);
+    try std.testing.expectEqualStrings("example262k", gpu.manifest.?);
     try std.testing.expectEqual(@as(?i64, 3), gpu.keep);
     try std.testing.expectEqualStrings("matrix=off", gpu.policy);
 }

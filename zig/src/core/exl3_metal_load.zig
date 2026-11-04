@@ -1,4 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! Resident Metal views from the same exl3_load.Parts used by the CUDA uploader.
+const std = @import("std");
 const mtl = @import("metal");
 const projection = @import("exl3_projection.zig");
 const loader = @import("exl3_load.zig");
@@ -26,6 +29,7 @@ pub fn fromParts(device: mtl.Device, parts: loader.Parts, g: loader.Group) !Owne
         .inst3 => .inst3,
         .mcg => .mcg,
         .mul1 => .mul1,
+        .mcg_e4m3 => return error.UnsupportedCodebook,
     }, .suh_format = if (parts.suh_packed) .packed_signs else .f16, .svh_format = if (parts.suh_packed) .packed_signs else .f16 };
     try o.matrix.validate();
     return o;
@@ -35,4 +39,8 @@ fn copy(d: mtl.Device, bytes: []const u8) !mtl.Buffer {
     const b = try d.buffer(bytes.len, mtl.ResourceOptions.shared);
     @memcpy(b.contents()[0..bytes.len], bytes);
     return b;
+}
+
+test {
+    std.testing.refAllDecls(@This());
 }

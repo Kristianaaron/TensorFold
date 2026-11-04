@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
+#include "../tf_vblock.cuh"
 // x3gm.cu's v2 kernel (TF_DSV41_GM_V2): gm2_item, kloop2 and gm2_kernel, inside namespace dsv41_x3gm
 #pragma once
 // x3gm v2 (TF_DSV41_GM_V2): gm_kernel's items, chains and bits with less issue work (member groups, width per item)
@@ -19,7 +22,7 @@ __device__ __forceinline__ void kloop2(float (&acc)[MTL][NG][4], const unsigned 
         cp_commit();
     }
     cp_wait<NSA - 2>();
-    __syncthreads();
+    TF_TASK_SYNC();
     for (int s = 0; s < S; ++s) {
         if (s + NSA - 1 < S) load_stage(s + NSA - 1);
         cp_commit();
@@ -52,7 +55,7 @@ __device__ __forceinline__ void kloop2(float (&acc)[MTL][NG][4], const unsigned 
             }
         }
         cp_wait<NSA - 2>();
-        __syncthreads();
+        TF_TASK_SYNC();
     }
 }
 
@@ -147,7 +150,7 @@ __device__ __forceinline__ void gm2_item(const Args& a, unsigned char* smem, con
     // epilogue: gm_kernel's
 #pragma unroll
     for (int rd = 0; rd < C::ROUNDS; ++rd) {
-        if (rd) __syncthreads();
+        if (rd) TF_TASK_SYNC();
         if (ER * rd < cnt) {
 #pragma unroll
             for (int n = 0; n < NGR; ++n) {
@@ -162,7 +165,7 @@ __device__ __forceinline__ void gm2_item(const Args& a, unsigned char* smem, con
                 }
             }
         }
-        __syncthreads();
+        TF_TASK_SYNC();
         for (int r = warp; r < ER && ER * rd + r < cnt; r += W) {
             const int row = rows_sh[ER * rd + r];
             const int c0 = 4 * lane;
@@ -225,16 +228,17 @@ struct Smem2 {
 template <int MATS, int XM, int MTL, int NG, int KS, int NSA, int NGR>
 __global__ void __launch_bounds__(Smem2<MATS, XM, MTL, NG, KS, NSA, NGR>::THREADS,
                                   Smem2<MATS, XM, MTL, NG, KS, NSA, NGR>::MINB) gm2_kernel(const Args a) {
+    TF_VBLOCK_ENTER();
     constexpr int BM = NG * 8, THREADS = Smem2<MATS, XM, MTL, NG, KS, NSA, NGR>::THREADS;
     extern __shared__ __align__(16) unsigned char smem[];
     __shared__ int rows_sh[BM];
     __shared__ int item_sh;
     const int NBLK = a.N >> 7, total = a.npass[0] * NBLK;
-    int next = blockIdx.x;
+    int next = TF_VBID.x;
     for (;;) {
         __syncthreads();                                      // the last item is done with rows_sh and shared memory
         if (threadIdx.x == 0) item_sh = a.ticket ? atomicAdd(a.ticket, 1) : next;
-        next += gridDim.x;
+        next += TF_VNBLK.x;
         __syncthreads();
         const int item = item_sh;
         if (item >= total) break;

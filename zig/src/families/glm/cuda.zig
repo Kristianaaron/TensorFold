@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! GLM-5.3-Flash on CUDA: the family's parts, ported from the Python family's CUDA path.
 
 pub const experts = @import("cuda_experts.zig");
@@ -69,6 +71,10 @@ test {
 }
 
 pub const dflash = @import("dflash.zig");
+pub const dflash_block = @import("dflash_block.zig");
+pub const dflash_select = @import("dflash_select.zig");
+pub const cuda_taps = @import("cuda_taps.zig");
+pub const dflash_load = @import("dflash_load.zig");
 pub const dflash_candidates = @import("dflash_candidates.zig");
 pub const dflash_load_owner = @import("dflash_load_owner.zig");
 

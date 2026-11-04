@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! A round's windows (Python `_plan_window`, `_copy_proposal`, `_allocate`): forced, copied or drafted rows.
 const std = @import("std");
 const accept = @import("accept.zig");
@@ -11,8 +13,10 @@ const fill = @import("fill.zig");
 const shape = @import("shape.zig");
 const ev = @import("events.zig");
 const trail = @import("trail.zig");
+const arb = @import("copy_arbiter.zig");
 const Engine = @import("engine.zig").Engine;
 const Stream = @import("stream.zig").Stream;
+const Held = @import("stream.zig").Held;
 const Value = ev.Value;
 const f = ev.f;
 
@@ -50,7 +54,30 @@ pub const Plan = struct {
 };
 
 /// A copied continuation and its source: the stream's own context, or Recall's record.
-pub const Copy = struct { tokens: []const u32 = &.{}, recalled: bool = false };
+/// `chance`: the source's landing chance (0: cfg.copy_rate).
+pub const Copy = struct { tokens: []const u32 = &.{}, recalled: bool = false, chance: f64 = 0 };
+
+/// A chain's draft count (held + host drafts) rounded down to a verify width the family runs: only with
+/// cfg.verify_widths (glm_dsa); every other family keeps the count it was granted.
+fn widthCount(e: *const Engine, drafts: usize) usize {
+    return if (e.cfg.verify_widths) roundDraftCount(drafts, @intCast(e.cfg.family_width -| 1)) else drafts;
+}
+
+/// Keep suffix/copy verify widths in the supported graph shapes: 1..8, 12, or 16 total rows.
+pub fn roundDraftCount(drafts: usize, max_drafts: usize) usize {
+    const n = @min(drafts, max_drafts);
+    if (n <= 7) return n;
+    if (n < 11) return 7;
+    return @min(n, if (n < 15) @as(usize, 11) else 15);
+}
+
+test "suffix copy drafts truncate to supported verify widths without padding" {
+    for (9..11) |drafts| try std.testing.expectEqual(@as(usize, 8), roundDraftCount(drafts, 15) + 1);
+    for (11..15) |drafts| try std.testing.expectEqual(@as(usize, 12), roundDraftCount(drafts, 15) + 1);
+    for (15..21) |drafts| try std.testing.expectEqual(@as(usize, 16), roundDraftCount(drafts, 15) + 1);
+    for (0..8) |drafts| try std.testing.expectEqual(drafts, roundDraftCount(drafts, 15));
+    try std.testing.expectEqual(@as(usize, 7), roundDraftCount(20, 7));
+}
 
 /// Forced tokens first, then a copied continuation, then the head's drafts (Python `_plan_window`).
 pub fn plan(e: *Engine, s: *Stream, copied: ?Copy) !Plan {
@@ -64,7 +91,7 @@ pub fn plan(e: *Engine, s: *Stream, copied: ?Copy) !Plan {
     };
     if (s.force.items.len > 0) {
         const width: usize = if (s.drafts) @min(e.cfg.base_width, e.cfg.batch_rows) else 1;
-        const take = @min(width - 1, s.force.items.len);
+        const take = widthCount(e, @min(width - 1, s.force.items.len));
         const forced = try a.dupe(u32, s.force.items[0..take]);
         s.force.replaceRangeAssumeCapacity(0, take, &.{});
         p.kind = .forced;
@@ -74,10 +101,12 @@ pub fn plan(e: *Engine, s: *Stream, copied: ?Copy) !Plan {
         var copy: Copy = .{};
         if (copied) |c| copy = c else if (s.drafts) copy = try copyProposal(e, s);
         const extend = e.alone and e.cfg.context_copies and !copy.recalled and queued != null and queued.?.count > 0;
+        if (e.cfg.copy_arbitrate and copy.tokens.len > 0 and !extend) copy = try arbitrate(e, s, copy, queued);
         if (copy.tokens.len > 0 and !extend) {
             p.kind = .copy;
             p.recalled = copy.recalled;
-            p.tokens = try a.dupe(u32, copy.tokens);
+            const allowed = roundDraftCount(copy.tokens.len, @intCast(e.cfg.max_copy));
+            p.tokens = try a.dupe(u32, copy.tokens[0..allowed]);
         } else if (s.drafts and queued != null) {
             const q = queued.?;
             if (q.tokens) |t| {
@@ -183,12 +212,45 @@ pub fn copyProposal(e: *Engine, s: *Stream) !Copy {
         if (p.vtable.priced) return .{ .tokens = p.propose(s.context.items, @min(@as(i64, e.cfg.max_copy), s.draftRoom() - 1)) catch &.{} };
         const copied = p.proposeAfter(s.context.items, &.{}, most) catch &.{};
         const least: usize = if (e.alone and e.cfg.context_copies) 1 else 2;
-        if (copied.len >= least and p.lastMatch() >= e.cfg.enter_match) return .{ .tokens = copied };
+        if (copied.len >= least and p.lastMatch() >= e.cfg.enter_match) {
+            if (!e.cfg.copy_arbitrate) return .{ .tokens = copied };
+            const own: Copy = .{ .tokens = copied, .chance = p.landing() orelse 0 };
+            const other = recallCopy(e, s, most);
+            if (other.tokens.len == 0) return own;
+            const other_rate = try copyRate(e, other);
+            const own_rate = try copyRate(e, own);
+            return if (other_rate > own_rate) other else own;
+        }
     };
+    return recallCopy(e, s, most);
+}
+
+fn recallCopy(e: *Engine, s: *Stream, most: i64) Copy {
     const r = s.recall orelse return .{};
     if (most < 2) return .{};
     const got = r.propose(s.context.items, @intCast(most), s.rounds);
-    return if (got.len >= 2) .{ .tokens = got, .recalled = true } else .{};
+    return if (got.len >= 2) .{ .tokens = got, .recalled = true, .chance = if (e.cfg.copy_arbitrate) r.landing() else 0 } else .{};
+}
+
+fn copyRate(e: *Engine, c: Copy) !f64 {
+    const q = if (c.chance > 0) c.chance else e.cfg.copy_rate;
+    const chain = try alloc.chainProbabilities(e.arena.allocator(), &.{q}, c.tokens.len);
+    const least: usize = @min(@as(usize, 2), c.tokens.len);
+    return arb.best(chain, &e.cfg.copy_costs, least, e.cfg.verify_widths, @intCast(e.cfg.max_copy)).rate;
+}
+
+/// TF_GLM53_COPYD: the copy's best prefix by expected tokens a ms, or none when the held chain is worth more a ms; verification stays exact.
+fn arbitrate(e: *Engine, s: *Stream, copy: Copy, queued: ?Held) !Copy {
+    const a = e.arena.allocator();
+    const q = if (copy.chance > 0) copy.chance else e.cfg.copy_rate;
+    const copy_chain = try alloc.chainProbabilities(a, &.{q}, copy.tokens.len);
+    const least: usize = @min(@as(usize, 2), copy.tokens.len);
+    const held_n: usize = if (queued) |h| (if (h.tokens == null and h.parents == null) h.count else 0) else 0;
+    const head_chain: []const f64 = if (held_n > 0 and s.drafts) try nodeChances(e, s, held_n) else &.{};
+    const d = arb.decide(copy_chain, least, head_chain, e.cfg.node_probabilities, &e.cfg.copy_costs, e.cfg.verify_widths, @intCast(e.cfg.max_copy));
+    try trail.event(e, &.{ f("ev", trail.str("arbitrate")), f("stream", trail.str(s.id)), f("copy", trail.int(d.copy.drafts)), f("copy_rate", ev.bits(d.copy.rate)), f("head", trail.int(held_n)), f("head_rate", if (d.head_rate) |r| ev.bits(r) else .null), f("pick", trail.str(if (d.copy_wins) "copy" else "head")) });
+    if (!d.copy_wins) return .{};
+    return .{ .tokens = copy.tokens[0..d.copy.drafts], .recalled = copy.recalled, .chance = copy.chance };
 }
 
 pub fn copyAhead(ptr: *anyopaque, w: *const depth.Who) bool {
@@ -203,7 +265,7 @@ pub fn probe(e: *Engine) depth.Probe {
 }
 
 pub fn who(s: *Stream) depth.Who {
-    return .{ .state = &s.depth, .draft_room = s.draftRoom(), .finished = s.finished, .forced = s.force.items.len > 0, .granted = s.granted, .stream = s, .sampled = s.sampling != null };
+    return .{ .state = &s.depth, .draft_room = s.draftRoom(), .finished = s.finished, .forced = s.force.items.len > 0, .granted = s.granted, .grant_short = s.grant_short, .stream = s, .sampled = s.sampling != null };
 }
 
 /// Whether any of a round's streams draws keyed samples (its rows carry their host work).
@@ -253,9 +315,14 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
         try trail.event(e, &.{ f("ev", trail.str("lone-price")), f("stream", trail.str(plans[0].stream.id)), f("rows", trail.int(counts[0] + 1)), f("expected", ev.bits(expected)), f("ms", if (ms) |value| ev.bits(value) else .null), f("probe", .{ .bool = trial != null }) });
     }
     for (plans, counts) |*p, c| {
-        if (p.kind == .head) p.stream.granted = c;
-        if (p.kind == .forced or p.count() == 0 or c == p.count()) continue;
-        try cut.prefix(a, p, c);
+        if (p.kind == .head) {
+            p.stream.grant_short = c < p.count();
+            p.stream.granted = c;
+        }
+        if (p.kind == .forced or p.count() == 0) continue;
+        const want = if (p.parents == null) widthCount(e, c) else c;
+        if (want == p.count()) continue;
+        try cut.prefix(a, p, @intCast(want));
     }
     const rows = try a.alloc(Value, plans.len);
     for (rows, plans) |*r, p| {
@@ -283,7 +350,7 @@ fn trimmed(e: *Engine, plans: []Plan, t: trim.Trim) !void {
             try cut.selected(a, p, nodes);
             p.tokens = sub.tokens;
             p.parents = if (accept.isChain(try accept.rowParents(a, 1 + sub.tokens.len, sub.parents))) null else sub.parents;
-        } else try cut.prefix(a, p, c.count);
+        } else try cut.prefix(a, p, @intCast(widthCount(e, c.count)));
         if (p.count() == 0) p.kind = .none;
     }
 }

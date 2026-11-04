@@ -322,3 +322,32 @@ test "a finished warm pass keeps its states with its request's length: the histo
         try std.testing.expect(got.same);
     }
 }
+
+test "a warm pass steps aside for a request admitted ahead of it whose prompt is still filling, and runs no chunk" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 3 };
+    defer target.deinit();
+    var chunks: WarmChunks = .{};
+    target.prefill_hook = WarmChunks.hook;
+    target.prefill_hook_ctx = &chunks;
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.stepped(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2, .warm_turns = true });
+    host.warm_quiet = 20 * std.time.ns_per_ms;
+    const prompt = [_]u32{ 2, 7, 1, 8 };
+    var warm: Box = .{};
+    var real: Box = .{};
+    const request: Request = .{ .prompt = &prompt, .max_tokens = 48 };
+    const warm_request: Request = .{ .prompt = &prompt, .max_tokens = 0, .background = true };
+    try host.engine().submit(1, &request, .{ .ctx = &real, .event = Box.event });
+    try host.engine().submit(2, &warm_request, .{ .ctx = &warm, .event = Box.event });
+    try host.start();
+    defer host.stop();
+    try std.testing.expectEqual(Reason.cancelled, warm.wait());
+    try std.testing.expectEqual(@as(usize, 0), chunks.n.load(.monotonic));
+    try std.testing.expectEqual(Reason.length, real.wait());
+    try std.testing.expectEqual(@as(usize, 48), real.tokens);
+}

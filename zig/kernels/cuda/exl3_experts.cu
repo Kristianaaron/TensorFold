@@ -1,10 +1,16 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
+#include "tf_vblock.cuh"
 // EXL3 routed experts: grouping, grouped GEMMs, epilogues; port of tensorfold's experts.cu (ExLlamaV3, Turboderp).
+// Adapted from bertholomus/TensorFold@ddfad35:src/tensorfold/cuda/exl3/ (Apache-2.0). Changes: add the CB 3 grouped instantiation.
 
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 #include "exl3_decode.cuh"
+
+__device__ __forceinline__ void prefetch_l2(const void* p) { asm volatile("prefetch.global.L2 [%0];" :: "l"(p)); }
 
 namespace tf_exl3 {
 
@@ -20,17 +26,28 @@ struct GroupedArgs {
     const int* ucount; // int32 [1]
     const int* members; // int32 [nexp_max, maxm], row * 32 + slot, -1 after the last member
     float* z; // fp32 partials, [(mat * sk + split) * P + p] * N + col
-    int k, n, p, sk, maxm, slots, nexp_max, mats, ns, standard, skip;
+    int k, n, p, sk, maxm, slots, nexp_max, mats, ns, standard, skip, l2d;
 };
 
 // One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc: per-lane loads and the shared decode (same bits).
 template <int CB, int K2, int NT>
 __device__ __forceinline__ void warp_tiles(const uint32_t* T, int ntiles, int kt0, int nkt, int nt0, const half* x0,
-                                           const half* x1, bool ok0, bool ok1, int lane, float (&acc)[NT][2][4]) {
+                                           const half* x1, bool ok0, bool ok1, int lane, float (&acc)[NT][2][4], int l2d) {
+    // L2 read-ahead after MiaAI-Lab GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold patch 0128-glm-full-expert-prefetch (Apache-2.0, Copyright 2026 Mia's AI Lab); independent CUDA. Changes: depth argument, GLM-only default.
     constexpr int TW = tile_words<K2>(), LW = lane_words<K2>();
+    constexpr int LINES = (NT * TW + 31) / 32;
+    static_assert(LINES <= 32);
     const size_t kstride = (size_t)ntiles * TW;
+    if (l2d > 0) {
+        const int ahead = l2d < nkt ? l2d : nkt;
+        const int count = ahead * LINES;
+        for (int j = lane; j < count; j += 32)
+            prefetch_l2(T + (size_t)(kt0 + j / LINES) * kstride + (size_t)nt0 * TW + (size_t)(j % LINES) * 32);
+    }
     for (int i = 0; i < nkt; ++i) {
         const uint32_t* t0 = T + (size_t)(kt0 + i) * kstride + (size_t)nt0 * TW;
+        if (l2d > 0 && i + l2d < nkt && lane < LINES)
+            prefetch_l2(T + (size_t)(kt0 + i + l2d) * kstride + (size_t)nt0 * TW + (size_t)lane * 32);
         uint32_t w[NT][LW];
 #pragma unroll
         for (int j = 0; j < NT; ++j) ldg_lane_words<K2>(t0 + j * TW, lane, w[j]);
@@ -74,7 +91,7 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
         const int code = m < count ? a.members[first + m] : -1;
         rows_sh[threadIdx.x] = a.standard ? code : (code >= 0 ? (code >> 5) * a.slots + (code & 31) : -1);
     }
-    __syncthreads();
+    TF_TASK_SYNC();
     if (rows_sh[0] < 0) return; // members come first, so this tile is empty
     const int r0 = rows_sh[g], r1 = rows_sh[g + 8];
     const half* x0 = X + (size_t)(r0 < 0 ? 0 : r0) * a.k + 2 * t;
@@ -95,7 +112,7 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
     switch (k2) {
 #define TF_EXL3X_CASE(K2_)                                                                                   \
     case K2_:                                                                                                \
-        warp_tiles<CB, K2_, NT>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);          \
+        warp_tiles<CB, K2_, NT>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc, a.l2d);  \
         break;
         TF_EXL3X_CASE(2)
         TF_EXL3X_CASE(3)
@@ -127,7 +144,7 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
             red[warp][g + 8][col] = acc[i][h][2];
             red[warp][g + 8][col + 1] = acc[i][h][3];
         }
-    __syncthreads();
+    TF_TASK_SYNC();
     for (int idx = threadIdx.x; idx < 16 * NT * 16; idx += W * 32) {
         const int row = idx / (NT * 16), col = idx % (NT * 16);
         const int r = rows_sh[row];
@@ -143,17 +160,59 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
 
 // ---------------------------------------------------------------------------------------------------------------
 
-extern "C" __global__ void tf_exl3_grouped_0(tf_exl3::GroupedArgs a) {  // 3inst, any width
-    tf_exl3::grouped_body<0, 8, 4>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+__device__ __forceinline__ void tf_exl3_grouped_0_task(tf_exl3::GroupedArgs a) {  // 3inst, any width
+    tf_exl3::grouped_body<0, 8, 4>(a, TF_VBID.x, TF_VBID.y, TF_VBID.z);
+}
+extern "C" __global__ void __launch_bounds__(128) tf_exl3_grouped_0(tf_exl3::GroupedArgs a) {
+    TF_VBLOCK_ENTER(); tf_exl3_grouped_0_task(a); }
+
+__device__ __forceinline__ void tf_exl3_grouped_1_task(tf_exl3::GroupedArgs a) {  // mcg, any width
+    tf_exl3::grouped_body<1, 8, 4>(a, TF_VBID.x, TF_VBID.y, TF_VBID.z);
+}
+extern "C" __global__ void __launch_bounds__(128) tf_exl3_grouped_1(tf_exl3::GroupedArgs a) {
+    TF_VBLOCK_ENTER(); tf_exl3_grouped_1_task(a); }
+
+__device__ __forceinline__ void tf_exl3_grouped_2_task(tf_exl3::GroupedArgs a) {  // mul1, any width (RED-SNOW's experts)
+    tf_exl3::grouped_body<2, 8, 4>(a, TF_VBID.x, TF_VBID.y, TF_VBID.z);
+}
+extern "C" __global__ void __launch_bounds__(128) tf_exl3_grouped_2(tf_exl3::GroupedArgs a) {
+    TF_VBLOCK_ENTER(); tf_exl3_grouped_2_task(a); }
+
+__device__ __forceinline__ void tf_exl3_grouped_3_task(tf_exl3::GroupedArgs a) {  // mcg rounded through E4M3
+    tf_exl3::grouped_body<3, 8, 4>(a, TF_VBID.x, TF_VBID.y, TF_VBID.z);
+}
+extern "C" __global__ void __launch_bounds__(128) tf_exl3_grouped_3(tf_exl3::GroupedArgs a) {
+    TF_VBLOCK_ENTER(); tf_exl3_grouped_3_task(a); }
+
+// Small parity entry points use the exact decoder template that grouped_3 calls.
+template <int K2>
+__device__ __forceinline__ void mcg_e4m3_tile(const uint32_t* tile, half* out) {
+    const int lane = threadIdx.x;
+    uint32_t w[tf_exl3::lane_words<K2>()];
+    tf_exl3::load_lane_words<K2>(tile, lane, w);
+    uint32_t b0[2], b1[2];
+    tf_exl3::decode_lane<K2, tf_exl3::CB_MCG_E4M3>(w, lane, b0, b1);
+    const int g = lane >> 2, t = lane & 3;
+    const uint32_t v[4] = { b0[0], b0[1], b1[0], b1[1] };
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        const half2 h = *reinterpret_cast<const half2*>(&v[q]);
+        const int col = g + 8 * (q >> 1), row = 2 * t + 8 * (q & 1);
+        out[(size_t)row * 16 + col] = __low2half(h);
+        out[(size_t)(row + 1) * 16 + col] = __high2half(h);
+    }
 }
 
-extern "C" __global__ void tf_exl3_grouped_1(tf_exl3::GroupedArgs a) {  // mcg, any width
-    tf_exl3::grouped_body<1, 8, 4>(a, blockIdx.x, blockIdx.y, blockIdx.z);
-}
-
-extern "C" __global__ void tf_exl3_grouped_2(tf_exl3::GroupedArgs a) {  // mul1, any width (RED-SNOW's experts)
-    tf_exl3::grouped_body<2, 8, 4>(a, blockIdx.x, blockIdx.y, blockIdx.z);
-}
+extern "C" __global__ void tf_exl3_mcg_e4m3_tile_2(const uint32_t* tile, half* out) {
+    TF_VBLOCK_ENTER(); mcg_e4m3_tile<2>(tile, out); }
+extern "C" __global__ void tf_exl3_mcg_e4m3_tile_3(const uint32_t* tile, half* out) {
+    TF_VBLOCK_ENTER(); mcg_e4m3_tile<3>(tile, out); }
+extern "C" __global__ void tf_exl3_mcg_e4m3_tile_4(const uint32_t* tile, half* out) {
+    TF_VBLOCK_ENTER(); mcg_e4m3_tile<4>(tile, out); }
+extern "C" __global__ void tf_exl3_mcg_e4m3_tile_6(const uint32_t* tile, half* out) {
+    TF_VBLOCK_ENTER(); mcg_e4m3_tile<6>(tile, out); }
+extern "C" __global__ void tf_exl3_mcg_e4m3_tile_8(const uint32_t* tile, half* out) {
+    TF_VBLOCK_ENTER(); mcg_e4m3_tile<8>(tile, out); }
 
 namespace tf_exl3 {
 
@@ -169,12 +228,11 @@ struct GroupArgs {
     int rows, slots, experts, maxm;
 };
 
-extern "C" __global__ void __launch_bounds__(GROUP_THREADS) tf_exl3_group(const GroupArgs a) {
-    extern __shared__ int sh_pick[];
+__device__ __forceinline__ void tf_exl3_group_task(const GroupArgs a, int* sh_pick) {
     __shared__ int warp_tot[GROUP_THREADS / 32];
     const int n = a.rows * a.slots;
     for (int i = threadIdx.x; i < n; i += GROUP_THREADS) sh_pick[i] = a.pick[i];
-    __syncthreads();
+    TF_TASK_SYNC();
     int cnt[GROUP_PER_THREAD];
     int used = 0;
 #pragma unroll
@@ -195,7 +253,7 @@ extern "C" __global__ void __launch_bounds__(GROUP_THREADS) tf_exl3_group(const 
         if (lane >= o) inc += v;
     }
     if (lane == 31) warp_tot[warp] = inc;
-    __syncthreads();
+    TF_TASK_SYNC();
     if (warp == 0) {
         int v = warp_tot[lane];
         int s = v;
@@ -206,7 +264,7 @@ extern "C" __global__ void __launch_bounds__(GROUP_THREADS) tf_exl3_group(const 
         warp_tot[lane] = s - v; // exclusive per warp
         if (lane == 31) a.ucount[0] = s;
     }
-    __syncthreads();
+    TF_TASK_SYNC();
     int place = warp_tot[warp] + inc - used;
 #pragma unroll
     for (int q = 0; q < GROUP_PER_THREAD; ++q) {
@@ -219,6 +277,12 @@ extern "C" __global__ void __launch_bounds__(GROUP_THREADS) tf_exl3_group(const 
         for (; j < a.maxm; ++j) a.members[place * a.maxm + j] = -1;
         ++place;
     }
+}
+
+extern "C" __global__ void __launch_bounds__(GROUP_THREADS) tf_exl3_group(const GroupArgs a) {
+    TF_VBLOCK_ENTER();
+    extern __shared__ int sh_pick[];
+    tf_exl3_group_task(a, sh_pick);
 }
 
 // Program (slot, 128-block of K, matrix): Xh = fp16((x * suh) @ H) for gate and up of every routed slot (pick < E).
@@ -234,8 +298,8 @@ struct RotInArgs {
     int k, slots, experts;
 };
 
-extern "C" __global__ void tf_exl3_experts_rot_in(const RotInArgs a) {
-    const int p = blockIdx.x, blk = blockIdx.y, mat = blockIdx.z;
+__device__ __forceinline__ void tf_exl3_experts_rot_in_task(const RotInArgs a) {
+    const int p = TF_VBID.x, blk = TF_VBID.y, mat = TF_VBID.z;
     const int e = a.pick[p];
     if (e < 0 || e >= a.experts) return;
     const int lane = threadIdx.x;
@@ -258,6 +322,11 @@ extern "C" __global__ void tf_exl3_experts_rot_in(const RotInArgs a) {
     for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
 }
 
+extern "C" __global__ void tf_exl3_experts_rot_in(const RotInArgs a) {
+    TF_VBLOCK_ENTER();
+    tf_exl3_experts_rot_in_task(a);
+}
+
 __device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
 // The SwiGLU clamps as torch.clamp has them: a NaN stays a NaN, where fminf and fmaxf hand back the limit.
 __device__ __forceinline__ float upTo(float x, float l) { return x > l ? l : x; }
@@ -276,8 +345,8 @@ struct GateUpArgs {
     int act_mode;
 };
 
-extern "C" __global__ void tf_exl3_gateup_epilogue(const GateUpArgs a) {
-    const int p = blockIdx.x, blk = blockIdx.y;
+__device__ __forceinline__ void tf_exl3_gateup_epilogue_task(const GateUpArgs a) {
+    const int p = TF_VBID.x, blk = TF_VBID.y;
     const int e = a.pick[p];
     if (e < 0 || e >= a.experts) return;
     const int lane = threadIdx.x;
@@ -318,6 +387,11 @@ extern "C" __global__ void tf_exl3_gateup_epilogue(const GateUpArgs a) {
     for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
 }
 
+extern "C" __global__ void tf_exl3_gateup_epilogue(const GateUpArgs a) {
+    TF_VBLOCK_ENTER();
+    tf_exl3_gateup_epilogue_task(a);
+}
+
 // Program (member row, 128-block of the width): down epilogue and combine in one launch, the same bits as the two.
 struct DownArgs {
     const float* z; // [split * P + p] * D + col
@@ -329,9 +403,9 @@ struct DownArgs {
     int p, d, sk, experts, slots;
 };
 
-extern "C" __global__ void tf_exl3_down_combine(const DownArgs a) {
-    __shared__ float4 part[32][32]; // [slot][lane]: the slot's 4 outputs of the lane
-    const int r = blockIdx.x, blk = blockIdx.y;
+__device__ __forceinline__ void tf_exl3_down_combine_task(const DownArgs a, char* smem) {
+    float4 (*part)[32] = reinterpret_cast<float4 (*)[32]>(smem); // [slot][lane]: the slot's 4 outputs of the lane
+    const int r = TF_VBID.x, blk = TF_VBID.y;
     const int k = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int n = blk * 128 + 4 * lane;
     const int p = r * a.slots + k;
@@ -357,7 +431,7 @@ extern "C" __global__ void tf_exl3_down_combine(const DownArgs a) {
     }
     if (!a.wts) return; // runSlots reads the same post-rotation per-slot FP32 outputs without reducing them.
     part[k][lane] = make_float4(o[0], o[1], o[2], o[3]);
-    __syncthreads();
+    TF_TASK_SYNC();
     if (k != 0) return;
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
     for (int q = 0; q < a.slots; ++q) {
@@ -370,6 +444,12 @@ extern "C" __global__ void tf_exl3_down_combine(const DownArgs a) {
     }
 #pragma unroll
     for (int j = 0; j < 4; ++j) a.out[(size_t)r * a.d + n + j] = acc[j];
+}
+
+extern "C" __global__ void tf_exl3_down_combine(const DownArgs a) {
+    TF_VBLOCK_ENTER();
+    extern __shared__ __align__(16) char smem[];
+    tf_exl3_down_combine_task(a, smem);
 }
 
 }  // namespace tf_exl3
@@ -387,7 +467,8 @@ struct PlanStage {
 };
 
 extern "C" __global__ void tf_exl3_plan_rotate(const PlanStage a) {
-    const int it = blockIdx.x, blk = blockIdx.y, mat = blockIdx.z;
+    TF_VBLOCK_ENTER();
+    const int it = TF_VBID.x, blk = TF_VBID.y, mat = TF_VBID.z;
     if (it >= a.counts[0]) return;
     const int e = a.items[3 * it], first = a.items[3 * it + 1], count = a.items[3 * it + 2];
     if (e == a.skip) return;
@@ -405,7 +486,8 @@ extern "C" __global__ void tf_exl3_plan_rotate(const PlanStage a) {
 }
 
 extern "C" __global__ void tf_exl3_plan_finish(const PlanStage a) {
-    const int it = blockIdx.x, blk = blockIdx.y, lane = threadIdx.x;
+    TF_VBLOCK_ENTER();
+    const int it = TF_VBID.x, blk = TF_VBID.y, lane = threadIdx.x;
     if (it >= a.counts[0]) return;
     const int e = a.items[3 * it], first = a.items[3 * it + 1], count = a.items[3 * it + 2];
     if (e == a.skip) return;
@@ -442,7 +524,8 @@ extern "C" __global__ void tf_exl3_plan_finish(const PlanStage a) {
 using namespace tf_exl3_prompt;
 extern "C" __global__ void tf_exl3_prompt_rotate(const __nv_bfloat16* __restrict__ x, int x_stride, const half* __restrict__ suh,
         half* __restrict__ out, int K) {
-    const int row = blockIdx.x, blk = blockIdx.y;
+    TF_VBLOCK_ENTER();
+    const int row = TF_VBID.x, blk = TF_VBID.y;
     const int lane = threadIdx.x;
     const half* sh = suh + blk * 128 + 4 * lane;
     const __nv_bfloat16* xr = x + (size_t)row * x_stride + blk * 128 + 4 * lane;
@@ -455,37 +538,51 @@ extern "C" __global__ void tf_exl3_prompt_rotate(const __nv_bfloat16* __restrict
     for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
 }
 
+template <int CB>
+__device__ __forceinline__ void tf_exl3_prompt_gu_body(const half* Xg, const half* Xu, const uint64_t* Tg, const uint64_t* Tu,
+        const int* items, const int* counts, const int* members, const half* svh_g, const half* svh_u, const half* suh_d,
+        half* xd, int K, int N, int xdiv, float limit, int act_mode, const int* k2g, const int* k2u) {
+    __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes()];
+    __shared__ int rows_sh[TPM];
+    if (xdiv > 1) tgateup<TPM, CB>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, xdiv, limit, act_mode, k2g, k2u, smem_raw, rows_sh);
+    else tgateup<2 * TPM, CB>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, 1, limit, act_mode, k2g, k2u, smem_raw, rows_sh);
+}
 extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu(const half* __restrict__ Xg, const half* __restrict__ Xu,
         const uint64_t* __restrict__ Tg, const uint64_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts,
         const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d,
-        half* __restrict__ xd, int K, int N, int xdiv, float limit, int act_mode) {
-
-    __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes()];   // one buffer for either instantiation
-    __shared__ int rows_sh[TPM];
-    if (xdiv > 1) tgateup<TPM>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, xdiv, limit, act_mode, smem_raw, rows_sh);
-    else tgateup<2 * TPM>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, 1, limit, act_mode, smem_raw, rows_sh);
+        half* __restrict__ xd, int K, int N, int xdiv, float limit, int act_mode, const int* __restrict__ k2g, const int* __restrict__ k2u) {
+    TF_VBLOCK_ENTER();
+    tf_exl3_prompt_gu_body<CB_MCG>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, xdiv, limit, act_mode, k2g, k2u);
+}
+// The same with GLM-5.3's mcg codebook rounded through E4M3 (decode_lane<K2, CB_MCG_E4M3>).
+extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu_e4m3(const half* __restrict__ Xg, const half* __restrict__ Xu,
+        const uint64_t* __restrict__ Tg, const uint64_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts,
+        const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d,
+        half* __restrict__ xd, int K, int N, int xdiv, float limit, int act_mode, const int* __restrict__ k2g, const int* __restrict__ k2u) {
+    TF_VBLOCK_ENTER();
+    tf_exl3_prompt_gu_body<CB_MCG_E4M3>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, xdiv, limit, act_mode, k2g, k2u);
 }
 
 // Block (256 model-width columns, item): y[row][slot][:] = the down epilogue of the item's pairs (this rank's share).
-extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
-        const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
-        float* __restrict__ y, int K, int D, int ys) {
-
+template <int CB>
+__device__ __forceinline__ void tf_exl3_prompt_down_body(const half* Xd, const uint64_t* Td, const int* items, const int* counts,
+        const int* members, const half* svh_d, float* y, int K, int D, int ys, const int* k2d) {
     __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes()];
     __shared__ int rows_sh[TPM];
-    const int cb = blockIdx.x, item = blockIdx.y;
+    const int cb = TF_VBID.x, item = TF_VBID.y;
     if (item >= counts[0]) return;
     const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
     if (threadIdx.x < TPM) rows_sh[threadIdx.x] = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
-    __syncthreads();
+    TF_TASK_SYNC();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     float acc[TMT][TNB][4];
-    tmain<1, TPM>(Xd, Xd, Td, Td, rows_sh, cnt, e, K, D >> 4, cb, 1, reinterpret_cast<half*>(smem_raw), acc);
+    const int k2 = k2d[e];
+    tmain<1, TPM, CB>(Xd, Xd, Td, Td, rows_sh, cnt, e, K, D >> 4, cb, 1, k2, k2, reinterpret_cast<half*>(smem_raw), acc);
     float* Ed = reinterpret_cast<float*>(smem_raw);
     for (int hf = 0; hf < 2 && hf * TPH < cnt; ++hf) {
-        if (hf) __syncthreads();
+        if (hf) TF_TASK_SYNC();
         tspill(Ed, DN_ES, warp * TMT * 16, acc, hf);
-        __syncthreads();
+        TF_TASK_SYNC();
         for (int i = warp; i < TPH && hf * TPH + i < cnt; i += TNW) {
             const int p = rows_sh[hf * TPH + i];
 #pragma unroll
@@ -502,3 +599,86 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down(const h
         }
     }
 }
+extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
+        const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
+        float* __restrict__ y, int K, int D, int ys, const int* __restrict__ k2d) {
+    TF_VBLOCK_ENTER();
+    tf_exl3_prompt_down_body<CB_MCG>(Xd, Td, items, counts, members, svh_d, y, K, D, ys, k2d);
+}
+extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down_e4m3(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
+        const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
+        float* __restrict__ y, int K, int D, int ys, const int* __restrict__ k2d) {
+    TF_VBLOCK_ENTER();
+    tf_exl3_prompt_down_body<CB_MCG_E4M3>(Xd, Td, items, counts, members, svh_d, y, K, D, ys, k2d);
+}
+
+// TF_GLM53_PROMPT_EXPERTS=2 over a 128-member plan (exl3_prompt.cuh's wide path); every output has the bits of
+// tf_exl3_prompt_gu/down. The _s entries are those kernels unchanged for items of 64 members or fewer (larger items
+// return at once); wup, wgate and wdown take the larger items (dynamic shared memory: wsmem_bytes(), exl3_prompt.zig).
+__device__ __forceinline__ bool tf_exl3_prompt_small(const int* items, const int* counts) {
+    const int item = TF_VBID.y;
+    return item < counts[0] && items[3 * item + 2] <= TPM;
+}
+extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu_s(const half* __restrict__ Xg, const half* __restrict__ Xu,
+        const uint64_t* __restrict__ Tg, const uint64_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts,
+        const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d,
+        half* __restrict__ xd, int K, int N, int xdiv, float limit, int act_mode, const int* __restrict__ k2g, const int* __restrict__ k2u) {
+    TF_VBLOCK_ENTER();
+    if (!tf_exl3_prompt_small(items, counts)) return;
+    tf_exl3_prompt_gu_body<CB_MCG>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, xdiv, limit, act_mode, k2g, k2u);
+}
+extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu_s_e4m3(const half* __restrict__ Xg, const half* __restrict__ Xu,
+        const uint64_t* __restrict__ Tg, const uint64_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts,
+        const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d,
+        half* __restrict__ xd, int K, int N, int xdiv, float limit, int act_mode, const int* __restrict__ k2g, const int* __restrict__ k2u) {
+    TF_VBLOCK_ENTER();
+    if (!tf_exl3_prompt_small(items, counts)) return;
+    tf_exl3_prompt_gu_body<CB_MCG_E4M3>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, xdiv, limit, act_mode, k2g, k2u);
+}
+extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down_s(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
+        const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
+        float* __restrict__ y, int K, int D, int ys, const int* __restrict__ k2d) {
+    TF_VBLOCK_ENTER();
+    if (!tf_exl3_prompt_small(items, counts)) return;
+    tf_exl3_prompt_down_body<CB_MCG>(Xd, Td, items, counts, members, svh_d, y, K, D, ys, k2d);
+}
+extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down_s_e4m3(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
+        const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
+        float* __restrict__ y, int K, int D, int ys, const int* __restrict__ k2d) {
+    TF_VBLOCK_ENTER();
+    if (!tf_exl3_prompt_small(items, counts)) return;
+    tf_exl3_prompt_down_body<CB_MCG_E4M3>(Xd, Td, items, counts, members, svh_d, y, K, D, ys, k2d);
+}
+
+#define TF_EXL3_PROMPT_WIDE(SUFFIX, CBV)                                                                                   \
+    extern "C" __global__ void __launch_bounds__(WTHREADS, 2) tf_exl3_prompt_wup##SUFFIX(const half* __restrict__ Xu,       \
+            const uint64_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts,                   \
+            const int* __restrict__ members, const half* __restrict__ svh_u, float* __restrict__ uu, int K, int N, int xdiv,  \
+            int act_mode, const int* __restrict__ k2u) {                                                                     \
+        TF_VBLOCK_ENTER();                                                                                                 \
+        extern __shared__ __align__(16) unsigned char tf_exl3_wide_smem[];                                                 \
+        __shared__ int rows_sh[WPM];                                                                                       \
+        wup<CBV>(Xu, Tu, items, counts, members, svh_u, uu, K, N, xdiv, act_mode, k2u, tf_exl3_wide_smem, rows_sh);       \
+    }                                                                                                                      \
+    extern "C" __global__ void __launch_bounds__(WTHREADS, 2) tf_exl3_prompt_wgate##SUFFIX(const half* __restrict__ Xg,     \
+            const uint64_t* __restrict__ Tg, const int* __restrict__ items, const int* __restrict__ counts,                   \
+            const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ suh_d,                  \
+            const float* __restrict__ uu, half* __restrict__ xd, int K, int N, int xdiv, float limit, int act_mode,           \
+            const int* __restrict__ k2g) {                                                                                   \
+        TF_VBLOCK_ENTER();                                                                                                 \
+        extern __shared__ __align__(16) unsigned char tf_exl3_wide_smem[];                                                 \
+        __shared__ int rows_sh[WPM];                                                                                       \
+        wgate<CBV>(Xg, Tg, items, counts, members, svh_g, suh_d, uu, xd, K, N, xdiv, limit, act_mode, k2g, tf_exl3_wide_smem, rows_sh); \
+    }                                                                                                                      \
+    extern "C" __global__ void __launch_bounds__(WTHREADS, 2) tf_exl3_prompt_wdown##SUFFIX(const half* __restrict__ Xd,     \
+            const uint64_t* __restrict__ Td, const int* __restrict__ items, const int* __restrict__ counts,                   \
+            const int* __restrict__ members, const half* __restrict__ svh_d, float* __restrict__ y, int K, int D,             \
+            const int* __restrict__ k2d) {                                                                                   \
+        TF_VBLOCK_ENTER();                                                                                                 \
+        extern __shared__ __align__(16) unsigned char tf_exl3_wide_smem[];                                                 \
+        __shared__ int rows_sh[WPM];                                                                                       \
+        wdown<CBV>(Xd, Td, items, counts, members, svh_d, y, K, D, k2d, tf_exl3_wide_smem, rows_sh);                       \
+    }
+TF_EXL3_PROMPT_WIDE(, CB_MCG)
+TF_EXL3_PROMPT_WIDE(_e4m3, CB_MCG_E4M3)
+#undef TF_EXL3_PROMPT_WIDE

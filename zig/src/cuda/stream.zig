@@ -1,5 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! Streams and events: ordering, waits and GPU-side timing.
 
+const std = @import("std");
 const abi = @import("abi.zig");
 const Driver = @import("driver.zig").Driver;
 const Error = @import("driver.zig").Error;
@@ -7,6 +10,39 @@ const Error = @import("driver.zig").Error;
 pub const Stream = struct {
     d: *const Driver,
     handle: abi.Stream,
+    deferred: ?*const Deferred = null,
+
+    /// Optional CUDA-launch recorder. The callback returns true when it recorded a dispatchable
+    /// launch; false asks the launch helper to flush this stream before issuing the ordinary call.
+    pub const Deferred = struct {
+        ctx: *anyopaque,
+        record_fn: *const fn (*anyopaque, *const DeferredLaunch) Error!bool,
+        flush_fn: *const fn (*anyopaque, Stream) Error!void,
+    };
+
+    /// One ordinary launch as submitted to the CUDA driver. `params` uses CUDA's packed
+    /// parameter ABI and is borrowed only for the duration of `record_fn`.
+    pub const DeferredLaunch = struct {
+        name: []const u8,
+        grid: abi.Dim3,
+        block: abi.Dim3,
+        shared: u32,
+        params: []const u8,
+        param_count: usize,
+        /// The kernel and each parameter's byte offset in `params`, so a recorder can still issue the launch itself.
+        function: abi.Function = null,
+        offsets: []const u16 = &.{},
+    };
+
+    pub fn withDeferred(self: Stream, sink: *const Deferred) Stream {
+        var copy = self;
+        copy.deferred = sink;
+        return copy;
+    }
+
+    pub fn flushDeferred(self: Stream) Error!void {
+        if (self.deferred) |sink| try sink.flush_fn(sink.ctx, self);
+    }
 
     /// A non-blocking stream never waits on the legacy default stream (what every engine stream should be).
     pub fn init(d: *const Driver, non_blocking: bool) Error!Stream {
@@ -19,6 +55,11 @@ pub const Stream = struct {
     pub const Priority = enum { default, highest };
 
     pub fn initPriority(d: *const Driver, priority: Priority) Error!Stream {
+        return initPriorityBlocking(d, priority, true);
+    }
+
+    /// A priority stream whose legacy-default-stream blocking behavior matches `init`.
+    pub fn initPriorityBlocking(d: *const Driver, priority: Priority, non_blocking: bool) Error!Stream {
         var least: c_int = 0;
         var greatest: c_int = 0;
         try d.check(d.api.cuCtxGetStreamPriorityRange(&least, &greatest), "cuCtxGetStreamPriorityRange");
@@ -27,7 +68,7 @@ pub const Stream = struct {
             .default => 0,
             .highest => greatest,
         };
-        try d.check(d.api.cuStreamCreateWithPriority(&s, abi.stream_non_blocking, p), "cuStreamCreateWithPriority");
+        try d.check(d.api.cuStreamCreateWithPriority(&s, if (non_blocking) abi.stream_non_blocking else 0, p), "cuStreamCreateWithPriority");
         return .{ .d = d, .handle = s };
     }
 
@@ -37,12 +78,14 @@ pub const Stream = struct {
     }
 
     pub fn deinit(self: *Stream) void {
+        self.flushDeferred() catch {};
         @import("copy_source.zig").synchronizeStream(self.d, self.handle) catch {};
         _ = self.d.api.cuStreamDestroy_v2(self.handle);
         self.* = undefined;
     }
 
     pub fn synchronize(self: Stream) Error!void {
+        try self.flushDeferred();
         try @import("copy_source.zig").synchronizeStream(self.d, self.handle);
     }
 
@@ -52,6 +95,7 @@ pub const Stream = struct {
     }
 
     pub fn wait(self: Stream, event: Event) Error!void {
+        try self.flushDeferred();
         try self.d.check(self.d.api.cuStreamWaitEvent(self.handle, event.handle, 0), "cuStreamWaitEvent");
     }
 };
@@ -73,11 +117,13 @@ pub const Event = struct {
     }
 
     pub fn record(self: Event, stream: Stream) Error!void {
+        try stream.flushDeferred();
         try self.d.check(self.d.api.cuEventRecord(self.handle, stream.handle), "cuEventRecord");
     }
 
     /// A record a capture keeps as an event record node: outside waits after a launch wait for that point of it.
     pub fn recordExternal(self: Event, stream: Stream) Error!void {
+        try stream.flushDeferred();
         try self.d.check(self.d.api.cuEventRecordWithFlags(self.handle, stream.handle, abi.event_record_external), "cuEventRecordWithFlags");
     }
 
@@ -100,3 +146,11 @@ pub const Event = struct {
         return ms;
     }
 };
+
+test "stream and event declarations are fully analyzed" {
+    std.testing.refAllDecls(@This());
+    std.testing.refAllDecls(Stream);
+    std.testing.refAllDecls(Stream.Deferred);
+    std.testing.refAllDecls(Stream.DeferredLaunch);
+    std.testing.refAllDecls(Event);
+}

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! A device sub-allocator under DeviceBuffer.alloc: buffers carved from a few large chunks, not one cuMemAlloc each.
 
 const std = @import("std");
@@ -203,6 +205,10 @@ pub const Vmm = struct {
     va_len: usize = 0,
     next: u64 = 0,
     api: Api,
+    retain_handles: bool = false,
+    close_unmap_all: bool = false,
+    handles: [256]u64 = @splat(0),
+    handle_count: usize = 0,
     /// the first chunk that failed: the driver call and its CUresult (null: none failed)
     failed: ?struct { call: []const u8, code: c_int } = null,
 
@@ -236,8 +242,27 @@ pub const Vmm = struct {
 
     /// `va_bytes` of virtual addresses reserved (cheap: no memory behind them until a chunk maps).
     pub fn open(d: *const Driver, device: abi.Device, va_bytes: usize) Error!Vmm {
+        return openWithGranularity(d, device, va_bytes, 1, true, true);
+    }
+
+    /// Weight arenas use the requested minimum allocation granularity without a recommended-size floor.
+    pub fn openMinimum(d: *const Driver, device: abi.Device, va_bytes: usize) Error!Vmm {
+        return openWithGranularity(d, device, va_bytes, 0, false, true);
+    }
+
+    /// openMinimum with CUmemAllocationProp.gpuDirectRDMACapable left 0 (the TF_GLM53_WEIGHT_VMM_RDMA=0 A/B for the weights).
+    pub fn openMinimumNoRdma(d: *const Driver, device: abi.Device, va_bytes: usize) Error!Vmm {
+        return openWithGranularity(d, device, va_bytes, 0, false, false);
+    }
+
+    fn openWithGranularity(d: *const Driver, device: abi.Device, va_bytes: usize, query: c_int, apply_floor: bool, allow_rdma: bool) Error!Vmm {
         var vmm_ok: c_int = 0;
-        if (d.api.cuDeviceGetAttribute(&vmm_ok, .virtual_memory_management_supported, device) != abi.success or vmm_ok == 0) return error.Unsupported; // VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED
+        const support_rc = d.api.cuDeviceGetAttribute(&vmm_ok, .virtual_memory_management_supported, device);
+        if (support_rc != abi.success) {
+            std.log.err("CUDA VMM step cuDeviceGetAttribute failed with CUresult {d}", .{support_rc});
+            return error.Unsupported;
+        }
+        if (vmm_ok == 0) return error.Unsupported; // VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED
         var lib = std.DynLib.open("libcuda.so.1") catch return error.DriverUnavailable;
         errdefer lib.close();
         var api: Api = undefined;
@@ -245,18 +270,36 @@ pub const Vmm = struct {
         inline for (names) |n| @field(api, n[0]) = lib.lookup(@FieldType(Api, n[0]), n[1]) orelse return error.MissingSymbol;
         var prop: Prop = .{ .loc_id = device };
         var rdma: c_int = 0; // GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED: keep the memory registrable as cuMemAlloc's is
-        if (d.api.cuDeviceGetAttribute(&rdma, .gpu_direct_rdma_with_cuda_vmm_supported, device) == abi.success and rdma != 0) prop.rdma = 1;
+        if (d.api.cuDeviceGetAttribute(&rdma, .gpu_direct_rdma_with_cuda_vmm_supported, device) == abi.success and rdma != 0 and allow_rdma) prop.rdma = 1;
         var g: usize = 0;
-        if (api.granularity(&g, &prop, 1) != abi.success or g == 0) return error.Unsupported; // RECOMMENDED
-        g = @max(g, 2 << 20);
+        const granularity_rc = api.granularity(&g, &prop, query);
+        if (granularity_rc != abi.success) {
+            std.log.err("CUDA VMM step cuMemGetAllocationGranularity failed with CUresult {d}", .{granularity_rc});
+            return error.Unsupported;
+        }
+        if (g == 0) return error.Unsupported;
+        if (apply_floor) g = @max(g, 2 << 20);
         const len = std.mem.alignForward(usize, va_bytes, g);
         var va: u64 = 0;
-        if (api.reserve(&va, len, g, 0, 0) != abi.success) return error.CudaFailed;
+        const reserve_rc = api.reserve(&va, len, g, 0, 0);
+        if (reserve_rc != abi.success) {
+            std.log.err("CUDA VMM step cuMemAddressReserve failed with CUresult {d}", .{reserve_rc});
+            return error.CudaFailed;
+        }
         return .{ .lib = lib, .device = device, .prop = prop, .granularity = g, .va = va, .va_len = len, .next = va, .api = api };
     }
 
     pub fn close(v: *Vmm) void {
-        _ = v.api.addressFree(v.va, v.va_len);
+        if (v.close_unmap_all and v.next > v.va) {
+            const rc = v.api.unmap(v.va, @intCast(v.next - v.va));
+            if (rc != abi.success) std.log.err("CUDA VMM step cuMemUnmap failed with CUresult {d}", .{rc});
+        }
+        for (v.handles[0..v.handle_count]) |handle| {
+            const rc = v.api.release(handle);
+            if (rc != abi.success) std.log.err("CUDA VMM step cuMemRelease failed with CUresult {d}", .{rc});
+        }
+        const free_rc = v.api.addressFree(v.va, v.va_len);
+        if (free_rc != abi.success) std.log.err("CUDA VMM step cuMemAddressFree failed with CUresult {d}", .{free_rc});
         v.lib.close();
     }
 
@@ -264,16 +307,68 @@ pub const Vmm = struct {
         return .{ .ctx = v, .granularity = v.granularity, .chunk = chunk, .release = release, .name = "vmm" };
     }
 
+    /// Create one physical allocation handle. The caller owns the handle until it is mapped and released.
+    pub fn createHandle(v: *Vmm, len: usize) Error!u64 {
+        if (len == 0 or len % v.granularity != 0) return error.CudaFailed;
+        var h: u64 = 0;
+        const rc = v.api.create(&h, len, &v.prop, 0);
+        if (rc != abi.success) return error.CudaFailed;
+        return h;
+    }
+
+    /// Map offset zero of `handle` at an already-reserved virtual address.
+    pub fn mapHandle(v: *Vmm, at: u64, len: usize, handle: u64) Error!void {
+        if (len == 0 or len % v.granularity != 0) return error.CudaFailed;
+        if (v.api.map(at, len, 0, handle, 0) != abi.success) return error.CudaFailed;
+    }
+
+    pub fn grantAccess(v: *Vmm, at: u64, len: usize) Error!void {
+        if (len == 0 or len % v.granularity != 0) return error.CudaFailed;
+        const desc: AccessDesc = .{ .loc_id = v.device };
+        if (v.api.setAccess(at, len, &desc, 1) != abi.success) return error.CudaFailed;
+    }
+
+    pub fn releaseHandle(v: *Vmm, handle: u64) void {
+        _ = v.api.release(handle);
+    }
+
+    pub fn unmapRange(v: *Vmm, at: u64, len: usize) void {
+        if (len != 0) _ = v.api.unmap(at, len);
+    }
+
     fn chunk(ctx: *anyopaque, len: usize) ?u64 {
         const v: *Vmm = @ptrCast(@alignCast(ctx));
         if (v.va + v.va_len - v.next < len) return v.fail("the reserved range", 0);
-        var h: u64 = 0;
-        const rc = v.api.create(&h, len, &v.prop, 0);
-        if (rc != abi.success) return v.fail("cuMemCreate", rc);
-        defer _ = v.api.release(h); // the mapping holds the memory until it is unmapped
         const at = v.next;
-        const rm = v.api.map(at, len, 0, h, 0);
-        if (rm != abi.success) return v.fail("cuMemMap", rm);
+        const max_chunk = if (v.retain_handles) ((@as(usize, 4) << 30) / v.granularity) * v.granularity else @max(len, 1);
+        if (max_chunk == 0) return v.fail("4 GiB chunk limit", 0);
+        var offset: usize = 0;
+        while (offset < len) {
+            const chunk_len = @min(max_chunk, len - offset);
+            if (v.retain_handles and v.handle_count == v.handles.len) {
+                if (offset != 0) _ = v.api.unmap(at, offset);
+                return v.fail("VMM handle tracking capacity", 0);
+            }
+            var h: u64 = 0;
+            const rc = v.api.create(&h, chunk_len, &v.prop, 0);
+            if (rc != abi.success) {
+                if (offset != 0) _ = v.api.unmap(at, offset);
+                return v.fail("cuMemCreate", rc);
+            }
+            const rm = v.api.map(at + offset, chunk_len, 0, h, 0);
+            if (rm != abi.success) {
+                _ = v.api.release(h);
+                if (offset != 0) _ = v.api.unmap(at, offset);
+                return v.fail("cuMemMap", rm);
+            }
+            if (v.retain_handles) {
+                v.handles[v.handle_count] = h;
+                v.handle_count += 1;
+            } else {
+                _ = v.api.release(h);
+            }
+            offset += chunk_len;
+        }
         const desc: AccessDesc = .{ .loc_id = v.device };
         const ra = v.api.setAccess(at, len, &desc, 1);
         if (ra != abi.success) {
@@ -456,6 +551,39 @@ test "arena: VMM keeps the first failed driver call and its code, later failures
     v.failed = null; // past the reserved range: no driver call at all
     try t.expectEqual(@as(?u64, null), be.chunk(be.ctx, 8 << 20));
     try t.expectEqualStrings("the reserved range", v.failed.?.call);
+}
+
+test "VMM helpers record create, double map, and access arguments in order" {
+    const Api = struct {
+        var n: usize = 0;
+        var calls: [3]u8 = .{ 0, 0, 0 };
+        var at: [3]u64 = .{ 0, 0, 0 };
+        var len: [3]usize = .{ 0, 0, 0 };
+        fn create(h: *u64, bytes: usize, _: *const Vmm.Prop, _: c_ulonglong) callconv(.c) abi.Result {
+            calls[n] = 1; len[n] = bytes; n += 1; h.* = 99; return abi.success;
+        }
+        fn map(address: u64, bytes: usize, offset: usize, handle: u64, flags: c_ulonglong) callconv(.c) abi.Result {
+            _ = offset; _ = flags; _ = handle; calls[n] = 2; at[n] = address; len[n] = bytes; n += 1; return abi.success;
+        }
+        fn access(address: u64, bytes: usize, desc: *const Vmm.AccessDesc, count: usize) callconv(.c) abi.Result {
+            _ = desc; _ = count; calls[n] = 3; at[n] = address; len[n] = bytes; n += 1; return abi.success;
+        }
+        fn ok(_: u64) callconv(.c) abi.Result { return abi.success; }
+    };
+    Api.n = 0;
+    var v: Vmm = .{ .lib = undefined, .device = 7, .prop = .{ .loc_id = 7 }, .granularity = 2 << 20, .va = 1 << 40, .va_len = 8 << 20, .next = 1 << 40, .api = undefined };
+    v.api.create = Api.create;
+    v.api.map = Api.map;
+    v.api.setAccess = Api.access;
+    v.api.release = Api.ok;
+    v.api.unmap = struct { fn f(_: u64, _: usize) callconv(.c) abi.Result { return abi.success; } }.f;
+    const h = try v.createHandle(2 << 20);
+    try v.mapHandle(1 << 40, 2 << 20, h);
+    try v.grantAccess(1 << 40, 2 << 20);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, Api.calls[0..3]);
+    try std.testing.expectEqual(@as(usize, 2 << 20), Api.len[0]);
+    try std.testing.expectEqual(@as(u64, 1 << 40), Api.at[1]);
+    try std.testing.expectEqual(@as(usize, 2 << 20), Api.len[2]);
 }
 
 test "Failure boundaries: a free range survives failure inserting its live address" {

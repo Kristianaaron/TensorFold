@@ -228,3 +228,5 @@ credited here.
   ([#120](https://github.com/ashhart/TensorFold/pull/120)).
 
 - @tpischke requested fresh per-request sampling keys and reproducible done-line seeds in [#1026](https://github.com/ashhart/TensorFold/issues/1026).
+- GLM-5.3 X3E4 routed prefill adapts EXL3 trellis decoding from ashhart/TensorFold (Apache-2.0), with the
+  underlying EXL3 format and Hadamard rotation credited to ExLlamaV3 (MIT).

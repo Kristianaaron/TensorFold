@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! TensorFold's CUDA runtime: the driver, cuBLASLt and NCCL through dlopen, our kernels and Triton's, no Python.
 
 pub const abi = @import("abi.zig");
@@ -32,6 +34,7 @@ pub const aot = @import("aot.zig");
 pub const kernels = @import("kernels.zig");
 pub const qmmf = @import("qmmf.zig");
 pub const fp8 = @import("fp8.zig");
+pub const w8a8 = @import("w8a8.zig");
 pub const mxfp8 = @import("mxfp8.zig");
 pub const exlr8 = @import("exlr8.zig");
 pub const nvfp4 = @import("nvfp4.zig");
@@ -98,6 +101,7 @@ test {
     _ = segments;
     _ = @import("qmmf.zig");
     _ = @import("fp8.zig");
+    _ = @import("w8a8.zig");
     _ = @import("mxfp8.zig");
     _ = carveout;
     _ = @import("nvfp4.zig");

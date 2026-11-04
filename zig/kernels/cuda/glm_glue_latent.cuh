@@ -1,5 +1,9 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 // latent.py's BF16 absorb, expand and cache write by hand (the MLA layers' 512-wide latent, 256-wide heads).
 #pragma once
+
+#include "tf_vblock.cuh"
 
 #include "glm_triton.cuh"
 
@@ -9,10 +13,11 @@ using namespace glm_triton;
 extern "C" __global__ void __launch_bounds__(128)
     tf_glm_absorb_q(const __nv_bfloat16* q, const __nv_bfloat16* wk, __nv_bfloat16* qa, int64_t rows, int64_t heads,
                     int64_t rb) {
+    TF_VBLOCK_ENTER();
   constexpr int D = 256, LW = 512;
   __shared__ float smem[128];
   const int t = threadIdx.x, k0 = t >> 2, nq = t & 3, warp = t >> 5;
-  const int64_t h = blockIdx.x, n0 = (int64_t)blockIdx.y * 32 + nq * 8, r0 = blockIdx.z * rb;
+  const int64_t h = TF_VBID.x, n0 = (int64_t)TF_VBID.y * 32 + nq * 8, r0 = TF_VBID.z * rb;
   float w[8][8];
   for (int rep = 0; rep < 8; ++rep)
     for (int j = 0; j < 8; ++j) w[rep][j] = bf(wk[(h * D + k0 + 32 * rep) * LW + n0 + j]);
@@ -30,7 +35,7 @@ extern "C" __global__ void __launch_bounds__(128)
     float v = smem[t];
     v = v + __shfl_xor_sync(0xffffffffu, v, 2);
     v = v + __shfl_xor_sync(0xffffffffu, v, 1);
-    if ((t & 3) == 0) qa[(r * heads + h) * LW + (int64_t)blockIdx.y * 32 + t / 4] = __float2bfloat16_rn(v);
+    if ((t & 3) == 0) qa[(r * heads + h) * LW + (int64_t)TF_VBID.y * 32 + t / 4] = __float2bfloat16_rn(v);
     __syncthreads();
   }
 }
@@ -39,10 +44,11 @@ extern "C" __global__ void __launch_bounds__(128)
 extern "C" __global__ void __launch_bounds__(128)
     tf_glm_expand_v(const __nv_bfloat16* ol, const __nv_bfloat16* wv, __nv_bfloat16* out, int64_t rows,
                     int64_t heads, int64_t rb) {
+    TF_VBLOCK_ENTER();
   constexpr int DV = 256, LW = 512;
   __shared__ float smem[32];
   const int t = threadIdx.x, lane = t & 31, warp = t >> 5, kb = (warp & 1) * 256 + lane * 8, nb = warp >> 1;
-  const int64_t h = blockIdx.x, n0 = (int64_t)blockIdx.y * 16, r0 = blockIdx.z * rb;
+  const int64_t h = TF_VBID.x, n0 = (int64_t)TF_VBID.y * 16, r0 = TF_VBID.z * rb;
   float w[8][8];
   for (int rep = 0; rep < 8; ++rep)
     for (int j = 0; j < 8; ++j) w[rep][j] = bf(wv[(h * DV + n0 + nb + 2 * rep) * LW + kb + j]);
@@ -69,6 +75,7 @@ extern "C" __global__ void __launch_bounds__(128)
 // latent._lat_write (BF16 cache): row r of `lat` into cache slot pos + r.
 extern "C" __global__ void tf_glm_lat_write(const __nv_bfloat16* lat, int64_t lat_stride, __nv_bfloat16* cache,
                                             const int* pos, int64_t lw) {
-  const int64_t r = blockIdx.x, at = (int64_t)pos[0] + r;
-  for (int64_t k = threadIdx.x; k < lw; k += blockDim.x) cache[at * lw + k] = lat[r * lat_stride + k];
+    TF_VBLOCK_ENTER();
+  const int64_t r = TF_VBID.x, at = (int64_t)pos[0] + r;
+  for (int64_t k = threadIdx.x; k < lw; k += TF_VBDIM.x) cache[at * lw + k] = lat[r * lat_stride + k];
 }

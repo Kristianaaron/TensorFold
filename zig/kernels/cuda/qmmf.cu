@@ -1,10 +1,16 @@
-// Device code of nvfp4/qmmf.cu (lines 14-298, comments and ATen dropped), its FP4, FP8 and FP8G modes plus BF16.
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
+#include "tf_vblock.cuh"
+// Device code of nvfp4/qmmf.cu (lines 14-298, comments and ATen dropped).
+// Adapted from bertholomus/TensorFold@ddfad35: src/tensorfold/families/glm5_next/cuda/qmm.py (Apache-2.0).
+// Changes: add block-scale-before-bf16-rounding FP8B while retaining TensorFold's existing qmmf modes.
 
 #include <algorithm>
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <cstddef>
 
 #include "qmm_frag.cuh"
 
@@ -12,9 +18,15 @@ namespace tf_qmmf {
 
 using namespace qmm_frag;
 
-enum Mode : int { FP4 = 0, FP8 = 1, MXFP8 = 2, FP8G = 3, BF16 = 4 };
+enum Mode : int { FP4 = 0, FP8 = 1, MXFP8 = 2, FP8G = 3, BF16 = 4, FP8B = 5 };
 
 constexpr int GS = 64;
+
+// Byte-to-k mapping shared with cuda/fp8.zig's FP8 fragment packer.
+__device__ __forceinline__ int kin(int lane, int byte) {
+    const int p = 16 * (byte / 4) + 4 * (lane % 4) + byte % 4;
+    return 16 * (p / 16) + 2 * ((p % 16) / 4) + p % 2 + 8 * ((p % 4) / 2);
+}
 
 __device__ __forceinline__ uint32_t fp4pair(uint32_t w, int s) {
     const uint32_t v = w >> s;
@@ -30,6 +42,16 @@ __device__ __forceinline__ uint32_t fp8pair(uint32_t w) {
     uint32_t r;
     asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(t), "r"(0x7B807B80u), "r"(0x80008000u));
     return r;
+}
+
+__device__ __forceinline__ uint32_t fp8bpair(uint32_t w, float scale) {
+    const uint16_t lo = static_cast<uint16_t>(w);
+    const uint16_t hi = static_cast<uint16_t>(w >> 16);
+    const float a = __uint_as_float(static_cast<uint32_t>(lo) << 16) * scale;
+    const float b = __uint_as_float(static_cast<uint32_t>(hi) << 16) * scale;
+    const uint16_t qa = __bfloat16_as_ushort(__float2bfloat16_rn(a));
+    const uint16_t qb = __bfloat16_as_ushort(__float2bfloat16_rn(b));
+    return static_cast<uint32_t>(qa) | (static_cast<uint32_t>(qb) << 16);
 }
 
 // UE8M0 has no zero encoding: byte 0 is 2^-127, byte 255 is NaN.
@@ -59,18 +81,17 @@ struct Tile {
 };
 
 template <int MODE, int BM, int BN, int WM, int WN, int STAGES, bool F32, bool CLUSTER, bool FUSE = false>
-__global__ void __launch_bounds__(WM * WN * 32) qmmf_kernel(
+__device__ __forceinline__ void qmmf_task(
         const __nv_bfloat16* __restrict__ x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,
         float scale, void* __restrict__ out, float* __restrict__ part, int M, int N, int K, int SK, int npad, int ldx,
-        int group) {
+        int group, unsigned char* buf) {
     using T = Tile<MODE, BM, BN, WM, WN, STAGES>;
     static_assert(BN == 64, "a block reads one 64-column tile of words and scales");
-    extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm = warp / WN, wn = warp % WN;
     const int KG = K / GS, slice_groups = KG / SK, per = FUSE ? KG : slice_groups;
-    const int2 at = tile_of(blockIdx.x, M, N, BM, BN, group);
-    const int m0 = at.x, n0 = at.y, slice = FUSE ? 0 : blockIdx.z, g0 = slice * per;
+    const int2 at = tile_of(TF_VBID.x, M, N, BM, BN, group);
+    const int m0 = at.x, n0 = at.y, slice = FUSE ? 0 : TF_VBID.z, g0 = slice * per;
 
     auto stage = [&](int s) { return buf + s * T::STAGE; };
     auto load = [&](int s, int g) {
@@ -122,13 +143,18 @@ __global__ void __launch_bounds__(WM * WN * 32) qmmf_kernel(
             }
         }
         wait<STAGES - 2>();
-        __syncthreads();
+        TF_TASK_SYNC();
         const int next = it + STAGES - 1;
         if (next < per) load(next % STAGES, g0 + next);
         commit();
         const unsigned char* p = stage(it % STAGES);
         const unsigned char* pw = p + T::X;
         const uint8_t* ps = p + T::X + T::W;
+        float scale_b = 1.0f;
+        if constexpr (MODE == FP8B) {
+            // One expanded scale per 64x64 tile, reused by both K32 MMA steps.
+            scale_b = reinterpret_cast<const float*>(bs)[static_cast<size_t>(n0 / 64) * KG + g0 + it];
+        }
         float d[T::MT][T::NT][4];
         uint4 wq[T::NT];
         uint32_t sq[T::NT][2];
@@ -177,10 +203,15 @@ __global__ void __launch_bounds__(WM * WN * 32) qmmf_kernel(
                     b0 = fp8pair(word & 0xFFFFu);
                     b1 = fp8pair(word >> 16);
                 }
+                if constexpr (MODE == FP8B) {
+                    b0 = fp8bpair(b0, scale_b);
+                    b1 = fp8bpair(b1, scale_b);
+                }
 #pragma unroll
                 for (int i = 0; i < T::MT; ++i) {
-                    if constexpr (MODE == FP8 || MODE == BF16) mma(acc[i][j], a[i], b0, b1);
-                    else if (MODE == FP4 || (MODE == MXFP8 && (kt & 1) == 0) || (MODE == FP8G && kt == 0))
+                    if constexpr (MODE == FP8 || MODE == FP8B || MODE == BF16) {
+                        mma(acc[i][j], a[i], b0, b1);
+                    } else if (MODE == FP4 || (MODE == MXFP8 && (kt & 1) == 0) || (MODE == FP8G && kt == 0))
                         mma0(d[i][j], a[i], b0, b1);
                     else mma(d[i][j], a[i], b0, b1);
                 }
@@ -211,7 +242,7 @@ __global__ void __launch_bounds__(WM * WN * 32) qmmf_kernel(
         }
     }
     wait<0>();
-    __syncthreads();
+    TF_TASK_SYNC();
     if constexpr (FUSE) {
         if (SK > 1) {
 #pragma unroll
@@ -286,16 +317,105 @@ __global__ void __launch_bounds__(WM * WN * 32) qmmf_kernel(
         }
 }
 
+template <int MODE, int BM, int BN, int WM, int WN, int STAGES, bool F32, bool CLUSTER, bool FUSE = false>
+__global__ void __launch_bounds__(WM * WN * 32) qmmf_kernel(
+        const __nv_bfloat16* __restrict__ x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,
+        float scale, void* __restrict__ out, float* __restrict__ part, int M, int N, int K, int SK, int npad, int ldx,
+        int group) {
+    TF_VBLOCK_ENTER();
+    extern __shared__ __align__(128) unsigned char buf[];
+    qmmf_task<MODE, BM, BN, WM, WN, STAGES, F32, CLUSTER, FUSE>(x, w, bs, scale, out, part, M, N, K, SK, npad, ldx,
+                                                                 group, buf);
+}
+
 template <bool F32>
-__global__ void reduce_kernel(const float* __restrict__ part, void* __restrict__ out, long long total, int SK,
+__device__ __forceinline__ void reduce_task(const float* __restrict__ part, void* __restrict__ out, long long total, int SK,
                               float scale) {
-    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const long long i = static_cast<long long>(TF_VBID.x) * TF_VBDIM.x + threadIdx.x;
     if (i >= total) return;
     float acc = part[i];
     for (int s = 1; s < SK; ++s) acc = acc + part[s * total + i];
     acc = acc * scale;
     if (F32) reinterpret_cast<float*>(out)[i] = acc;
     else reinterpret_cast<__nv_bfloat16*>(out)[i] = __float2bfloat16_rn(acc);
+}
+
+// Convert the native FP8B fragment layout into qmmf's BF16 fragment layout. This preserves the
+// production path's order: E4M3 decode, fp32 block-scale multiply, then one round-to-nearest BF16.
+extern "C" __global__ void tf_qmmf_fp8b_dequant_bf16(
+        const unsigned char* __restrict__ codes, const float* __restrict__ scales,
+        __nv_bfloat16* __restrict__ out, int N, int K, int NPad) {
+    TF_VBLOCK_ENTER();
+    const size_t i = static_cast<size_t>(TF_VBID.x) * TF_VBDIM.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(NPad) * K;
+    if (i >= total) return;
+    const int e = i % 4;
+    const int lane = (i / 4) % 32;
+    const int kt = (i / 128) % 4;
+    const int jj = (i / 512) % 8;
+    const int kg = K / GS;
+    const int tile = i / 4096;
+    const int g = tile % kg;
+    const int t = tile / kg;
+    const int row = t * 64 + jj * 8 + lane / 4;
+    const int col = g * GS + kt * 16 + 2 * (lane % 4) + (e & 1) + 8 * (e >> 1);
+    if (row >= N) {
+        out[i] = __float2bfloat16_rn(0.0f);
+        return;
+    }
+    const int within = col % GS;
+    const int h = within / 32;
+    const int q = within % 32;
+    const int rr = row % 8;
+    const int a = (row % 64) / 8;
+    int low = 0, b = 0;
+    for (int l = 0; l < 4; ++l) {
+        for (int byte = 0; byte < 8; ++byte) {
+            if (kin(l, byte) == q) { low = l; b = byte; }
+        }
+    }
+    const int src_lane = rr * 4 + low;
+    const size_t src = (((((static_cast<size_t>(t) * kg + g) * 8 + a) * 32 + src_lane) * 2 + h) * 8 + b);
+    const float value = e4m3f(codes[src]) * scales[static_cast<size_t>(t) * kg + g];
+    out[i] = __float2bfloat16_rn(value);
+}
+
+// Row-major companion for the cuBLASLt prefill path. It uses the same native FP8B scale
+// tiles and rounds each weight once after the fp32 scale multiply.
+extern "C" __global__ void tf_qmmf_fp8b_dequant_bf16_rowmajor(
+        const unsigned char* __restrict__ codes, const float* __restrict__ scales,
+        __nv_bfloat16* __restrict__ out, int N, int K, int NPad) {
+    TF_VBLOCK_ENTER();
+    const size_t i = static_cast<size_t>(TF_VBID.x) * TF_VBDIM.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(N) * K;
+    if (i >= total) return;
+    const int row = static_cast<int>(i / K);
+    const int col = static_cast<int>(i % K);
+    const int t = row / 64;
+    const int jj = (row % 64) / 8;
+    const int rr = row % 8;
+    const int g = col / GS;
+    const int within = col % GS;
+    const int h = within / 32;
+    const int q = within % 32;
+    const int kg = K / GS;
+    const int source_k = q & 15;
+    const int source_byte_low = (source_k & 1) | ((source_k >> 2) & 2);
+    const int source_lane_low = (source_k - (source_byte_low & 1) - 8 * (source_byte_low >> 1)) / 2;
+    const int byte = source_byte_low + 4 * (q >> 4);
+    const int lane = rr * 4 + source_lane_low;
+    const int a = jj;
+    const size_t src = (((((static_cast<size_t>(t) * kg + g) * 8 + a) * 32 + lane) * 2 + h) * 8 + byte);
+    const float value = e4m3f(codes[src]) * scales[static_cast<size_t>(t) * kg + g];
+    out[i] = __float2bfloat16_rn(value);
+    (void)NPad;
+}
+
+template <bool F32>
+__global__ void reduce_kernel(const float* __restrict__ part, void* __restrict__ out, long long total, int SK,
+                              float scale) {
+    TF_VBLOCK_ENTER();
+    reduce_task<F32>(part, out, total, SK, scale);
 }
 
 template __global__ void qmmf_kernel<MXFP8, 16, 64, 1, 4, 4, false, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
@@ -314,6 +434,20 @@ template __global__ void qmmf_kernel<FP8G, 32, 64, 1, 4, 4, false, true, false>(
 template __global__ void qmmf_kernel<FP8G, 64, 64, 1, 4, 4, false, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
 template __global__ void qmmf_kernel<FP8G, 64, 64, 1, 4, 4, false, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
 template __global__ void qmmf_kernel<FP8G, 64, 64, 1, 4, 4, false, false, true>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<FP8B, 16, 64, 1, 4, 4, false, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<FP8B, 16, 64, 1, 4, 4, false, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<FP8B, 32, 64, 1, 4, 4, false, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<FP8B, 32, 64, 1, 4, 4, false, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<FP8B, 64, 64, 1, 4, 4, false, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<FP8B, 64, 64, 1, 4, 4, false, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<FP8B, 64, 64, 1, 4, 4, false, false, true>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<FP8B, 16, 64, 1, 4, 4, true, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<FP8B, 16, 64, 1, 4, 4, true, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<FP8B, 32, 64, 1, 4, 4, true, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<FP8B, 32, 64, 1, 4, 4, true, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<FP8B, 64, 64, 1, 4, 4, true, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<FP8B, 64, 64, 1, 4, 4, true, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+template __global__ void qmmf_kernel<FP8B, 64, 64, 1, 4, 4, true, false, true>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
 template __global__ void qmmf_kernel<FP4, 16, 64, 1, 4, 4, false, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
 template __global__ void qmmf_kernel<FP4, 16, 64, 1, 4, 4, false, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
 template __global__ void qmmf_kernel<FP4, 32, 64, 1, 4, 4, false, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
@@ -393,5 +527,66 @@ template __global__ void qmmf_kernel<BF16, 64, 64, 1, 4, 4, true, true, false>(c
 template __global__ void qmmf_kernel<BF16, 64, 64, 1, 4, 4, true, false, true>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
 template __global__ void reduce_kernel<true>(const float* __restrict__, void* __restrict__, long long, int, float);
 template __global__ void reduce_kernel<false>(const float* __restrict__, void* __restrict__, long long, int, float);
+
+// ---- Grouped FP8B projections: GLM-5.3 TF_GLM53_PRE_FUSE / TF_GLM53_PREP_FUSE (ours). The task is qmmf_task above
+// (adapted from bertholomus/TensorFold@ddfad35 qmm.py, Apache-2.0). Up to four FP8B weights that read the same input
+// rows run in one launch. A block picks its weight from blockIdx.x and runs the unchanged qmmf_task with that weight's
+// own N, NPAD and SK, so each output element keeps the K slices, MMA order and slice sum of its own qmmf launch.
+constexpr int GROUP_MAX = 4;
+struct GroupSeg {
+    const unsigned char* w;
+    const uint8_t* bs;
+    void* out;
+    float scale;
+    int n, npad, sk, blocks;
+};
+struct GroupArgs {
+    const __nv_bfloat16* x;
+    const unsigned char* prefetch;
+    long long prefetch_bytes;
+    int m, k, ldx, band, count, pad;
+    GroupSeg seg[GROUP_MAX];
+};
+static_assert(sizeof(GroupSeg) == 48, "qmmf.zig GroupSegAbi");
+static_assert(sizeof(GroupArgs) == 240, "qmmf.zig GroupArgsAbi");
+static_assert(offsetof(GroupArgs, seg) == 48, "qmmf.zig GroupArgsAbi");
+
+template <int BM, bool CLUSTER, bool FUSE>
+__device__ __forceinline__ void qmmf_group(const GroupArgs& a, unsigned char* buf) {
+    int s = 0, local = static_cast<int>(blockIdx.x);
+    while (s + 1 < a.count && local >= a.seg[s].blocks) {
+        local -= a.seg[s].blocks;
+        ++s;
+    }
+    const GroupSeg& g = a.seg[s];
+    tf_vblock_set(make_uint3(local, 0, blockIdx.z), make_uint3(g.blocks, 1, gridDim.z), blockDim);
+    qmmf_task<FP8B, BM, 64, 1, 4, 4, false, CLUSTER, FUSE>(a.x, g.w, g.bs, g.scale, g.out, nullptr, a.m, g.n, a.k, g.sk,
+                                                          g.npad, a.ldx, a.band, buf);
+    if (a.prefetch_bytes > 0) {
+        const long long blocks = static_cast<long long>(gridDim.x) * gridDim.z;
+        const long long id = static_cast<long long>(blockIdx.z) * gridDim.x + blockIdx.x;
+        const long long lines = (a.prefetch_bytes + 127) / 128, per = (lines + blocks - 1) / blocks;
+        const long long lo = id * per, hi = lines < lo + per ? lines : lo + per;
+        for (long long l = lo + threadIdx.x; l < hi; l += blockDim.x)
+            asm volatile("prefetch.global.L2::evict_last [%0];" : : "l"(a.prefetch + l * 128));
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(128) tf_qmmf_group_fp8b_16c(const GroupArgs a) {
+    extern __shared__ __align__(128) unsigned char buf[];
+    qmmf_group<16, true, false>(a, buf);
+}
+extern "C" __global__ void __launch_bounds__(128) tf_qmmf_group_fp8b_32c(const GroupArgs a) {
+    extern __shared__ __align__(128) unsigned char buf[];
+    qmmf_group<32, true, false>(a, buf);
+}
+extern "C" __global__ void __launch_bounds__(128) tf_qmmf_group_fp8b_64c(const GroupArgs a) {
+    extern __shared__ __align__(128) unsigned char buf[];
+    qmmf_group<64, true, false>(a, buf);
+}
+extern "C" __global__ void __launch_bounds__(128) tf_qmmf_group_fp8b_64f(const GroupArgs a) {
+    extern __shared__ __align__(128) unsigned char buf[];
+    qmmf_group<64, false, true>(a, buf);
+}
 
 }

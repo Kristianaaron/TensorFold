@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
+#include "../tf_vblock.cuh"
 // Copy of src/tensorfold/cuda/exl3/experts_grouped.cuh (blob 57be4c027785): sass_check.sh
 
 // After ExLlamaV3, MIT, Copyright (c) 2025 Turboderp.
@@ -196,12 +199,13 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
     float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
-    const int u = blockIdx.x;
+    TF_VBLOCK_ENTER();
+    const int u = TF_VBID.x;
     if (u >= ucount[0]) return;
     const int MT = (maxm + 15) / 16;
-    const int mtile = blockIdx.z % MT;
-    const int split = (blockIdx.z / MT) % SK;
-    const int mat = blockIdx.z / MT / SK;
+    const int mtile = TF_VBID.z % MT;
+    const int split = (TF_VBID.z / MT) % SK;
+    const int mat = TF_VBID.z / MT / SK;
     const half* X = mat ? X1 : X0;
     const int e = uids[u];
     const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
@@ -224,7 +228,7 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
 
     const int per_split = KT / SK, per_warp = per_split / W;
     const int kt0 = split * per_split + warp * per_warp;
-    const int nt0 = blockIdx.y * NT;
+    const int nt0 = TF_VBID.y * NT;
 
     float acc[NT][2][4];
 #pragma unroll
@@ -289,7 +293,8 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
 // W_q [K, N] fp16 of one matrix through the same lane decode (tests; not on the forward path).
 template <int CB, int K2>
 __global__ void dequant_kernel(const uint32_t* __restrict__ T, half* __restrict__ out, int K, int N) {
-    const int kt = blockIdx.x, nt = blockIdx.y, lane = threadIdx.x;
+    TF_VBLOCK_ENTER();
+    const int kt = TF_VBID.x, nt = TF_VBID.y, lane = threadIdx.x;
     const int NTILES = N >> 4;
     uint32_t w[Fmt<K2>::LW];
     load_words<K2>(w, T + ((size_t)kt * NTILES + nt) * Fmt<K2>::TW + lane, lane);

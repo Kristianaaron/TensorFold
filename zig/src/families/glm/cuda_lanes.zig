@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! GLM-5.3-Flash's CUDA lane backend (as nemotron/cuda_lanes.zig): a slot per stream, shared verify, chunked prompts.
 
 const std = @import("std");
@@ -17,7 +19,12 @@ const ring = 1024;
 /// The widest verify window: the pending token and a copy (the lane core proposes them), as the decode buffers hold.
 pub const max_rows = fw.window_rows;
 const mtp_rows = 1 + engine.max_drafts;
-const max_held = dflash.BLOCK - 1; // a DFlash2 block's drafts (the MTP head's chains stop at max_drafts)
+const max_held = dflash.BLOCK; // accommodates DSpark's anchor slot plus seven masked slots
+
+fn blockDrafts(l: *const Lanes) usize {
+    const dr = l.x.e.drafter orelse return 0;
+    return if (dr.geometry.sample_from_anchor) dflash.BLOCK else dflash.BLOCK - 1;
+}
 
 /// With DFlash2: a window's ms by rows on two GB10s (EXL3, TF_GLM_PROF: 86 to 107 ms at 5 to 8), shared as glm_cuda's.
 const gb10_window_costs = costTable(max_rows, 52.0, 6.8);
@@ -110,9 +117,9 @@ pub const Lanes = struct {
             .mtp = drafting,
             .speculate = drafting,
             .speculate_early = false,
-            .drafts = if (block) max_held else engine.max_drafts,
+            .drafts = if (block) @intCast(blockDrafts(self)) else engine.max_drafts,
             .draft_streams = block, // one block pass drafts every stream of the round
-            .mtp_step_ms = if (block) 1.6 / @as(f64, max_held) else 0, // a block's 7 drafts in one pass (about 1.6 ms)
+            .mtp_step_ms = if (block) 1.6 / @as(f64, @floatFromInt(blockDrafts(self))) else 0,
             .draft_probabilities = block, // the selector's chances size each window against the costs below
             .window_costs = if (block) &gb10_window_costs else &.{},
             .shared_costs = if (block) &gb10_shared_costs else &.{},
@@ -441,13 +448,14 @@ pub const Lanes = struct {
                 n = rows.len;
                 break :a r.follow[rows.len - 1];
             } else self.value(r.first orelse return error.NoFirstToken);
-            reqs[i] = .{ .slot = l.slot, .pos = 0, .n = n, .anchor = anchor, .out = &l.held, .probs = &l.chances };
+            const dr = self.x.e.drafter.?;
+            reqs[i] = .{ .slot = l.slot, .pos = if (dr.geometry.kind == .dspark) @intCast(r.position) else 0, .n = n, .anchor = anchor, .out = &l.held, .probs = &l.chances };
             held[i] = l;
         }
         try self.x.block(reqs[0..requests.len]);
         const cut = confidence();
         for (requests, held[0..requests.len]) |r, l| {
-            l.held_n = @min(r.depth, max_held);
+            l.held_n = @min(r.depth, blockDrafts(self));
             var chain: f64 = 1; // glm_cuda's rule: past the first, a chain stops where its product falls under the cut
             for (l.chances[0..l.held_n], 0..) |*c, j| {
                 chain *= c.*;

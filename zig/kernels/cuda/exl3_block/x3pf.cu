@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
+#include "../tf_vblock.cuh"
 // Copy of src/tensorfold/families/deepseek_v41/cuda/x3pf.cu (blob 3617e7173522): sass_check.sh
 
 
@@ -73,12 +76,13 @@ __global__ void __launch_bounds__(W * 32) pf_kernel(
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
     float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
-    const int u = blockIdx.x;
+    TF_VBLOCK_ENTER();
+    const int u = TF_VBID.x;
     if (u >= ucount[0]) return;
     const int MG = (maxm + 16 * MTL - 1) / (16 * MTL);
-    const int mg = blockIdx.z % MG;
-    const int split = (blockIdx.z / MG) % SK;
-    const int mat = blockIdx.z / MG / SK;
+    const int mg = TF_VBID.z % MG;
+    const int split = (TF_VBID.z / MG) % SK;
+    const int mat = TF_VBID.z / MG / SK;
     const half* X = mat ? X1 : X0;
     const int e = uids[u];
     const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
@@ -114,7 +118,7 @@ __global__ void __launch_bounds__(W * 32) pf_kernel(
 
     const int per_split = KT / SK, per_warp = per_split / W;
     const int kt0 = split * per_split + warp * per_warp;
-    const int nt0 = blockIdx.y * NT;
+    const int nt0 = TF_VBID.y * NT;
 
     float acc[MTL][NT][2][4];
 #pragma unroll

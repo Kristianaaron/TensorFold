@@ -74,6 +74,181 @@ fn sentArguments(a: Allocator, deltas: []const Value) Allocator.Error![]const u8
     return out.items;
 }
 
+fn sentArgumentsAt(a: Allocator, deltas: []const Value, index: i64) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (deltas) |delta| for (delta.get("tool_calls").?.array) |one| {
+        if (one.get("index").?.int64().? != index) continue;
+        try out.appendSlice(a, one.get("function").?.get("arguments").?.string);
+    };
+    return out.items;
+}
+
+fn expectXmlParity(a: Allocator, schema: []const u8, value: []const u8) !void {
+    const tool_text = try std.mem.concat(a, u8, &.{
+        "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"parameters\":{\"$defs\":{\"Limit\":{\"type\":\"integer\"},\"Nested\":{\"type\":\"object\",\"properties\":{\"limit\":{\"$ref\":\"#/$defs/Limit\"}}},\"A\":{\"$ref\":\"#/$defs/B\"},\"B\":{\"$ref\":\"#/$defs/A\"}},\"properties\":{\"n\":",
+        schema,
+        "}}}}]",
+    });
+    const tools = (try json.parse(a, tool_text)).ok.array;
+    const text = try std.fmt.allocPrint(a, "<tool_call><function=lookup><parameter=n>\n{s}\n</parameter></function></tool_call>", .{value});
+    const parsed = try tool_parse.parse(a, text, tools, null);
+    const expected = parsed.calls.?[0].get("function").?.get("arguments").?.string;
+    const actual = try sentArguments(a, try streamed(a, tools, &.{text}));
+    const expected_value = (try json.parse(a, expected)).ok;
+    const actual_value = (try json.parse(a, actual)).ok;
+    try std.testing.expectEqualStrings(try json.stringify(a, expected_value, .{}), try json.stringify(a, actual_value, .{}));
+}
+
+test "effective schemas keep streamed and whole arguments in parity" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try expectXmlParity(a, "{\"$ref\":\"#/$defs/Limit\"}", "5");
+    try expectXmlParity(a, "{\"anyOf\":[{\"type\":\"integer\"},{\"type\":\"null\"}]}", "null");
+    try expectXmlParity(a, "{\"oneOf\":[{\"type\":\"integer\"},{\"type\":\"null\"}]}", "5");
+    try expectXmlParity(a, "{\"type\":[\"integer\",\"null\"]}", "5");
+    try expectXmlParity(a, "{\"$ref\":\"#/$defs/Nested\"}", "{\"limit\":5}");
+    try expectXmlParity(a, "{\"$ref\":\"#/$defs/A\"}", "5");
+    try expectXmlParity(a, "{\"$ref\":\"#/$defs/Missing\"}", "5");
+    try expectXmlParity(a, "{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}]}", "hello");
+}
+
+fn expectGlmParity(a: Allocator, tools: []const Value, text: []const u8) !void {
+    const parsed = try tool_parse.parse(a, text, tools, null);
+    const expected = parsed.calls orelse return error.TestExpectedCalls;
+    const whole = try streamed(a, tools, &.{text});
+    try std.testing.expectEqual(expected.len, countNamedCalls(whole));
+    for (expected, 0..) |call, idx| {
+        const expected_args = call.get("function").?.get("arguments").?.string;
+        const actual = try sentArgumentsAt(a, whole, @intCast(idx));
+        const want_value = (try json.parse(a, expected_args)).ok;
+        const got_value = (try json.parse(a, actual)).ok;
+        try std.testing.expectEqualStrings(try json.stringify(a, want_value, .{}), try json.stringify(a, got_value, .{}));
+    }
+
+    var s = try Streamer.init(a, tools);
+    var pieces: std.ArrayList(Value) = .empty;
+    var at: usize = 0;
+    while (at < text.len) {
+        var end = at + 1;
+        while (end < text.len and text[end] & 0xc0 == 0x80) end += 1;
+        try s.feed(text[0..end], &pieces);
+        at = end;
+    }
+    try std.testing.expectEqual(expected.len, countNamedCalls(pieces.items));
+    for (expected, 0..) |call, idx| {
+        const expected_args = call.get("function").?.get("arguments").?.string;
+        const actual = try sentArgumentsAt(a, pieces.items, @intCast(idx));
+        const want_value = (try json.parse(a, expected_args)).ok;
+        const got_value = (try json.parse(a, actual)).ok;
+        try std.testing.expectEqualStrings(try json.stringify(a, want_value, .{}), try json.stringify(a, got_value, .{}));
+    }
+}
+
+fn countNamedCalls(deltas: []const Value) usize {
+    var count: usize = 0;
+    for (deltas) |delta| for (delta.get("tool_calls").?.array) |one| {
+        if (one.get("id") != null) count += 1;
+    };
+    return count;
+}
+
+test "GLM arguments stream incrementally before a long value closes" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]")).ok.array;
+    const value = try a.alloc(u8, 5000);
+    @memset(value, 'x');
+    const prefix = "<tool_call>lookup<arg_key>q</arg_key><arg_value>";
+    const before_close = try std.mem.concat(a, u8, &.{ prefix, value });
+    const complete = try std.mem.concat(a, u8, &.{ before_close, "</arg_value></tool_call>" });
+    var s = try Streamer.init(a, tools);
+    var out: std.ArrayList(Value) = .empty;
+    var first_name = false;
+    var name_at: usize = 0;
+    for (0..(before_close.len + 49) / 50) |step| {
+        const end = @min(before_close.len, (step + 1) * 50);
+        try s.feed(before_close[0..end], &out);
+        for (out.items) |delta| for (delta.get("tool_calls").?.array) |one| {
+            const function = one.get("function").?;
+            if (!first_name and function.get("name") != null) {
+                first_name = true;
+                name_at = end;
+            }
+        };
+    }
+    try std.testing.expect(first_name);
+    try std.testing.expect(name_at < before_close.len);
+    var argument_deltas: usize = 0;
+    for (out.items) |delta| for (delta.get("tool_calls").?.array) |one| {
+        if (one.get("function").?.get("arguments").?.string.len > 0) argument_deltas += 1;
+    };
+    try std.testing.expect(argument_deltas >= 40);
+    try s.feed(complete, &out);
+}
+
+test "GLM streamed arguments match whole parsing across values and feed boundaries" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"parameters\":{\"properties\":{\"q\":{\"type\":\"string\"},\"other\":{\"type\":\"string\"},\"n\":{\"type\":\"integer\"},\"ok\":{\"type\":\"boolean\"},\"items\":{\"type\":\"array\"}}}}}]")).ok.array;
+    const cases = [_][]const u8{
+        "<tool_call>lookup<arg_key>q</arg_key><arg_value>one</arg_value><arg_key>other</arg_key><arg_value>two</arg_value></tool_call>",
+        "<tool_call>lookup<arg_key>n</arg_key><arg_value>17</arg_value><arg_key>ok</arg_key><arg_value>true</arg_value><arg_key>items</arg_key><arg_value>[1,2]</arg_value></tool_call>",
+        "<tool_call>lookup<arg_key>q</arg_key><arg_value>\n  \"quoted\" \\\\ slash\nsecond line  \n</arg_value></tool_call>",
+        "<tool_call>lookup<arg_key>q</arg_key><arg_value>  lead\nline\n tail  </arg_value></tool_call>",
+        "<tool_call>lookup<arg_key>q</arg_key><arg_value>café 🚀</arg_value></tool_call>",
+        "<tool_call>lookup<arg_key>q</arg_key><arg_value>< and </arg and </arg_key></arg_value></tool_call>",
+        "<tool_call>lookup<arg_key>q</arg_key><arg_value></arg_value></tool_call>",
+        "<tool_call>lookup</tool_call>",
+        "<tool_call>lookup<arg_key>q</arg_key><arg_value>one</arg_value></tool_call><tool_call>lookup<arg_key>q</arg_key><arg_value>two</arg_value></tool_call>",
+        "A little prose. <tool_call>lookup<arg_key>q</arg_key><arg_value>inside</arg_value></tool_call>",
+    };
+    for (cases) |text| try expectGlmParity(a, tools, text);
+}
+
+test "untyped GLM JSON containers stream with whole-parser parity" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"parameters\":{\"properties\":{\"payload\":{\"description\":\"arbitrary request data\"}}}}}]")).ok.array;
+    const text = "<tool_call>lookup<arg_key>payload</arg_key><arg_value>{\"id\": 7, \"tags\": [\"alpha\", \"beta\"]}</arg_value></tool_call>";
+    try expectGlmParity(a, tools, text);
+}
+
+test "unrecognized and legacy call envelopes retain their existing stream paths" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]")).ok.array;
+    for ([_][]const u8{
+        "<tool_call>missing<arg_key>q</arg_key><arg_value>x</arg_value></tool_call>",
+        "<tool_call>{\"name\":\"lookup\",\"arguments\":{\"q\":\"x\"}}</tool_call>",
+        "<tool_call><function=lookup",
+        "<tool_call>lookup q</arg_key><arg_value>x</arg_value></tool_call>",
+    }) |text| {
+        const deltas = try streamed(a, tools, &.{text});
+        try std.testing.expectEqual(@as(usize, 0), deltas.len);
+    }
+    const xml = try streamed(a, tools, &.{"<tool_call><function=lookup><parameter=q>x</parameter></function></tool_call>"});
+    try std.testing.expectEqualStrings("{\"q\":\"x\"}", try sentArguments(a, xml));
+}
+
+test "a GLM call cut inside a value closes to the sent arguments" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]")).ok.array;
+    const open = "<tool_call>lookup<arg_key>q</arg_key><arg_value>unfinished value";
+    const sent = try sentArguments(a, try streamed(a, tools, &.{open}));
+    try std.testing.expect(std.mem.startsWith(u8, sent, "{\"q\":\"unfi"));
+    const close = try tool_parse.closeCall(a, open, tools);
+    try std.testing.expect(close.len > 0);
+    const completed = try streamed(a, tools, &.{ open, try std.mem.concat(a, u8, &.{ open, close }) });
+    try std.testing.expectEqualStrings("{\"q\":\"unfinished value\"}", try sentArguments(a, completed));
+}
+
 test "DSML containment survives every byte boundary and preserves adjacent call order" {
     const prefix = "<｜DSML｜tool_calls><｜DSML｜invoke name=\"lookup\">" ++
         "<｜DSML｜parameter name=\"q\" string=\"true\">";

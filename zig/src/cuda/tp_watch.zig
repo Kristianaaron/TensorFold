@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! Ranks' liveness lines: a TCP line from each rank to rank 0, open before NCCL, carrying ready and error records.
 const std = @import("std");
 const platform = @import("sys");
@@ -23,9 +25,8 @@ pub fn ended() void {
     ending.store(true, .release);
 }
 
-/// NCCL_COMM_ID's host (IPv4) at its port plus one.
-fn address() !posix.sockaddr.in {
-    const id = std.mem.span(platform.c.getenv("NCCL_COMM_ID") orelse return error.NoCommId);
+/// A rank address's host (IPv4) at its port plus one.
+fn addressOf(id: []const u8) !posix.sockaddr.in {
     const colon = std.mem.lastIndexOfScalar(u8, id, ':') orelse return error.NoCommId;
     const port = (std.fmt.parseInt(u16, id[colon + 1 ..], 10) catch return error.NoCommId) +% 1;
     const ip = std.Io.net.IpAddress.parse(id[0..colon], port) catch return error.NoCommId;
@@ -50,9 +51,16 @@ fn socket() !posix.socket_t {
 /// Rank 0 takes a line from each other rank within 5 minutes, and they connect to it; then every line is watched.
 pub fn start(io: std.Io, rank: usize, world: usize) !void {
     if (world < 2) return;
+    const id = std.mem.span(platform.c.getenv("NCCL_COMM_ID") orelse return error.NoCommId);
+    return startAt(io, rank, world, id);
+}
+
+/// Start liveness lines at the copied leader address, independent of NCCL's communicator bootstrap env.
+pub fn startAt(io: std.Io, rank: usize, world: usize, leader: []const u8) !void {
+    if (world < 2) return;
     if (world > max_lines + 1) return error.TooManyRanks;
     my_rank = rank;
-    var addr = try address();
+    var addr = try addressOf(leader);
     if (rank == 0) {
         const server = try socket();
         defer _ = posix.system.close(server);
@@ -83,6 +91,12 @@ pub fn start(io: std.Io, rank: usize, world: usize) !void {
         }
     }
     for (lines[0..line_count], 0..) |fd, i| (try std.Thread.spawn(.{}, watch, .{ fd, i })).detach();
+}
+
+test "tp watch address parses host:port and adds one" {
+    const addr = try addressOf("192.0.2.1:29600");
+    try std.testing.expectEqual(std.mem.nativeToBig(u16, 29601), addr.port);
+    try std.testing.expectError(error.NoCommId, addressOf("nohost"));
 }
 
 fn send(r: Record) void {

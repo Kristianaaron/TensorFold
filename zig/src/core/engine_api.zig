@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! The engine a server drives (``Engine``), and ``LaneHost``: the lane core served on one thread, rounds left to it.
 const std = @import("std");
 const lanes = @import("lanes");
@@ -17,6 +19,7 @@ pub const seedFor = lanes.sampling.seedFor;
 
 /// A committed token's log probability under the target's raw distribution, with the best tokens at its position.
 pub const LogprobRow = lanes.LogprobRow;
+pub const LongLoopConfig = lanes.stream.LongLoopConfig;
 
 /// The request's stop strings, checked on the engine's thread after each committed token (the server decodes the tail).
 pub const Stop = struct {
@@ -52,6 +55,7 @@ pub const grammar = lanes.grammar;
 /// A reply to decode. The request and every slice in it stay valid until its ``finished`` event.
 pub const Request = struct {
     prompt: []const u32,
+    ablate: bool = false,
     max_tokens: u32,
     sampling: ?Sampling = null,
     /// Tokens that end the reply as ``stop`` (the token is delivered); empty when the request ignores EOS.
@@ -74,6 +78,8 @@ pub const Request = struct {
     decode_spans: []const [2]u32 = &.{},
     /// Most reply tokens inside a think block before the engine writes ``think_close`` (0: no limit).
     think_budget: u32 = 0,
+    think_soft_bits: []const u64 = &.{},
+    think_soft_cap: u32 = 0,
     think_close: []const u32 = &.{},
     think_end: ?u32 = null,
     /// The offered tools as JSON text, for drafters that propose a call's structure; empty: no tools.
@@ -83,6 +89,9 @@ pub const Request = struct {
     structure: ?Structure = null,
     /// Stop a short exact cycle while the think block is open.
     loop_guard: bool = false,
+    /// GLM-5.3 opt-in long-period cycle guard (TF_GLM53_LOOP_GUARD=long).
+    loop_guard_long: bool = false,
+    loop_long: LongLoopConfig = .{},
     /// The prompt row (the assistant header's last) where routed lessons decide whether they act (null: none acts).
     decide: ?u32 = null,
     /// The model as shipped: no learned neuron acts on its rows, no prompt state is kept or reused (a lesson's writer).
@@ -166,6 +175,7 @@ pub const Sink = struct {
 
 /// What the engine serves, fixed once it has loaded.
 pub const Info = struct {
+    ablate: bool = false,
     name: []const u8 = "lanes",
     text_generation: bool = true,
     speech: ?SpeechInfo = null,
@@ -275,6 +285,7 @@ pub const Open = struct {
     /// --mtp-drafts and --mtp-confidence; null: the engine's defaults.
     mtp_drafts: ?u32 = null,
     mtp_confidence: ?f64 = null,
+    manifest: ?[]const u8 = null,
     /// Kept prompt entries (--checkpoint-slots); null: the engine's plan.
     keep: ?i64 = null,
     /// Tensor parallelism: this process is `rank` of `tp`; rank 0 listens on `master`:`master_port` for the others.

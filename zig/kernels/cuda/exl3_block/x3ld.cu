@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
+#include "../tf_vblock.cuh"
 // Copy of src/tensorfold/families/deepseek_v41/cuda/x3ld.cu (blob 5cd25f2cdf3c): sass_check.sh
 
 
@@ -71,7 +74,7 @@ __device__ __forceinline__ void ld_tiles(const uint32_t* __restrict__ T, int NTI
     for (int d = 0; d < PD; ++d) issue_w(d, d);                 // PD <= nkt (host)
 
     pdl_wait();                                                  // X (and Z) belong to the kernels before
-    __syncthreads();                                             // rows_sh
+    TF_TASK_SYNC();                                             // rows_sh
     const int r0 = rows_sh[g], r1 = rows_sh[g + 8];
     const half* x0 = X + (size_t)(r0 < 0 ? 0 : r0) * K + 2 * t;
     const half* x1 = X + (size_t)(r1 < 0 ? 0 : r1) * K + 2 * t;
@@ -137,11 +140,11 @@ __device__ __forceinline__ void ld_body(
     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
     float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
     static_assert(PD >= 1 && PD <= 4, "PD 1-4");
-    const int u = blockIdx.x;
+    const int u = TF_VBID.x;
     const int MT = (maxm + 15) / 16;
-    const int mtile = blockIdx.z % MT;
-    const int split = (blockIdx.z / MT) % SK;
-    const int mat = blockIdx.z / MT / SK;
+    const int mtile = TF_VBID.z % MT;
+    const int split = (TF_VBID.z / MT) % SK;
+    const int mat = TF_VBID.z / MT / SK;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
 
     // round trip 1: none of these depends on another (uids / members are sized by the grid: always in bounds)
@@ -163,7 +166,7 @@ __device__ __forceinline__ void ld_body(
     const int KT = K >> 4, NTILES = N >> 4;
     const int per_split = KT / SK, per_warp = per_split / W;
     const int kt0 = split * per_split + warp * per_warp;
-    const int nt0 = blockIdx.y * NT;
+    const int nt0 = TF_VBID.y * NT;
     uint32_t* stage = reinterpret_cast<uint32_t*>(&red[warp][0][0]);
 
     float acc[NT][2][4];
@@ -214,7 +217,7 @@ __device__ __forceinline__ void ld_body(
             red[warp][g + 8][col] = acc[i][h][2];
             red[warp][g + 8][col + 1] = acc[i][h][3];
         }
-    __syncthreads();
+    TF_TASK_SYNC();
     for (int idx = threadIdx.x; idx < 16 * NT * 16; idx += W * 32) {
         const int row = idx / (NT * 16), col = idx % (NT * 16);
         const int r = rows_sh[row];
@@ -232,6 +235,7 @@ __global__ void __launch_bounds__(W * 32, NT == 8 ? 3 : 4) ld_kernel(
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
     float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
+    TF_VBLOCK_ENTER();
     ld_body<CB, NT, PD, LO, HI, PROBE>(X0, X1, TP0, TP1, K2_0, K2_1, uids, ucount, members, Z, K, N, P, SK, maxm, slots);
 }
 
@@ -242,6 +246,7 @@ __global__ void __launch_bounds__(W * 32, 3) ld_kernel<2, 8, 1, 8, 8, 0>(
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
     float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
+    TF_VBLOCK_ENTER();
     ld_body<2, 8, 1, 8, 8, 0>(X0, X1, TP0, TP1, K2_0, K2_1, uids, ucount, members, Z, K, N, P, SK, maxm, slots);
 }
 

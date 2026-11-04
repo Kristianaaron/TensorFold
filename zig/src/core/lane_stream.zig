@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! A request's stream on the lane host: its kept prefix looked up, its drafter made, the stream set up.
 const std = @import("std");
 const lanes = @import("lanes");
@@ -37,6 +39,7 @@ pub fn open(h: *LaneHost, job: *Job) bool {
     job.stream = lanes.Stream.init(h.gpa, .{
         .id = "request",
         .prompt = r.prompt,
+        .ablate = r.ablate,
         .max_new = r.max_tokens,
         .eos = r.eos,
         .sampling = r.sampling,
@@ -47,11 +50,15 @@ pub fn open(h: *LaneHost, job: *Job) bool {
         .cancel_check = .{ .ptr = job, .check = LaneHost.cancelled },
         .yield_check = if (r.background and r.max_tokens == 0) .{ .ptr = job, .check = LaneHost.yieldsTo } else null,
         .think_budget = r.think_budget,
+        .think_soft_bits = r.think_soft_bits,
+        .think_soft_cap = r.think_soft_cap,
         .think_close = r.think_close,
         .think_end = if (r.think_end) |t| t else -1,
         .logprobs = r.logprobs,
         .prompt_logprobs = r.prompt_logprobs,
         .loop_guard = r.loop_guard,
+        .loop_guard_long = r.loop_guard_long,
+        .loop_long = r.loop_long,
         .chunks = r.chunks,
         .history_len = r.history_len,
         .shared_prefixes = r.shared_prefixes,

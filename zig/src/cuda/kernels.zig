@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! Our .cu kernels as fatbins built at build time with each Python extension's nvcc flags, embedded in the binary.
 
 const std = @import("std");
@@ -54,6 +56,11 @@ pub const moe_glue: []const u8 = if (available) &Blob("fatbin_moe_glue").bytes e
 pub const dense_rows: []const u8 = if (available) &Blob("fatbin_dense_rows").bytes else &.{};
 pub const modelopt_pack: []const u8 = if (available) &Blob("fatbin_modelopt_pack").bytes else &.{};
 pub const glm_glue: []const u8 = if (available) &Blob("fatbin_glm_glue").bytes else &.{};
+pub const glm53_index: []const u8 = if (available) &Blob("fatbin_glm53_index").bytes else &.{};
+pub const glm53_mla: []const u8 = if (available) &Blob("fatbin_glm53_mla").bytes else &.{};
+pub const glm53_glue: []const u8 = if (available) &Blob("fatbin_glm53_glue").bytes else &.{};
+pub const glm53_head: []const u8 = if (available) &Blob("fatbin_glm53_head").bytes else &.{};
+pub const glm53_megakernel: []const u8 = if (available) &Blob("fatbin_glm53_megakernel").bytes else &.{};
 pub const glm_ops: []const u8 = if (available) &Blob("fatbin_glm_ops").bytes else &.{};
 pub const glm_quant: []const u8 = if (available) &Blob("fatbin_glm_quant").bytes else &.{};
 pub const glm_vision: []const u8 = if (available) &Blob("fatbin_glm_vision").bytes else &.{};
@@ -62,6 +69,9 @@ pub const glm_dflash: []const u8 = if (available) &Blob("fatbin_glm_dflash").byt
 pub const glm_kda: []const u8 = if (available) &Blob("fatbin_glm_kda").bytes else &.{};
 pub const exl3_linear: []const u8 = if (available) &Blob("fatbin_exl3_linear").bytes else &.{};
 pub const exl3_experts: []const u8 = if (available) &Blob("fatbin_exl3_experts").bytes else &.{};
+pub const glm53_pmx: []const u8 = if (available) &Blob("fatbin_glm53_pmx").bytes else &.{};
+pub const glm53_p5a: []const u8 = if (available) &Blob("fatbin_glm53_p5a").bytes else &.{};
+pub const dsv41_exl3_experts: []const u8 = if (available) &Blob("fatbin_dsv41_exl3_experts").bytes else &.{};
 pub const exl3_candidate: []const u8 = if (available) &Blob("fatbin_exl3_candidate").bytes else &.{};
 pub const torch_argmax: []const u8 = if (available) &Blob("fatbin_torch_argmax").bytes else &.{};
 pub const torch_topk: []const u8 = if (available) &Blob("fatbin_torch_topk").bytes else &.{};
@@ -86,6 +96,9 @@ pub const qk_rows: []const u8 = if (available) &Blob("fatbin_qk_rows").bytes els
 pub const roce_gather: []const u8 = if (available) &Blob("fatbin_roce_gather").bytes else &.{};
 pub const route_rows: []const u8 = if (available) &Blob("fatbin_route_rows").bytes else &.{};
 pub const flashnext_hc: []const u8 = if (available) &Blob("fatbin_flashnext_hc").bytes else &.{};
+pub const glm53_fp8_mma: []const u8 = if (available) &Blob("fatbin_glm53_fp8_mma").bytes else &.{};
+pub const glm53_x3e4: []const u8 = if (available) &Blob("fatbin_glm53_x3e4").bytes else &.{};
+pub const glm53_w8a8: []const u8 = if (available) &Blob("fatbin_glm53_w8a8").bytes else &.{};
 pub const flashnext_attn: []const u8 = if (available) &Blob("fatbin_flashnext_attn").bytes else &.{};
 
 /// Symbols in the gdn image as cuobjdump lists them for the built fatbin (named namespace tf_gdn).
@@ -137,3 +150,7 @@ pub const train_attn: []const u8 = if (available) &Blob("fatbin_train_attn").byt
 pub const flashnext_train: []const u8 = if (available) &Blob("fatbin_flashnext_train").bytes else &.{};
 pub const attn_train: []const u8 = if (available) &Blob("fatbin_attn_train").bytes else &.{};
 pub const qwen27_train: []const u8 = if (available) &Blob("fatbin_qwen27_train").bytes else &.{};
+
+test "kernel image declarations are fully analyzed" {
+    std.testing.refAllDecls(@This());
+}

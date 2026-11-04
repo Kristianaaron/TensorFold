@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! The EXL3 routed experts (exl3/experts.cu's device code): the group, the grouped GEMMs, the epilogues.
 const std = @import("std");
 const driver = @import("driver.zig");
@@ -6,14 +8,23 @@ const launch_ = @import("launch.zig");
 const stream_ = @import("stream.zig");
 const kernels = @import("kernels.zig");
 const exl3 = @import("exl3.zig");
+const grouped = @import("grouped.zig");
 const Driver = driver.Driver;
 const Module = module.Module;
 const Function = module.Function;
 const Stream = stream_.Stream;
 
+/// GLM's grouped EXL3 L2 read-ahead depth; other model families leave this disabled.
+pub var l2_depth: i32 = 0;
+
 pub const DType = exl3.DType;
 pub const Codebook = exl3.Codebook;
 pub const prompt = @import("exl3_prompt.zig");
+pub const pmx = @import("exl3_pmx.zig");
+pub const p5a = @import("exl3_p5a.zig");
+
+/// tf_exl3_group stores [rows][8 slots] int32 membership entries in dynamic shared memory.
+const group_dynamic_shared_bytes: u32 = 2048 * 8 * 4;
 
 /// One layer's routed experts (experts.py's Exl3RoutedExperts): per-expert trellis pointers, stacked scales, the clamp.
 pub const Layer = struct {
@@ -34,11 +45,19 @@ pub const Layer = struct {
     width: usize, // I (expert width)
     codebook: Codebook,
     uniform_k2: u32 = 0, // nonzero only when the loader verified this half-bit width for every projection
+    widths_ok: bool = false, // host verified all per-expert projection widths are supported by prompt decode
+    pmx_ok: bool = false, // gate, up, and down widths are all in the PMX {4,6} set
     shared_input: bool = false, // the loader verified identical gate/up input scales across every expert
     gu_stride: usize = 0, // gate/up trellis row stride in tiles (0: contiguous per projection)
     limit: f32 = 0, // the SwiGLU clamp (0: none)
     act_mode: i32 = 0, // 0: GLM's bf16 roundings (the route RED-SNOW runs), 1: fp32
 };
+
+test {
+    _ = pmx;
+    _ = p5a;
+    _ = prompt;
+}
 
 /// What one projection launches (experts.py default_config): the 8-tile 4-warp K splits, shape-fixed; n % 128 required.
 pub fn plan(k: usize, n: usize, gateup: bool) !u32 {
@@ -106,12 +125,16 @@ pub fn scratch(base: u64, l: Layer, rows: usize, slots: usize) !Scratch {
 /// The loaded kernels.
 pub const Experts = struct {
     mod: Module,
+    router_mod: Module,
+    router: grouped.Router,
     group: Function,
     rot_in: Function,
-    grouped: [3]Function, // one per codebook
+    grouped: [4]Function, // one per codebook
     gateup: Function,
     down_combine: Function,
     prompt: prompt.Kernels = undefined,
+    pmx: ?pmx.Pmx = null,
+    p5a: ?p5a.P5a = null,
     plan_rotate: Function = undefined,
     plan_finish: Function = undefined,
 
@@ -119,6 +142,8 @@ pub const Experts = struct {
         if (!kernels.available) return error.BuiltWithoutKernels;
         var e: Experts = .{
             .mod = try Module.load(d, kernels.exl3_experts),
+            .router_mod = undefined,
+            .router = undefined,
             .group = undefined,
             .rot_in = undefined,
             .grouped = undefined,
@@ -126,16 +151,20 @@ pub const Experts = struct {
             .down_combine = undefined,
         };
         errdefer e.mod.unload();
+        e.router_mod = try Module.load(d, kernels.experts);
+        errdefer e.router_mod.unload();
+        e.router = try grouped.Router.resolve(e.router_mod);
         e.prompt = try prompt.Kernels.resolve(e.mod);
         e.plan_rotate = try e.mod.function("tf_exl3_plan_rotate");
         e.plan_finish = try e.mod.function("tf_exl3_plan_finish");
         e.group = try e.mod.function("tf_exl3_group");
-        try e.group.allowDynamicShared(64 * 1024);
+        try e.group.allowDynamicShared(group_dynamic_shared_bytes);
         e.rot_in = try e.mod.function("tf_exl3_experts_rot_in");
         e.grouped = .{
             try e.mod.function("tf_exl3_grouped_0"),
             try e.mod.function("tf_exl3_grouped_1"),
             try e.mod.function("tf_exl3_grouped_2"),
+            try e.mod.function("tf_exl3_grouped_3"),
         };
         e.gateup = try e.mod.function("tf_exl3_gateup_epilogue");
         e.down_combine = try e.mod.function("tf_exl3_down_combine");
@@ -143,12 +172,27 @@ pub const Experts = struct {
     }
 
     pub fn unload(e: *Experts) void {
+        if (e.p5a) |*p| p.unload();
+        if (e.pmx) |*p| p.unload();
+        e.router_mod.unload();
         e.mod.unload();
     }
 
     /// Per-slot FP32 outputs after the same BF16-up contract; the caller owns its routing-weight reduction.
     pub fn runSlots(e: *const Experts, s: Stream, l: Layer, x: u64, stride: usize, dtype: DType, pick: u64, rows: usize, sc: Scratch) !void {
         try e.run(s, l, x, stride, dtype, pick, 0, rows, 0, sc);
+    }
+
+    /// Reduce prompt GEMM's per-slot fp32 rows with the decode kernel's ordered FMA chain.
+    /// Invalid ids select the already-computed `y` values and skip decode's down-projection epilogue.
+    pub fn combinePrompt(e: *const Experts, s: Stream, l: Layer, y: u64, wts: u64, rows: usize, slots: usize, out: u64, ids: u64) !void {
+        if (rows == 0 or slots == 0 or slots > 32) return error.Exl3Shape;
+        try s.flushDeferred();
+        try s.d.check(s.d.api.cuMemsetD32Async(ids, std.math.maxInt(u32), rows * slots, s.handle), "clear prompt combine ids");
+        var a: launch_.Args = .{};
+        inline for (.{ y, ids, @as(u64, 0), y, wts, out }) |v| a.add(v);
+        inline for (.{ rows * slots, l.dims, @as(usize, 0), l.experts, slots }) |v| a.add(@as(i32, @intCast(v)));
+        try launch_.launch(e.down_combine, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(l.dims / 128), .z = 1 }, .block = .{ .x = @intCast(32 * slots) }, .shared = 16_384 }, s, &a);
     }
 
     /// The routed experts of `rows` rows: group, rotate in, grouped gate/up, SwiGLU, grouped down, wts-weighted sum.
@@ -217,6 +261,7 @@ pub const Experts = struct {
         g.add(i32d(l.gu_stride));
         g.add(@as(i32, 0));
         g.add(@as(i32, -1));
+        g.add(@as(i32, l2_depth));
         try launch_.launch(e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(w / 128), .z = @intCast(2 * g_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &g);
 
         var ep: launch_.Args = .{};
@@ -256,6 +301,7 @@ pub const Experts = struct {
         dn.add(@as(i32, 0));
         dn.add(@as(i32, 0));
         dn.add(@as(i32, -1));
+        dn.add(@as(i32, l2_depth));
         try launch_.launch(e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(d / 128), .z = @intCast(d_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &dn);
 
         var cb: launch_.Args = .{};
@@ -270,7 +316,7 @@ pub const Experts = struct {
         cb.add(i32d(d_sk));
         cb.add(i32d(l.experts));
         cb.add(i32d(slots));
-        try launch_.launch(e.down_combine, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(d / 128), .z = 1 }, .block = .{ .x = @intCast(32 * slots), .y = 1, .z = 1 } }, s, &cb);
+        try launch_.launch(e.down_combine, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(d / 128), .z = 1 }, .block = .{ .x = @intCast(32 * slots), .y = 1, .z = 1 }, .shared = 16_384 }, s, &cb);
     }
 };
 

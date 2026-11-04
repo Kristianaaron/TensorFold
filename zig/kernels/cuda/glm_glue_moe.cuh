@@ -1,11 +1,17 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 // GLM's MLP and MoE glue by hand: glue._swiglu, glue._topk and qmm._group_sums (the router's dot is glm_glue_router).
 #pragma once
+
+#include "tf_vblock.cuh"
 
 #include "glm_triton.cuh"
 
 using namespace glm_triton;
 
 namespace glm_moe {
+
+__device__ __forceinline__ float bf(__nv_bfloat16 v) { return __bfloat162float(v); }
 
 // A thread's S consecutive values summed from the second, then the butterfly over the 64 / S lanes of their group.
 template <int S>
@@ -25,10 +31,9 @@ __device__ __forceinline__ float swiglu1(float g, float u, float limit) {
 
 }  // namespace glm_moe
 
-// glue._swiglu with BLOCK 512 (128 threads, 4 values each, 64-group sums over 16 lanes), column block blockIdx.y.
-extern "C" __global__ void __launch_bounds__(128)
-    tf_glm_swiglu_512(const __nv_bfloat16* gu, __nv_bfloat16* out, float* xs, float limit, int64_t w) {
-  const int64_t r = blockIdx.x, d0 = blockIdx.y * 512 + threadIdx.x * 4;
+// glue._swiglu with BLOCK 512 (128 threads, 4 values each, 64-group sums over 16 lanes), column block TF_VBID.y.
+__device__ __forceinline__ void tf_glm_swiglu_512_task(const __nv_bfloat16* gu, __nv_bfloat16* out, float* xs, float limit, int64_t w) {
+  const int64_t r = TF_VBID.x, d0 = TF_VBID.y * 512 + threadIdx.x * 4;
   const uint2 gv = *reinterpret_cast<const uint2*>(gu + r * 2 * w + d0);
   const uint2 uv = *reinterpret_cast<const uint2*>(gu + r * 2 * w + w + d0);
   const __nv_bfloat16* gh = reinterpret_cast<const __nv_bfloat16*>(&gv);
@@ -37,7 +42,7 @@ extern "C" __global__ void __launch_bounds__(128)
   uint2 ov;
   __nv_bfloat16* oh = reinterpret_cast<__nv_bfloat16*>(&ov);
   for (int j = 0; j < 4; ++j) {
-    a[j] = glm_moe::swiglu1(bf(gh[j]), bf(uh[j]), limit);
+    a[j] = glm_moe::swiglu1(glm_moe::bf(gh[j]), glm_moe::bf(uh[j]), limit);
     oh[j] = __float2bfloat16_rn(a[j]);
   }
   *reinterpret_cast<uint2*>(out + r * w + d0) = ov;
@@ -45,33 +50,48 @@ extern "C" __global__ void __launch_bounds__(128)
   if ((threadIdx.x & 15) == 0) xs[r * (w / 64) + d0 / 64] = g;
 }
 
-// glue._swiglu with BLOCK 64 (the TP=3 shared expert's 704): one value a thread, the warp's butterfly, then 2 warps.
-extern "C" __global__ void __launch_bounds__(64)
-    tf_glm_swiglu_64(const __nv_bfloat16* gu, __nv_bfloat16* out, float* xs, float limit, int64_t w) {
-  __shared__ float smem[2];
-  const int64_t r = blockIdx.x, d = blockIdx.y * 64 + threadIdx.x;
-  const float a = glm_moe::swiglu1(bf(gu[r * 2 * w + d]), bf(gu[r * 2 * w + w + d]), limit);
-  out[r * w + d] = __float2bfloat16_rn(a);
-  const float g = block_sum<2>(a, smem);
-  if (threadIdx.x == 0) xs[r * (w / 64) + blockIdx.y] = g;
+extern "C" __global__ void __launch_bounds__(128)
+    tf_glm_swiglu_512(const __nv_bfloat16* gu, __nv_bfloat16* out, float* xs, float limit, int64_t w) {
+    TF_VBLOCK_ENTER();
+  tf_glm_swiglu_512_task(gu, out, xs, limit, w);
 }
 
-// qmm._group_sums: row blockIdx.x's 64-input sums, 8 lanes a group of 8 consecutive inputs each, 16 groups a block.
-extern "C" __global__ void __launch_bounds__(128)
-    tf_glm_group_sums(const __nv_bfloat16* x, float* xs, int64_t x_stride, int64_t kg) {
-  const int64_t m = blockIdx.x, g = blockIdx.y * 16 + threadIdx.x / 8;
+// glue._swiglu with BLOCK 64 (the TP=3 shared expert's 704): one value a thread, the warp's butterfly, then 2 warps.
+__device__ __forceinline__ void tf_glm_swiglu_64_task(const __nv_bfloat16* gu, __nv_bfloat16* out, float* xs, float limit, int64_t w) {
+  __shared__ float smem[2];
+  const int64_t r = TF_VBID.x, d = TF_VBID.y * 64 + threadIdx.x;
+  const float a = glm_moe::swiglu1(glm_moe::bf(gu[r * 2 * w + d]), glm_moe::bf(gu[r * 2 * w + w + d]), limit);
+  out[r * w + d] = __float2bfloat16_rn(a);
+  const float g = block_sum<2>(a, smem);
+  if (threadIdx.x == 0) xs[r * (w / 64) + TF_VBID.y] = g;
+}
+
+extern "C" __global__ void __launch_bounds__(64)
+    tf_glm_swiglu_64(const __nv_bfloat16* gu, __nv_bfloat16* out, float* xs, float limit, int64_t w) {
+    TF_VBLOCK_ENTER();
+  tf_glm_swiglu_64_task(gu, out, xs, limit, w);
+}
+
+// qmm._group_sums: row TF_VBID.x's 64-input sums, 8 lanes a group of 8 consecutive inputs each, 16 groups a block.
+__device__ __forceinline__ void tf_glm_group_sums_task(const __nv_bfloat16* x, float* xs, int64_t x_stride, int64_t kg) {
+  const int64_t m = TF_VBID.x, g = TF_VBID.y * 16 + threadIdx.x / 8;
   float q[8];
-  for (int j = 0; j < 8; ++j) q[j] = g < kg ? bf(x[m * x_stride + g * 64 + (threadIdx.x & 7) * 8 + j]) : 0.0f;
+  for (int j = 0; j < 8; ++j) q[j] = g < kg ? glm_moe::bf(x[m * x_stride + g * 64 + (threadIdx.x & 7) * 8 + j]) : 0.0f;
   const float s = glm_moe::group64<8>(q);
   if ((threadIdx.x & 7) == 0 && g < kg) xs[m * kg + g] = s;
 }
 
+extern "C" __global__ void __launch_bounds__(128)
+    tf_glm_group_sums(const __nv_bfloat16* x, float* xs, int64_t x_stride, int64_t kg) {
+    TF_VBLOCK_ENTER();
+  tf_glm_group_sums_task(x, xs, x_stride, kg);
+}
+
 // glue._topk, a warp a row: top_k by sigmoid + bias (ties to lower id), normed if `norm`, x scale; then shared expert.
-extern "C" __global__ void __launch_bounds__(32)
-    tf_glm_topk(const float* logits, const float* bias, int* pick, float* wts, float scale, int ne, int top_k,
-                int norm) {
+__device__ __forceinline__ void tf_glm_topk_task(const float* logits, const float* bias, int* pick, float* wts,
+                                                 float scale, int ne, int top_k, int norm) {
   constexpr int MAXE = 16;  // 512 experts a row
-  const int64_t r = blockIdx.x;
+  const int64_t r = TF_VBID.x;
   const int lane = threadIdx.x;
   float score[MAXE], choice[MAXE];
   for (int i = 0; i < MAXE; ++i) {
@@ -110,4 +130,11 @@ extern "C" __global__ void __launch_bounds__(32)
     pick[r * (top_k + 1) + lane] = ne;
     wts[r * (top_k + 1) + lane] = 1.0f;
   }
+}
+
+extern "C" __global__ void __launch_bounds__(32)
+    tf_glm_topk(const float* logits, const float* bias, int* pick, float* wts, float scale, int ne, int top_k,
+                int norm) {
+    TF_VBLOCK_ENTER();
+  tf_glm_topk_task(logits, bias, pick, wts, scale, ne, top_k, norm);
 }

@@ -1,4 +1,6 @@
-//! tool_choice "required" or a named function as a grammar: calls in the template's markup, arguments in their schema.
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
+//! Tool calls as a grammar in the template's markup: required or named calls, or auto replies offering strict tools.
 const std = @import("std");
 const api = @import("engine_api");
 const json = @import("json");
@@ -21,6 +23,7 @@ const blanks = "[ \\t\\r\\n]{0,8}";
 
 /// The most blank characters between an argument's JSON tokens (grammar.py BLANKS).
 const value_blanks = 32;
+var auto_logged: std.atomic.Value(bool) = .init(false);
 
 /// The style of `rendered`, a turn that calls `probe` with {key: "v"}; null: markup this grammar does not write.
 pub fn style(rendered: []const u8) ?Style {
@@ -34,17 +37,103 @@ pub fn style(rendered: []const u8) ?Style {
 }
 
 /// The grammar for a reply that must call one of `tools`: one call, or (`parallel`) one or more, then the end.
+// Ported from ashhart/TensorFold c766e8d0e (upstream 17eef71b) and 42d478a9f (upstream c01e4ccd), Apache-2.0
 pub fn structure(srv: *Server, cx: *Cx, tools: []const Value, parallel: bool, thinking: bool) errors.Refused!api.Structure {
-    const probe_turn = (try json.parse(cx.a, "[{\"role\": \"user\", \"content\": \"x\"}, {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"call_0\", \"type\": \"function\", \"function\": {\"name\": \"" ++ probe ++ "\", \"arguments\": {\"" ++ key ++ "\": \"v\"}}}]}]")).ok;
-    var scratch: Cx = .{ .a = cx.a };
-    const rendered = if (prompt.renderIds(srv, &scratch, probe_turn, &.{}, false, null, false)) |ids| try srv.text.decode(cx.a, ids) else |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.Refused => "",
-    };
-    const s = style(rendered) orelse .json; // unrecognized markup uses the canonical call form the parser accepts
+    const rendered = try probed(srv, cx);
+    const s = style(rendered) orelse .json;
     const text = try build(cx.a, s, tools, parallel);
     const field = try std.fmt.allocPrint(cx.a, "tool_choice \"required\" or a named function on backend '{s}'", .{srv.backendName()});
     return srv.compiledStructure(cx, .structural_tag, text, field, thinking);
+}
+
+// Ported from ashhart/TensorFold c766e8d0e (upstream 17eef71b) and 42d478a9f (upstream c01e4ccd), Apache-2.0
+pub fn optionalStructure(srv: *Server, cx: *Cx, tools: []const Value, all: bool, parallel: bool, thinking: bool) errors.Refused!api.Structure {
+    const rendered = try probed(srv, cx);
+    const s = style(rendered) orelse .json;
+    if (!auto_logged.swap(true, .acq_rel)) std.log.info("tool grammar: auto calls in {s} markup", .{@tagName(s)});
+    const text = try optional(cx.a, s, tools, all, parallel);
+    const field = try std.fmt.allocPrint(cx.a, "strict tools under tool_choice \"auto\" on backend '{s}'", .{srv.backendName()});
+    return srv.compiledStructure(cx, .structural_tag, text, field, thinking);
+}
+
+// Ported from ashhart/TensorFold c766e8d0e (upstream 17eef71b) and 42d478a9f (upstream c01e4ccd), Apache-2.0
+fn probed(srv: *Server, cx: *Cx) errors.Refused![]const u8 {
+    const probe_turn = (try json.parse(cx.a, "[{\"role\": \"user\", \"content\": \"x\"}, {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"call_0\", \"type\": \"function\", \"function\": {\"name\": \"" ++ probe ++ "\", \"arguments\": {\"" ++ key ++ "\": \"v\"}}}]}]")).ok;
+    var scratch: Cx = .{ .a = cx.a };
+    return if (prompt.renderIds(srv, &scratch, probe_turn, &.{}, false, null, false)) |ids| try srv.text.decode(cx.a, ids) else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Refused => "",
+    };
+}
+
+// Ported from ashhart/TensorFold c766e8d0e (upstream 17eef71b) and 42d478a9f (upstream c01e4ccd), Apache-2.0
+pub fn parseToolGrammar(v: ?[]const u8) bool {
+    const value = v orelse return false;
+    return std.mem.eql(u8, std.mem.trim(u8, value, " \t\r\n"), "1");
+}
+
+// Ported from ashhart/TensorFold c766e8d0e (upstream 17eef71b) and 42d478a9f (upstream c01e4ccd), Apache-2.0
+pub fn autoAllEnv() bool {
+    const v = std.c.getenv("TENSORFOLD_TOOL_GRAMMAR") orelse std.c.getenv("TF_DSV41_TOOL_GRAMMAR") orelse return false;
+    return parseToolGrammar(std.mem.span(v));
+}
+
+// Ported from ashhart/TensorFold c766e8d0e (upstream 17eef71b) and 42d478a9f (upstream c01e4ccd), Apache-2.0
+pub fn autoWanted(tools: []const Value, all: bool) bool {
+    if (tools.len == 0) return false;
+    if (all) return true;
+    for (tools) |tool| if (strict(tool)) return true;
+    return false;
+}
+
+// Ported from ashhart/TensorFold c766e8d0e (upstream 17eef71b) and 42d478a9f (upstream c01e4ccd), Apache-2.0
+fn strict(tool: Value) bool {
+    const function = if (tool.get("function")) |f| (if (f == .object) f else tool) else tool;
+    const value = function.get("strict") orelse return false;
+    return value == .bool and value.bool;
+}
+
+// Ported from ashhart/TensorFold c766e8d0e (upstream 17eef71b) and 42d478a9f (upstream c01e4ccd), Apache-2.0
+pub fn optional(a: Allocator, s: Style, tools: []const Value, all: bool, parallel: bool) Allocator.Error![]const u8 {
+    const tag = try callTag(a, s, tools, all);
+    const format = try node(a, "triggered_tags", &.{ .{ "triggers", try list(a, &.{tag.get("begin").?}) }, .{ "tags", try list(a, &.{tag}) }, .{ "stop_after_first", .{ .bool = !parallel } } });
+    return json.stringify(a, try node(a, "structural_tag", &.{.{ "format", format }}), .{ .ascii = false, .compact = true });
+}
+
+// Ported from ashhart/TensorFold c766e8d0e (upstream 17eef71b) and 42d478a9f (upstream c01e4ccd), Apache-2.0
+fn anyCall(a: Allocator, s: Style, tools: []const Value, all: bool) Allocator.Error!Value {
+    const calls = try a.alloc(Value, tools.len);
+    for (tools, calls) |tool, *result| result.* = try call(a, s, try tool_specs.toolName(a, tool), if (all or strict(tool)) try parameters(a, tool) else try anyObject(a));
+    if (calls.len == 1) return calls[0];
+    return node(a, "or", &.{.{ "elements", .{ .array = calls } }});
+}
+
+// Ported from ashhart/TensorFold c766e8d0e (upstream 17eef71b), Apache-2.0
+fn more(a: Allocator, ws: Value, one: Value) Allocator.Error!Value {
+    return node(a, "star", &.{.{ "content", try node(a, "sequence", &.{.{ "elements", try list(a, &.{ ws, one }) }}) }});
+}
+
+// Ported from ashhart/TensorFold c766e8d0e (upstream 17eef71b) and 42d478a9f (upstream c01e4ccd), Apache-2.0
+fn callTag(a: Allocator, s: Style, tools: []const Value, all: bool) Allocator.Error!Value {
+    const open: []const u8 = if (s == .gemma) "<|tool_call>" else "<tool_call>";
+    const bodies = try a.alloc(Value, tools.len);
+    var close: []const u8 = "";
+    for (tools, bodies) |tool, *body_value| {
+        const parts = (try anyCall(a, s, &.{tool}, all)).get("elements").?.array;
+        close = parts[parts.len - 1].strField("value").?;
+        var body: std.ArrayList(Value) = .empty;
+        const rest = parts[0].strField("value").?[open.len..];
+        if (rest.len > 0) try body.append(a, try constant(a, rest));
+        try body.appendSlice(a, parts[1 .. parts.len - 1]);
+        body_value.* = try node(a, "sequence", &.{.{ "elements", .{ .array = body.items } }});
+    }
+    const content = if (bodies.len == 1) bodies[0] else try node(a, "or", &.{.{ "elements", .{ .array = bodies } }});
+    return node(a, "tag", &.{ .{ "begin", .{ .string = open } }, .{ "content", content }, .{ "end", .{ .string = close } } });
+}
+
+// Ported from ashhart/TensorFold 42d478a9f (upstream c01e4ccd), Apache-2.0
+fn anyObject(a: Allocator) Allocator.Error!Value {
+    return node(a, "object", &.{.{ "additionalProperties", .{ .bool = true } }});
 }
 
 /// The structural tag's JSON text (xgrammar's form).
@@ -163,4 +252,8 @@ test "GLM required tools keep their name, schema and parallel policy" {
     const many = try build(a, picked, tools.array, true);
     try std.testing.expect(std.mem.indexOf(u8, many, "<tool_call>clock") != null);
     try std.testing.expect(std.mem.indexOf(u8, many, "\"type\":\"star\"") != null);
+}
+
+test {
+    _ = @import("tool_grammar_auto_test.zig");
 }

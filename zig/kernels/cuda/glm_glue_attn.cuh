@@ -1,5 +1,9 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 // latent.py's MLA attention and sparse.py's index scores by hand: the chunk kernels' online softmax, the chunk merge.
 #pragma once
+
+#include "tf_vblock.cuh"
 
 #include "glm_glue_router.cuh"
 
@@ -63,13 +67,13 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
   float* stat = red + HB * 4;
   const int t = threadIdx.x, lane = t & 31, warp = t >> 5, g = lane >> 2, q = lane & 3;
   const int kg = warp & 3, hh = warp >> 2;
-  const int64_t r = blockIdx.x, h0 = (int64_t)blockIdx.y * HB, c = blockIdx.z;
+  const int64_t r = TF_VBID.x, h0 = (int64_t)TF_VBID.y * HB, c = TF_VBID.z;
   const int64_t n = sparse ? cnt[r] : 0, limit = sparse ? 0 : (int64_t)pos[0] + r, start = c * CH;
   const bool live = sparse ? start < n : start <= limit;
   auto load_kv = [&](int tile) {
     __nv_bfloat16* dst = kvs + (tile & 1) * KT * LW;
     const int64_t first = start + tile * KT;
-    for (int idx = t; idx < KT * (LW / 8); idx += blockDim.x) {
+    for (int idx = t; idx < KT * (LW / 8); idx += TF_VBDIM.x) {
       const int key = idx / (LW / 8), u = idx % (LW / 8);
       const int64_t ki = first + key;
       const bool ok = sparse ? ki < n : ki <= limit;
@@ -85,7 +89,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
       for (int e = 0; e < 4; ++e) o[i][j][e] = 0.0f;
   constexpr int tiles = CH / KT;
   if (live) {
-    for (int idx = t; idx < HB * (LW / 8); idx += blockDim.x) {
+    for (int idx = t; idx < HB * (LW / 8); idx += TF_VBDIM.x) {
       const int hd = idx / (LW / 8), u = idx % (LW / 8);
       const bool ok = h0 + hd < heads;
       cp16(qs + wide(hd, u), qa + (r * heads + (ok ? h0 + hd : 0)) * LW + u * 8, ok);
@@ -100,7 +104,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
       wait<1>();
     else
       wait<0>();
-    __syncthreads();
+    TF_TASK_SYNC();
     const __nv_bfloat16* kv = kvs + (tile & 1) * KT * LW;
     const int64_t first = start + tile * KT;
     float sc[4];
@@ -126,14 +130,14 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
         if (q == 0) red[(hh * 16 + hf * 8 + g) * 4 + kg] = mx;
       }
     }
-    __syncthreads();
+    TF_TASK_SYNC();
     if (t < HB * 4) {
       float v = red[t];
       v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 2));
       v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 1));
       if ((t & 3) == 0) stat[t / 4] = v;
     }
-    __syncthreads();
+    TF_TASK_SYNC();
     float alpha[MT][2];
     for (int i = 0; i < MT; ++i)
       for (int hf = 0; hf < 2; ++hf) {
@@ -155,7 +159,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
         }
         m[i][hf] = nm;
       }
-    __syncthreads();
+    TF_TASK_SYNC();
     if (t < HB * 4) {
       float v = red[t];
       v = v + __shfl_xor_sync(0xffffffffu, v, 2);
@@ -179,7 +183,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
         }
       }
     }
-    __syncthreads();
+    TF_TASK_SYNC();
     for (int i = 0; i < MT; ++i)
       for (int hf = 0; hf < 2; ++hf) l[i][hf] = __fmaf_rn(l[i][hf], alpha[i][hf], stat[HB + i * 16 + hf * 8 + g]);
     if (tile + 2 < tiles) load_kv(tile + 2);
@@ -204,12 +208,14 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
 extern "C" __global__ void __launch_bounds__(256)
     tf_glm_chunks_16(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok, const int* cnt,
                      float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse) {
+    TF_VBLOCK_ENTER();
   glm_attn::chunks_wide<16>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse);
 }
 
 extern "C" __global__ void __launch_bounds__(256)
     tf_glm_chunks_32(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok, const int* cnt,
                      float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse) {
+    TF_VBLOCK_ENTER();
   glm_attn::chunks_wide<32>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse);
 }
 
@@ -217,8 +223,9 @@ extern "C" __global__ void __launch_bounds__(256)
 extern "C" __global__ void __launch_bounds__(128)
     tf_glm_merge(const float* po, const float* pm, const float* pl, __nv_bfloat16* out, const int* cnt, int64_t rows,
                  int64_t heads, int nch, int sparse) {
+    TF_VBLOCK_ENTER();
   constexpr int LW = glm_attn::LW;
-  const int64_t r = blockIdx.x, h = blockIdx.y;
+  const int64_t r = TF_VBID.x, h = TF_VBID.y;
   if (sparse && cnt[r] == 0) return;
   const int k0 = threadIdx.x * 4;
   float m = -INFINITY, l = 0.0f, o[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -246,11 +253,12 @@ extern "C" __global__ void __launch_bounds__(128)
     tf_glm_scores(const __nv_bfloat16* qi, const __nv_bfloat16* wts, int64_t w_stride, const __nv_bfloat16* pk,
                   float* out, const int* pos, int64_t np, int64_t nb, float scale, float wscale, int64_t heads,
                   int loop) {
+    TF_VBLOCK_ENTER();
   constexpr int D = 128, HP = 32, BP = 64;
   __shared__ __align__(16) __nv_bfloat16 sm[4 * 2 * 16 * D];  // q's 32 rows, then each warp's two 16-pool buffers
   auto at = [](int row, int u) { return row * D + ((u ^ (row & 7)) << 3); };
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, q = lane & 3;
-  const int64_t r = blockIdx.x, npool = ((int64_t)pos[0] + r + 1) / 4;
+  const int64_t r = TF_VBID.x, npool = ((int64_t)pos[0] + r + 1) / 4;
   for (int idx = threadIdx.x; idx < HP * (D / 8); idx += 128) {
     const int hh = idx / (D / 8), u = idx % (D / 8);
     const bool ok = hh < heads;
@@ -272,7 +280,7 @@ extern "C" __global__ void __launch_bounds__(128)
       glm_attn::cp16(sm + (warp * 2 + buf) * 16 * D + at(row, u), pk + (ok ? p : 0) * D + u * 8, ok);
     }
   };
-  const int64_t first = (int64_t)blockIdx.y * loop;
+  const int64_t first = (int64_t)TF_VBID.y * loop;
   // Blocks that score: those under nb with visible pools (pb * BP < npool); the rest only write -inf.
   auto live = [&](int j) { const int64_t pb = first + j; return j < loop && pb < nb && pb * BP < npool; };
   glm_attn::wait<0>();

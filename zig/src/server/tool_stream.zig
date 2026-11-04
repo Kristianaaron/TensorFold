@@ -41,13 +41,18 @@ pub const Streamer = struct {
     current: []const u8 = "",
     value_schema: Value = .null,
     typed: bool = false,
+    untyped: bool = false,
+    pending_open: ?[]const u8 = null,
     buffer: std.ArrayList(u8) = .empty,
     pos: usize = 0,
-    state: enum { outside, call, buffered, function, value, closing, abort } = .outside,
+    state: enum { outside, call, buffered, function, glm_args, value, closing, abort } = .outside,
     index: i64 = -1,
     args_open: bool = false,
     lead: bool = false,
     held: []const u8 = "",
+    glm: bool = false,
+    value_tail: []const u8 = "</parameter>",
+    framed: bool = true,
     streamed: bool = false,
     searched: usize = 0, // the answer is only ever extended, so prose already searched holds no opener
     tools: []const Value,
@@ -92,6 +97,50 @@ pub const Streamer = struct {
         }
         s.index += @intCast(calls.len);
         s.streamed = true;
+    }
+
+    fn openCall(s: *Streamer, name: []const u8, out: *std.ArrayList(Value)) Allocator.Error!void {
+        s.current = name;
+        s.index += 1;
+        s.streamed = true;
+        const function = try json.newObject(s.a);
+        try function.put(s.a, "name", .{ .string = name });
+        try function.put(s.a, "arguments", .{ .string = "" });
+        const one = try json.newObject(s.a);
+        try one.put(s.a, "index", try json.intValue(s.a, s.index));
+        try one.put(s.a, "id", .{ .string = try ids.make(s.a, "call_", 24) });
+        try one.put(s.a, "type", .{ .string = "function" });
+        try one.put(s.a, "function", .{ .object = function });
+        try out.append(s.a, try wrap(s.a, .{ .object = one }));
+        s.args_open = false;
+    }
+
+    fn glmOpen(s: *Streamer, rest: []const u8, out: *std.ArrayList(Value)) Allocator.Error!enum { wait, opened, no } {
+        var i: usize = 0;
+        while (i < rest.len and space(rest[i])) i += 1;
+        if (i == rest.len) return .wait;
+        if (rest[i] == '<' or rest[i] == '{' or rest[i] == '[') return .no;
+        const j = std.mem.indexOfScalarPos(u8, rest, i, '<') orelse {
+            if (reply_text.charCount(rest) > 256 or std.mem.indexOfAny(u8, rest[i..], "\n\r") != null) return .no;
+            return .wait;
+        };
+        const tag = rest[j..];
+        const key_tag = "<arg_key>";
+        const close_tag = "</tool_call>";
+        if (!std.mem.startsWith(u8, tag, key_tag) and !std.mem.startsWith(u8, tag, close_tag)) {
+            if ((tag.len < key_tag.len and std.mem.startsWith(u8, key_tag, tag)) or
+                (tag.len < close_tag.len and std.mem.startsWith(u8, close_tag, tag))) return .wait;
+            return .no;
+        }
+        const raw_name = reply_text.pyStrip(rest[i..j]);
+        if (raw_name.len == 0 or std.mem.indexOfAny(u8, raw_name, "\n\r") != null) return .no;
+        const lower = try std.ascii.allocLowerString(s.a, raw_name);
+        const name = s.known.get(lower) orelse return .no;
+        try s.openCall(name, out);
+        s.glm = true;
+        s.pos += j;
+        s.state = .glm_args;
+        return .opened;
     }
 
     /// The deltas the reply's ``text`` (its whole answer so far) adds.
@@ -179,6 +228,13 @@ pub const Streamer = struct {
                     }
                 },
                 .call => {
+                    if (!s.dsml_seen) {
+                        switch (try s.glmOpen(rest, out)) {
+                            .wait => return,
+                            .opened => continue,
+                            .no => {},
+                        }
+                    }
                     const m = opening(rest, "<function=") orelse {
                         const trimmed = reply_text.pyStrip(rest);
                         if (reply_text.charCount(rest) > 256 or (trimmed.len > 0 and trimmed[0] != '<') or
@@ -206,19 +262,7 @@ pub const Streamer = struct {
                         s.state = .buffered;
                         continue;
                     };
-                    s.current = name;
-                    s.index += 1;
-                    s.streamed = true;
-                    const function = try json.newObject(s.a);
-                    try function.put(s.a, "name", .{ .string = name });
-                    try function.put(s.a, "arguments", .{ .string = "" });
-                    const one = try json.newObject(s.a);
-                    try one.put(s.a, "index", try json.intValue(s.a, s.index));
-                    try one.put(s.a, "id", .{ .string = try ids.make(s.a, "call_", 24) });
-                    try one.put(s.a, "type", .{ .string = "function" });
-                    try one.put(s.a, "function", .{ .object = function });
-                    try out.append(s.a, try wrap(s.a, .{ .object = one }));
-                    s.args_open = false;
+                    try s.openCall(name, out);
                     s.pos += m.len;
                     s.state = .function;
                 },
@@ -239,12 +283,16 @@ pub const Streamer = struct {
                     if (opening(rest, "<parameter=")) |m| {
                         const key = reply_text.pyStrip(m.name);
                         s.value_schema = try tool_params.schemaOf(&s.schemas, s.current, key, s.a);
+                        s.untyped = tool_params.schemaUntyped(s.value_schema);
                         s.typed = typedSchema(s.value_schema);
                         s.buffer.clearRetainingCapacity();
                         const quoted = try json.quote(s.a, key, .{ .ascii = false });
-                        try out.append(s.a, try s.args(try std.mem.concat(s.a, u8, &.{ if (s.args_open) "," else "{", quoted, if (s.typed) ":" else ":\"" })));
+                        const prefix = try std.mem.concat(s.a, u8, &.{ if (s.args_open) "," else "{", quoted });
+                        if (s.untyped) s.pending_open = prefix else try out.append(s.a, try s.args(try std.mem.concat(s.a, u8, &.{ prefix, if (s.typed) ":" else ":\"" })));
                         s.args_open = true;
                         s.pos += m.len;
+                        s.value_tail = "</parameter>";
+                        s.framed = true;
                         s.state = .value;
                         s.lead = !m.newline;
                         s.held = "";
@@ -258,8 +306,38 @@ pub const Streamer = struct {
                     }
                     return;
                 },
+                .glm_args => {
+                    if (closing(rest, "</tool_call>")) |n| {
+                        try out.append(s.a, try s.args(if (s.args_open) "}" else "{}"));
+                        s.pos += n;
+                        s.searched = s.pos;
+                        s.glm = false;
+                        s.state = .outside;
+                        continue;
+                    }
+                    var i: usize = 0;
+                    while (i < rest.len and space(rest[i])) i += 1;
+                    if (!std.mem.startsWith(u8, rest[i..], "<arg_key>")) return;
+                    const k = tool_parse.valueKey(rest, i + 9) orelse return;
+                    const key = reply_text.pyStrip(rest[i + 9 .. k[0]]);
+                    s.value_schema = try tool_params.schemaOf(&s.schemas, s.current, key, s.a);
+                    s.untyped = tool_params.schemaUntyped(s.value_schema);
+                    s.typed = typedSchema(s.value_schema);
+                    s.buffer.clearRetainingCapacity();
+                    const quoted = try json.quote(s.a, key, .{ .ascii = false });
+                    const prefix = try std.mem.concat(s.a, u8, &.{ if (s.args_open) "," else "{", quoted });
+                    if (s.untyped) s.pending_open = prefix else try out.append(s.a, try s.args(try std.mem.concat(s.a, u8, &.{ prefix, if (s.typed) ":" else ":\"" })));
+                    s.args_open = true;
+                    s.pos += k[1];
+                    s.value_tail = "</arg_value>";
+                    s.framed = false;
+                    s.lead = false;
+                    s.held = "";
+                    s.state = .value;
+                    continue;
+                },
                 .value => {
-                    const tail = "</parameter>";
+                    const tail = s.value_tail;
                     const end = reply_text.findTag(rest, 0, tail);
                     const chunk = if (end) |e| rest[0..e] else rest[0..trimTail(rest, tail.len)];
                     s.pos += chunk.len;
@@ -269,23 +347,49 @@ pub const Streamer = struct {
                         s.lead = false;
                     }
                     var keep: []const u8 = undefined;
-                    if (end != null) {
+                    if (!s.framed) {
+                        keep = piece;
+                        s.held = "";
+                    } else if (end != null) {
                         keep = if (std.mem.endsWith(u8, piece, "\n")) piece[0 .. piece.len - 1] else piece; // the framing newline
                         s.held = "";
                     } else {
                         keep = reply_text.pyRstrip(piece); // its last newline may be the framing one
                         s.held = piece[keep.len..];
                     }
+                    if (s.pending_open) |prefix| {
+                        // Untyped values wait for their first non-space byte; only object/array candidates are buffered.
+                        const first: ?u8 = for (keep) |ch| {
+                            if (!space(ch)) break ch;
+                        } else null;
+                        if (first) |ch| {
+                            s.typed = ch == '{' or ch == '[';
+                            const separator = if (s.typed) ":" else ":\"";
+                            try out.append(s.a, try s.args(try std.mem.concat(s.a, u8, &.{ prefix, separator })));
+                            s.pending_open = null;
+                            s.untyped = false;
+                        } else if (end == null) {
+                            s.held = piece;
+                            return;
+                        } else {
+                            try out.append(s.a, try s.args(try std.mem.concat(s.a, u8, &.{ prefix, ":\"", try s.esc(keep), "\"" })));
+                            s.pending_open = null;
+                            s.untyped = false;
+                            s.pos += tail.len;
+                            s.state = if (s.glm) .glm_args else .function;
+                            continue;
+                        }
+                    }
                     if (s.typed) {
                         try s.buffer.appendSlice(s.a, keep);
                     } else if (keep.len > 0) try out.append(s.a, try s.args(try s.esc(keep)));
                     if (end == null) return;
                     if (s.typed) {
-                        const v = try tool_params.decode(s.a, s.buffer.items, s.value_schema, true);
+                        const v = try tool_params.decode(s.a, s.buffer.items, s.value_schema, !s.glm);
                         try out.append(s.a, try s.args(try json.stringify(s.a, v, .{ .ascii = false })));
                     } else try out.append(s.a, try s.args("\""));
                     s.pos += tail.len;
-                    s.state = .function;
+                    s.state = if (s.glm) .glm_args else .function;
                 },
                 .closing => {
                     const n = closing(rest, "</tool_call>") orelse return;

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! The lane engine's host core (Python lane_engine.py); backends run forwards and draws behind `backend.Backend`.
 const std = @import("std");
 
@@ -23,6 +25,7 @@ pub const stream = @import("stream.zig");
 pub const backend = @import("backend.zig");
 pub const events = @import("events.zig");
 pub const windows = @import("windows.zig");
+pub const lone_costs = @import("lone_costs.zig");
 pub const trail = @import("trail.zig");
 pub const engine = @import("engine.zig");
 pub const fake = @import("fake.zig");
@@ -31,6 +34,10 @@ pub const drafted = @import("drafted.zig");
 pub const recorder = @import("recorder.zig");
 pub const logprob = @import("logprob.zig");
 pub const grammar = @import("grammar.zig");
+pub const zngram = @import("zngram.zig");
+pub const ZNgram = zngram.ZNgram;
+pub const verify_budget = @import("verify_budget.zig");
+pub const hold_price = @import("hold_price.zig");
 
 pub const Engine = engine.Engine;
 pub const Config = config.Config;
@@ -49,6 +56,8 @@ test {
     _ = @import("recorder_test.zig");
     _ = @import("gpu_full_test.zig");
     _ = @import("drafted_test.zig");
+    _ = @import("drafted_chances_test.zig");
+    _ = @import("drafted_copy_test.zig");
     _ = @import("drafted_grammar_test.zig");
     _ = @import("windows_grammar_test.zig");
     _ = @import("pricing_test.zig");
@@ -56,6 +65,11 @@ test {
     _ = @import("lone_backoff_test.zig");
     _ = @import("fill_test.zig");
     _ = @import("fill_trim_test.zig");
+    _ = @import("zngram.zig");
+    _ = @import("verify_budget.zig");
+    _ = @import("zngram_engine_test.zig");
+    _ = @import("copy_arbiter.zig");
+    _ = @import("copy_arbiter_engine_test.zig");
 }
 
 pub const learned_disk = @import("learned_disk.zig");

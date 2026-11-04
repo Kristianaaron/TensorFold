@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! GLM's actual common EXL3 dispatch with recording driver calls, no device or image.
 const std = @import("std");
 const cuda = @import("cuda");
@@ -54,8 +56,8 @@ fn run(rows: usize, prompt: bool, shared: bool) !void {
     d.api.cuLaunchKernel = Capture.launch;
     d.api.cuMemcpy2DAsync_v2 = Capture.copy;
     const s: cuda.Stream = .{ .d = &d, .handle = null };
-    var k: ex.Experts = .{ .mod = undefined, .group = function(&d, 1), .rot_in = function(&d, 2), .grouped = @splat(function(&d, 3)), .gateup = function(&d, 4), .down_combine = function(&d, 5) };
-    if (comptime @hasField(ex.Experts, "prompt")) k.prompt = .{ .rotate = function(&d, 11), .gateup = function(&d, 12), .down = function(&d, 13) };
+    var k: ex.Experts = .{ .mod = undefined, .router_mod = undefined, .router = undefined, .group = function(&d, 1), .rot_in = function(&d, 2), .grouped = @splat(function(&d, 3)), .gateup = function(&d, 4), .down_combine = function(&d, 5) };
+    if (comptime @hasField(ex.Experts, "prompt")) k.prompt = .{ .rotate = function(&d, 11), .gateup = function(&d, 12), .down = function(&d, 13), .gateup_e4m3 = function(&d, 14), .down_e4m3 = function(&d, 15) };
     const ek: glm.experts.Kernels = .{ .nvfp4 = undefined, .router = .{ .plan_small = function(&d, 20), .plan_rank = function(&d, 21), .plan_offsets = function(&d, 22), .plan_scatter = function(&d, 23) } };
     const w: glm.exl3.Experts = .{ .gt = 100, .ut = 200, .dt = 300, .k2 = 400, .suh_g = 500, .suh_u = 600, .svh_g = 700, .svh_u = 800, .suh_d = 900, .svh_d = 1000, .shx = shared };
     const sc: glm.exl3.Scratch = .{ .picks = 0x100000000, .xg = 0, .xu = 0, .z = 0 };
@@ -90,7 +92,7 @@ test "exl3 prompt: scratch omits global split partials and shared rotation stora
     const decode = glm.exl3.scratchBytes(1024, 512, 256, false, false)[0];
     try std.testing.expect(shared < separate and separate < decode);
     if (comptime @hasDecl(ex, "prompt")) {
-        const l: ex.Layer = .{ .gate = 0, .up = 0, .down = 0, .gate_k2 = 0, .up_k2 = 0, .down_k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .dims = 512, .width = 256, .experts = 9, .codebook = .mcg, .uniform_k2 = 8, .shared_input = true };
+        const l: ex.Layer = .{ .gate = 0, .up = 0, .down = 0, .gate_k2 = 0, .up_k2 = 0, .down_k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .dims = 512, .width = 256, .experts = 9, .codebook = .mcg, .uniform_k2 = 8, .widths_ok = true, .shared_input = true };
         const bytes = try ex.prompt.bytes(l, 1024, 8);
         const sc = try ex.prompt.scratch(0x1000, l, 1024, 8);
         try std.testing.expectEqual(@as(u64, sc.xg), sc.xu);
@@ -123,17 +125,28 @@ test "exl3 prompt: decode retains the existing split-K launches" {
 
 test "exl3 prompt: the common dispatch requires verified mcg4 geometry and keeps every fallback" {
     const P = ex.prompt;
-    var l: ex.Layer = .{ .gate = 0, .up = 0, .down = 0, .gate_k2 = 0, .up_k2 = 0, .down_k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .dims = 512, .width = 256, .experts = 9, .codebook = .mcg, .uniform_k2 = 8 };
+    var l: ex.Layer = .{ .gate = 0, .up = 0, .down = 0, .gate_k2 = 0, .up_k2 = 0, .down_k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .dims = 512, .width = 256, .experts = 9, .codebook = .mcg, .uniform_k2 = 8, .widths_ok = true };
     try std.testing.expect(P.eligible(l));
     l.uniform_k2 = 0;
-    try std.testing.expect(!P.eligible(l));
+    try std.testing.expect(P.eligible(l));
     l.uniform_k2 = 6;
-    try std.testing.expect(!P.eligible(l));
+    try std.testing.expect(P.eligible(l));
     l.uniform_k2 = 8;
+    l.widths_ok = false;
+    try std.testing.expect(!P.eligible(l));
+    l.widths_ok = true;
+    l.codebook = .mcg_e4m3;
+    try std.testing.expect(P.eligible(l));
+    l.codebook = .mcg;
     for ([_]ex.Codebook{ .inst3, .mul1 }) |cb| {
         l.codebook = cb;
         try std.testing.expect(!P.eligible(l));
     }
+    try std.testing.expect(P.eligibleWidths(&.{ 8, 8 }));
+    try std.testing.expect(P.eligibleWidths(&.{ 2, 4, 6 }));
+    try std.testing.expect(!P.eligibleWidths(&.{1}));
+    try std.testing.expect(!P.eligibleWidths(&.{9}));
+    try std.testing.expect(!P.eligibleWidths(&.{}));
     l.codebook = .mcg;
     l.gu_stride = 16;
     try std.testing.expect(!P.eligible(l));
@@ -160,7 +173,7 @@ test "exl3 prompt: the common dispatch requires verified mcg4 geometry and keeps
 
 test "exl3 prompt: the common entry takes as many experts as the grouped router counts, and refuses one more" {
     const P = ex.prompt;
-    var l: ex.Layer = .{ .gate = 0, .up = 0, .down = 0, .gate_k2 = 0, .up_k2 = 0, .down_k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .dims = 512, .width = 256, .experts = cuda.grouped.max_experts, .codebook = .mcg, .uniform_k2 = 8 };
+    var l: ex.Layer = .{ .gate = 0, .up = 0, .down = 0, .gate_k2 = 0, .up_k2 = 0, .down_k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .dims = 512, .width = 256, .experts = cuda.grouped.max_experts, .codebook = .mcg, .uniform_k2 = 8, .widths_ok = true };
     try std.testing.expectEqual(@as(usize, 1024), cuda.grouped.max_experts);
     for ([_]usize{ 1, 1024, 2048 }) |rows| {
         l.experts = cuda.grouped.max_experts;

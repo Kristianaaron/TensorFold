@@ -1,14 +1,17 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! EXL3 checkpoint groups: every `{prefix}.trellis` and its parts, admitted from the safetensors headers (format.py).
 const std = @import("std");
 const checkpoint = @import("checkpoint.zig");
 const st = @import("safetensors.zig");
 
-pub const Codebook = enum { inst3, mcg, mul1 };
+pub const Codebook = enum { inst3, mcg, mul1, mcg_e4m3 };
 
 /// format.py's MARKERS: a scalar int32 tensor per codebook, whose value must be the magic.
 pub const Marker = struct { name: []const u8, codebook: Codebook, value: u32 };
 pub const markers = [_]Marker{
     .{ .name = "mcg", .codebook = .mcg, .value = 0xCBAC1FED },
+    .{ .name = "mcg_e4m3", .codebook = .mcg_e4m3, .value = 0xCBAC1FED },
     .{ .name = "mul1", .codebook = .mul1, .value = 0x83DCD12D },
 };
 
@@ -28,6 +31,7 @@ pub const Summary = struct {
     groups: usize = 0,
     inst3: usize = 0,
     mcg: usize = 0,
+    mcg_e4m3: usize = 0,
     mul1: usize = 0,
     suh_svh: usize = 0,
     su_sv: usize = 0,
@@ -40,6 +44,7 @@ pub const Summary = struct {
         switch (g.codebook) {
             .inst3 => s.inst3 += 1,
             .mcg => s.mcg += 1,
+            .mcg_e4m3 => s.mcg_e4m3 += 1,
             .mul1 => s.mul1 += 1,
         }
         if (g.suh) s.suh_svh += 1 else s.su_sv += 1;
@@ -317,4 +322,13 @@ test "a scan that fails an allocation frees every group prefix it held" {
     defer admitted.deinit();
     try std.testing.expectEqual(@as(usize, 2), admitted.groups.len);
     try std.testing.checkAllAllocationFailures(a, scanFault, .{ io, dir });
+}
+
+test "mcg_e4m3 keeps its own marker codebook in the shared scan contract" {
+    try std.testing.expectEqual(Codebook.mcg_e4m3, markers[1].codebook);
+    try std.testing.expectEqual(@as(u32, 0xCBAC1FED), markers[1].value);
+}
+
+test {
+    std.testing.refAllDecls(@This());
 }

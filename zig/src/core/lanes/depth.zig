@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! Draft depth by expected tokens a millisecond (Python family_depth.py DraftDepth and FamilyRounds._head_depth).
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -11,6 +13,11 @@ pub const Constants = struct {
     plain_margin: f64 = 1.05, // a drafted depth must beat plain rounds' tokens a ms by this much
     plain_wait_most: u64 = 128, // plain rounds between probes at most
     draft_slack: i64 = 2, // drafts a stream offers past what its last shared round granted it
+    grant_slack: i64 = 1,
+    short_slack: i64 = 0,
+    copy_first: bool = false,
+    copy_arbitrate: bool = false,
+    hold_costs: []const @import("hold_price.zig").HoldCost = &.{},
 };
 
 /// A stream's acceptance by depth and probe counters (Python `_depth_state[stream]`).
@@ -34,6 +41,8 @@ pub const Who = struct {
     finished: bool,
     forced: bool,
     granted: ?u32 = null,
+    grant_short: bool = false,
+    gain: ?f64 = null,
     stream: ?*anyopaque = null,
     sampled: bool = false, // keyed draws: host work a row that a greedy round does not have
 };
@@ -58,6 +67,7 @@ pub const Rule = struct {
     draft_step_ms: f64 = 0, // a shared round's draft past a stream's first (budgets price it)
     plain_guard: bool,
     node_probabilities: bool,
+    granted_depth: bool = false,
     confidence_floor: ?f64 = null,
     batch_rows: u32,
     batched_heads: bool = false, // one batch drafts every stream of a shared round (its steps: the deepest stream's)
@@ -65,8 +75,10 @@ pub const Rule = struct {
     overhead: std.ArrayList(Overhead) = .empty, // a shared round's ms past its forward, by streams (insertion order)
     greedy_ms: Table = .{}, // round_ms from greedy rounds alone: what greedy streams price by
     greedy_overhead: std.ArrayList(Overhead) = .empty, // overhead from rounds without a sampled stream
+    hold_order: []usize = &.{},
 
     pub fn deinit(r: *Rule) void {
+        r.gpa.free(r.hold_order);
         r.round_ms.deinit(r.gpa);
         r.overhead.deinit(r.gpa);
         r.greedy_ms.deinit(r.gpa);
@@ -192,12 +204,16 @@ pub const Rule = struct {
 
     /// Python `_head_depth`: the next round's head drafts for a stream (0 when forced, 1 with a copy ahead).
     pub fn headDepth(r: *Rule, who: *const Who, budget: ?i64, probe: Probe) !i64 {
-        const d: i64 = if (who.finished) 0 else if (budget) |b| b else if (r.node_probabilities)
+        const granted = who.granted orelse @as(u32, 0);
+        const cap = if (who.granted == null) @min(@as(i64, r.most_drafts), @max(1, who.draft_room - 1)) else @min(@as(i64, r.most_drafts), @as(i64, granted) + (if (who.grant_short) r.k.short_slack else r.k.grant_slack));
+        const d: i64 = if (who.finished) 0 else if (budget) |b| b else if (r.granted_depth)
+            (if (granted == 0 and who.granted != null) @min(cap, r.k.draft_slack) else cap)
+        else if (r.node_probabilities)
             @min(@as(i64, r.most_drafts), @max(1, who.draft_room - 1))
         else
             try r.depth(who.*);
         if (who.forced) return 0;
-        if (d != 0 and probe.copy(probe.ptr, who)) return 1;
+        if (d != 0 and !r.k.copy_arbitrate and probe.copy(probe.ptr, who)) return @intFromBool(!r.k.copy_first);
         return d;
     }
 
@@ -205,6 +221,11 @@ pub const Rule = struct {
     pub fn budgets(r: *Rule, whos: []Who, probe: Probe, sampled: bool, out: []i64) !void {
         if (r.confidence_floor != null) {
             for (whos, out) |*w, *o| o.* = try r.headDepth(w, null, probe);
+            return;
+        }
+        if (r.granted_depth) {
+            for (whos, out) |*w, *o| o.* = try r.headDepth(w, null, probe);
+            capPass(out, r.batch_rows);
             return;
         }
         if (r.node_probabilities) {
@@ -249,6 +270,15 @@ pub const Rule = struct {
             return;
         }
         for (whos, most, counts, out) |*w, m, c, *o| o.* = try r.headDepth(w, @min(m, @max(1, @as(i64, c))), probe);
+    }
+
+    /// Keep granted-depth holds within one shared drafter pass: each active block is cut to a common depth.
+    pub fn capPass(out: []i64, rows: u32) void {
+        var active: i64 = 0;
+        for (out) |d| active += @intFromBool(d > 0);
+        if (active == 0) return;
+        const depth_cap = @max(1, @divFloor(@as(i64, rows), active));
+        for (out) |*d| d.* = @min(d.*, depth_cap);
     }
 
     /// A shared round's ms beyond its forward at this many streams (the nearest measured count, first seen on ties).

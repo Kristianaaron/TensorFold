@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
+#include "../tf_vblock.cuh"
 // x3ld with gateup_epilogue / down_combine fused in its tail (TF_DSV41_X3LD_EPI=1, default off): 2 launches, same bits.
 
 // Preconditions (host binding checks): NT 8, gate/up mats 2, down mats 1, SK 1; down skips rows with no live slot.
@@ -81,11 +84,11 @@ __device__ __forceinline__ void epi_body(const half* __restrict__ X0, const half
                                          int SK, int maxm, int slots, const Epi& a) {
     static_assert(NT == 8, "a CTA's columns are one 128-column Hadamard block");
     // ---- ld_kernel<CB, NT, PD, LO, HI, 0>, verbatim but for the Z store in MODE 1 ----
-    const int u = blockIdx.x;
+    const int u = TF_VBID.x;
     const int MT = (maxm + 15) / 16;
-    const int mtile = blockIdx.z % MT;
-    const int split = (blockIdx.z / MT) % SK;
-    const int mat = blockIdx.z / MT / SK;
+    const int mtile = TF_VBID.z % MT;
+    const int split = (TF_VBID.z / MT) % SK;
+    const int mat = TF_VBID.z / MT / SK;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
 
     const int cnt = __ldcg(ucount);
@@ -106,7 +109,7 @@ __device__ __forceinline__ void epi_body(const half* __restrict__ X0, const half
     const int KT = K >> 4, NTILES = N >> 4;
     const int per_split = KT / SK, per_warp = per_split / W;
     const int kt0 = split * per_split + warp * per_warp;
-    const int nt0 = blockIdx.y * NT;
+    const int nt0 = TF_VBID.y * NT;
     uint32_t* stage = reinterpret_cast<uint32_t*>(&red[warp][0][0]);
 
     float acc[NT][2][4];
@@ -156,7 +159,7 @@ __device__ __forceinline__ void epi_body(const half* __restrict__ X0, const half
             red[warp][g + 8][col] = acc[i][h][2];
             red[warp][g + 8][col + 1] = acc[i][h][3];
         }
-    __syncthreads();
+    TF_TASK_SYNC();
 
     if constexpr (MODE == 0) {
         // ---- Z as ld_kernel stores it ----
@@ -171,15 +174,15 @@ __device__ __forceinline__ void epi_body(const half* __restrict__ X0, const half
         }
         // ---- the last of the mats x SK CTAs of (u, tile, block): gateup_epilogue for the tile's rows ----
         __threadfence();
-        __syncthreads();
+        TF_TASK_SYNC();
         if (threadIdx.x == 0) {
-            int* tk = a.ticket + ((size_t)u * MT + mtile) * gridDim.y + blockIdx.y;
-            const int arrivals = gridDim.z / MT;                     // mats x SK
+            int* tk = a.ticket + ((size_t)u * MT + mtile) * TF_VNBLK.y + TF_VBID.y;
+            const int arrivals = TF_VNBLK.z / MT;                     // mats x SK
             const int last = atomicAdd(tk, 1) == arrivals - 1;
             if (last) *tk = 0;                                       // every arrival is in: back to zero
             last_sh[0] = last;
         }
-        __syncthreads();
+        TF_TASK_SYNC();
         if (!last_sh[0]) return;
         __threadfence();
         for (int row = warp; row < 16; row += W) {
@@ -187,11 +190,11 @@ __device__ __forceinline__ void epi_body(const half* __restrict__ X0, const half
             if (p < 0) continue;
             const int ep = a.pick[p];
             if (ep < 0 || ep >= a.E) continue;                       // gateup_epilogue_kernel's exit
-            gateup_block(Z, ep, a.sv0, a.sv1, a.sd, a.xd, p, blockIdx.y, lane, P, N, SK, a.limit, a.act_mode);
+            gateup_block(Z, ep, a.sv0, a.sv1, a.sd, a.xd, p, TF_VBID.y, lane, P, N, SK, a.limit, a.act_mode);
         }
     } else {
         // ---- down_combine's per-slot part from the complete Z in shared memory (SK 1) ----
-        const int n = blockIdx.y * 128 + 4 * lane;
+        const int n = TF_VBID.y * 128 + 4 * lane;
         for (int row = warp; row < 16; row += W) {
             const int p = rows_sh[row];
             if (p < 0) continue;
@@ -214,7 +217,7 @@ __device__ __forceinline__ void epi_body(const half* __restrict__ X0, const half
         }
         // ---- a ticket per (row, block): the arrival of the row's last live slot combines it ----
         __threadfence();
-        __syncthreads();
+        TF_TASK_SYNC();
         if (threadIdx.x < 16) {
             int last = 0;
             const int p = rows_sh[threadIdx.x];
@@ -225,16 +228,16 @@ __device__ __forceinline__ void epi_body(const half* __restrict__ X0, const half
                     const int eq = a.pick[r * slots + q];
                     live += eq >= 0 && eq < a.E;
                 }
-                int* tk = a.ticket + (size_t)r * gridDim.y + blockIdx.y;
+                int* tk = a.ticket + (size_t)r * TF_VNBLK.y + TF_VBID.y;
                 last = atomicAdd(tk, 1) == live - 1;
                 if (last) *tk = 0;
             }
             last_sh[threadIdx.x] = last;
         }
-        __syncthreads();
+        TF_TASK_SYNC();
         bool fenced = false;
         OutT* out = reinterpret_cast<OutT*>(a.out);
-        const int d = blockIdx.y * 128 + threadIdx.x;                // a column a thread
+        const int d = TF_VBID.y * 128 + threadIdx.x;                // a column a thread
         for (int i = 0; i < 16; ++i) {
             if (!last_sh[i]) continue;                               // CTA-uniform
             if (!fenced) {
@@ -260,12 +263,15 @@ __device__ __forceinline__ void epi_body(const half* __restrict__ X0, const half
 #define DSV41_X3LD_EPI_PASS X0, X1, TP0, TP1, K2_0, K2_1, uids, ucount, members, Z, K, N, P, SK, maxm, slots, a
 #define DSV41_X3LD_EPI_INST(PD, LO, HI)                                                                             \
     extern "C" __global__ void __launch_bounds__(128, 3) dsv41_x3ld_epi_gu_##PD##_##LO##_##HI(DSV41_X3LD_EPI_ARGS) { \
+    TF_VBLOCK_ENTER(); \
         dsv41_x3ld_epi::epi_body<2, 8, PD, LO, HI, 0, float>(DSV41_X3LD_EPI_PASS);                               \
     }                                                                                                              \
     extern "C" __global__ void __launch_bounds__(128, 3) dsv41_x3ld_epi_dn_##PD##_##LO##_##HI(DSV41_X3LD_EPI_ARGS) { \
+    TF_VBLOCK_ENTER(); \
         dsv41_x3ld_epi::epi_body<2, 8, PD, LO, HI, 1, float>(DSV41_X3LD_EPI_PASS);                               \
     }                                                                                                              \
     extern "C" __global__ void __launch_bounds__(128, 3) dsv41_x3ld_epi_dnb_##PD##_##LO##_##HI(DSV41_X3LD_EPI_ARGS) { \
+    TF_VBLOCK_ENTER(); \
         dsv41_x3ld_epi::epi_body<2, 8, PD, LO, HI, 1, __nv_bfloat16>(DSV41_X3LD_EPI_PASS);                       \
     }
 DSV41_X3LD_EPI_INST(1, 8, 8)

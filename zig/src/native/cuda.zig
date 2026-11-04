@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! CUDA family registration, device setup, memory admission and the native lane host.
 const openDrama = @import("drama_open.zig").open;
 const std = @import("std");
@@ -5,6 +7,7 @@ const platform = @import("sys");
 const cuda = @import("cuda");
 const api = @import("engine_api");
 const lanes = @import("lanes");
+const lane_host_proposers_type = @typeInfo(@TypeOf(@as(api.LaneHost, undefined).proposers)).optional.child;
 const nemotron = @import("nemotron");
 const flashnext = @import("flashnext");
 const family_memory = @import("cuda_family_memory.zig");
@@ -13,6 +16,7 @@ const family_options = @import("cuda_options.zig");
 pub const follow = @import("cuda_follow.zig").follow;
 const lfm2 = @import("lfm2.zig");
 const glm = @import("glm_cuda");
+const glm53 = @import("glm53");
 const qwen35 = @import("qwen35");
 const kolibri1 = @import("kolibri1");
 const Allocator = std.mem.Allocator;
@@ -25,11 +29,11 @@ const vision_offer = @import("cuda_vision_offer.zig");
 const drafted = @import("cuda_drafted.zig");
 const kv_pages = @import("cuda_kv_pool.zig");
 /// CUDA families provide metadata, open their lane backend and explain their refusals.
-const registry = .{ nemotron.native, nemotron.omni, glm.native, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native };
+const registry = .{ nemotron.native, nemotron.omni, glm.native, glm53, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native };
 /// --record opens here (engines.zig refuses it for a backend without this).
 pub const records = true;
 pub const backends: []const []const u8 = &.{"cuda"};
-pub const serves: []const []const u8 = &.{ "--mtp-drafts", "--mtp-confidence", "--policy" };
+pub const serves: []const []const u8 = &.{ "--mtp-drafts", "--mtp-confidence", "--policy", "--manifest" };
 pub const families: []const api.Family = blk: {
     var out: [registry.len + 2]api.Family = undefined;
     for (registry, 0..) |F, i| out[i] = .{ .model_type = F.model_type, .formats = F.formats };
@@ -38,6 +42,24 @@ pub const families: []const api.Family = blk: {
     const final = out;
     break :blk &final;
 };
+
+test "CUDA native registry exposes the full GLM-5.3 DSA family" {
+    try std.testing.expectEqualStrings("glm_moe_dsa", glm53.model_type);
+    var registered = false;
+    inline for (registry) |family| {
+        if (std.mem.eql(u8, family.model_type, "glm_moe_dsa")) registered = true;
+    }
+    try std.testing.expect(registered);
+    var advertised = false;
+    for (families) |family| {
+        if (std.mem.eql(u8, family.model_type, "glm_moe_dsa")) {
+            advertised = true;
+            try std.testing.expectEqualSlices([]const u8, glm53.formats, family.formats);
+        }
+    }
+    try std.testing.expect(advertised);
+}
+
 const gib: f64 = 1 << 30;
 const cuda_device = @import("cuda_device.zig");
 pub const chip = cuda_device.chip;
@@ -65,6 +87,7 @@ pub const Host = struct {
     clock: lanes.backend.WallClock,
     core: lanes.Engine,
     host: api.LaneHost,
+    proposers: ?lane_host_proposers_type = null,
     startup: []u8 = &.{},
     lone: ?LoneRun = null, // the family's driver for a lone drafted stream, called with `family`
     store: ?*api.prompt_cache.Store = null, // kept Nemotron states; null when the budget is 0
@@ -123,8 +146,9 @@ pub const Host = struct {
         h.host.memory = if (h.gpu != null) .{ .read = family_memory.read } else null;
         h.host.explain = explain;
         h.host.health = h.health;
+        h.host.proposers = h.proposers;
         h.host.cache = h.store;
-        h.host.warm_quiet = if (info.warm_turns) nemotron.native.warm_quiet else 0;
+        h.host.warm_quiet = if (info.warm_turns) nemotron.native.warm_quiet else 0; // 150 ms, GLM-5.3's value too
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true, .logprobs = h.inner.vtable.first_row != null, .structures = h.inner.vtable.first_masked != null, .min_budget = nemotron.native.lone_min_budget, .resumes = true };
         if (h.learn != null) h.host.learner = h.learner();
         try h.host.start();
@@ -176,7 +200,9 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         return null;
     }
     if (std.mem.eql(u8, o.model_type, "fish_omni")) return openDrama(a, gpa, io, o, problem);
-    inline for (registry) |F| if (std.mem.eql(u8, o.model_type, F.model_type)) return openWith(F, a, gpa, io, o, problem);
+    inline for (registry) |F| {
+        if (std.mem.eql(u8, o.model_type, F.model_type)) return openWith(F, a, gpa, io, o, problem);
+    }
     if (std.mem.eql(u8, o.model_type, lfm2.family.model_type)) {
         if (refusals.lfm2(o)) |why| {
             problem.* = why;
@@ -194,16 +220,20 @@ const no_stream = "the CUDA memory budget fits no stream: one at a {d}-token win
 const too_many = "--parallel {d} needs {d:.2} GiB for its streams at a {d}-token window, " ++
     "and the CUDA memory budget leaves {d:.2} GiB{s}: serve --parallel {d}, or lower --context";
 fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
+    // Read the GLM warm-turn switch once for this startup; every other family's existing policy is unchanged.
+    const warm_turns_enabled = if (F == glm53) std.mem.eql(u8, getenv("TF_GLM53_WARM_TURNS") orelse "", "1") else true;
     if (refusals.family(F, o)) |why| {
         problem.* = why;
         return null;
     }
-    const native = modelContext(a, io, o.dir);
+    var native = modelContext(a, io, o.dir);
+    const manifest_cap = if (comptime @hasDecl(F, "contextCap")) try F.contextCap(a, io, o.dir, o.manifest) else null;
+    if (manifest_cap) |cap| native = if (native > 0) @min(native, cap) else cap;
     const window = contextWindow(o.context, native, F.default_context) catch |e| {
         problem.* = switch (e) {
             error.Negative => try std.fmt.allocPrint(a, "--context {d}: a token count, or 0 for the model's window", .{o.context.?}),
             error.NoNative => "--context 0 asks for the model's window, and its config.json names none: give a token count",
-            error.PastNative => try std.fmt.allocPrint(a, "--context {d} exceeds this model's {d}-token window", .{ o.context.?, native }),
+            error.PastNative => try std.fmt.allocPrint(a, "--context {d} exceeds this model's {d}-token window{s}", .{ o.context.?, native, if (manifest_cap != null) " (a --manifest caps it)" else "" }),
         };
         return null;
     };
@@ -380,6 +410,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
     h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = served.backend, .served = served, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined, .lone = if (@hasField(L, "lone")) loaded.lone else null };
+    if (@hasField(L, "proposer_ctx")) {
+        if (loaded.proposer_ctx) |ctx| h.proposers = .{ .ctx = ctx, .make = loaded.proposer_make.?, .free = loaded.proposer_free.? };
+    }
     h.readiness(F);
     const held = served.stream_bytes * (streams -| free);
     const kept = kv_pages.kept(F, loaded, paged, o, room, held, host_budget, host_cache);
@@ -397,7 +430,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         // rules and budget from the family's snap_* declarations (cuda_snaps.zig)
         const image: ?*const pc.rows.Image = if (F == nemotron.native) &cuda_disk.image else null; // its disk rows
         const copies: pc.Snapshots = .{ .ptr = loaded.target, .vtable = &snaps.Snaps(F, image).vtable };
-        store.* = pc.Store.init(gpa, copies, snaps.cacheRules(F), if (@hasDecl(F, "snap_slots")) cache else try snaps.cacheBudget(F, loaded.target, cache));
+        var cache_rules = snaps.cacheRules(F);
+        if (!warm_turns_enabled) cache_rules.warm = .off; // GLM-5.3 with the switch off keeps its rules byte-identical
+        store.* = pc.Store.init(gpa, copies, cache_rules, if (@hasDecl(F, "snap_slots")) cache else try snaps.cacheBudget(F, loaded.target, cache));
         errdefer {
             const disk = store.disk;
             store.deinit();
@@ -448,10 +483,11 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         .startup = h.startup,
         .policy = if (@hasField(@TypeOf(loaded), "policy")) loaded.policy else "",
         .prompt_cache = h.store != null,
-        .warm_turns = h.store != null and @hasDecl(F, "warm_quiet"),
+        .warm_turns = warm_turns_enabled and @hasDecl(F, "warm_quiet") and (h.store != null or F == glm53), // GLM-5.3 keeps its prompt resident itself
         .logprobs = served.backend.vtable.first_row != null,
         .prompt_logprobs = served.backend.vtable.prompt_rows,
         .structures = served.backend.vtable.first_masked != null,
+        .ablate = if (@hasField(@TypeOf(loaded), "ablate")) loaded.ablate else false,
         .vision = if (@hasField(@TypeOf(loaded), "vision")) vision_offer.offer(loaded.vision, o.vision) else null,
         .admit = admit,
         .slide_conversations = conversations,

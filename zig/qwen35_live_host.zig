@@ -1,7 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! Live graph capacities and actual projection/scan launches, using a recording driver rather than GPU execution.
 const std = @import("std");
 const q = @import("qwen35");
 const cuda = @import("cuda");
+/// lanes.cost_rule.reps: each of the 64 live widths is timed that many times.
+const reps = 7;
 const Shape = q.engine.Engine.Shape;
 
 test "a lone window does not launch the widest row and stream capacity" {
@@ -120,10 +124,10 @@ test "startup warms shared shapes once but measures all live widths independentl
     try q.native.warm.time(std.testing.io, &probe, &probe, &cache, &seen);
     var calls: usize = 0;
     for (probe.calls) |n| calls += n;
-    try std.testing.expectEqual(@as(usize, 74), calls);
-    try std.testing.expectEqual(@as(usize, 3), probe.calls[1]);
-    try std.testing.expectEqual(@as(usize, 3), probe.calls[2]);
-    try std.testing.expectEqual(@as(usize, 1), probe.calls[3]);
+    try std.testing.expectEqual(@as(usize, 10 + 64 * reps), calls);
+    try std.testing.expectEqual(@as(usize, 2 + reps), probe.calls[1]);
+    try std.testing.expectEqual(@as(usize, 2 + reps), probe.calls[2]);
+    try std.testing.expectEqual(@as(usize, reps), probe.calls[3]);
     for (probe.costs) |measured| try std.testing.expect(measured);
     try std.testing.expectEqual(@as(usize, 5), seen.len);
     for (1..65) |rows| try std.testing.expect(seen.contains(Shape.init(rows, 1, true, true, 1)));
@@ -150,8 +154,8 @@ test "shared warmups count actual passes without replacing any width measurement
     try q.native.warm.time(std.testing.io, &probe, &probe, &cache, &seen);
     var calls: usize = 0;
     for (probe.calls) |n| calls += n;
-    try std.testing.expectEqual(@as(usize, 73), calls);
-    try std.testing.expectEqual(@as(usize, 2), probe.calls[1]);
+    try std.testing.expectEqual(@as(usize, 9 + 64 * reps), calls);
+    try std.testing.expectEqual(@as(usize, 1 + reps), probe.calls[1]);
     try std.testing.expect(!cache.advanced);
     for (probe.costs) |measured| try std.testing.expect(measured);
 }

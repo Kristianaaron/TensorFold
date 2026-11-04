@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Kristian Aaron (Krishando). Original: ashhart/TensorFold@d1018b318 (Apache-2.0).
 //! Copy proposals from a stream's own context (Python SuffixLookupProposer) behind a small proposer interface.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -12,10 +14,11 @@ pub const Proposer = struct {
         propose_after: ?*const fn (ptr: *anyopaque, history: []const u32, tail: []const u32, max_draft: i64) anyerror![]const u32 = null,
         last_match: *const fn (ptr: *anyopaque) i64,
         observe: ?*const fn (ptr: *anyopaque, proposed: i64, accepted: i64) void = null,
+        landing: ?*const fn (ptr: *anyopaque) f64 = null,
         /// The proposer prices its own drafts: `propose`'s result is taken as is, no width, length or match gate.
         priced: bool = false,
         /// Every non-forced round of the stream, whatever drafted it: the window's rows and its drafts kept.
-        round: ?*const fn (ptr: *anyopaque, rows: u32, kept: u32) void = null,
+        round: ?*const fn (ptr: *anyopaque, rows: u32, kept: u32, suffix_used: bool) void = null,
     };
 
     /// Tokens valid until the next `propose`.
@@ -37,8 +40,13 @@ pub const Proposer = struct {
         if (p.vtable.observe) |f| f(p.ptr, proposed, accepted);
     }
 
-    pub fn round(p: Proposer, rows: u32, kept: u32) void {
-        if (p.vtable.round) |f| f(p.ptr, rows, kept);
+    pub fn landing(p: Proposer) ?f64 {
+        const get = p.vtable.landing orelse return null;
+        return get(p.ptr);
+    }
+
+    pub fn round(p: Proposer, rows: u32, kept: u32, suffix_used: bool) void {
+        if (p.vtable.round) |f| f(p.ptr, rows, kept, suffix_used);
     }
 };
 
