@@ -81,6 +81,7 @@ fn parseExpertRowsAdapt(raw: ?[]const u8) !usize {
     if (std.mem.eql(u8, v, "0")) return 0;
     if (std.mem.eql(u8, v, "2048")) return 2048;
     if (std.mem.eql(u8, v, "4096")) return 4096;
+    if (std.mem.eql(u8, v, "8192")) return 8192;
     return error.BadExpertRowsAdapt;
 }
 
@@ -1008,8 +1009,45 @@ const Gpu = struct {
         g.lane = try cuda.qmmf.Lane.load(g.d, (try ctx.capability()) / 10);
         if (g.setup.geometry.pre_fuse != .off or g.setup.geometry.prep_fuse != .off) try g.lane.loadGroup();
         g.ex = try cuda.exl3_experts.Experts.loadWith(g.d, if (std.c.getenv("TF_GLM53_MOE_NOALLOC")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false);
+        const rot_w4_raw = std.c.getenv("TF_GLM53_ROT_W4");
+        const rot_w4 = if (rot_w4_raw) |rot_value| blk: {
+            const rot_setting = std.mem.span(rot_value);
+            if (std.mem.eql(u8, rot_setting, "0")) break :blk false;
+            if (std.mem.eql(u8, rot_setting, "1")) break :blk true;
+            return error.BadRotW4;
+        } else false;
+        g.ex.rot_w4 = rot_w4;
+        if (rot_w4) std.log.info("TF_GLM53_ROT_W4=1: prompt routed rotation as one CTA a pair", .{});
         if (g.setup.geometry.prompt_experts_pmx) g.ex.pmx = try cuda.exl3_experts.pmx.Pmx.load(g.d);
+        if (std.c.getenv("TF_GLM53_GU_MB")) |gu_value| {
+            const gu_setting = std.mem.span(gu_value);
+            if (std.mem.eql(u8, gu_setting, "1")) {
+                if (g.ex.pmx) |*px| try px.useGuMb() else return error.GuMbNeedsPmx;
+                std.log.info("TF_GLM53_GU_MB=1: prompt routed gate/up through a 5-slot mbarrier ring", .{});
+            } else if (!std.mem.eql(u8, gu_setting, "0")) return error.BadGuMb;
+        }
         if (g.setup.geometry.prompt_experts_p5a) g.ex.p5a = try cuda.exl3_experts.p5a.P5a.load(g.d);
+        if (std.c.getenv("TF_GLM53_GU_W8S")) |w8s_value| {
+            const w8s_setting = std.mem.span(w8s_value);
+            if (std.mem.eql(u8, w8s_setting, "2")) {
+                if (!g.setup.geometry.prompt_experts_p5a) return error.GuW8sNeedsP5a;
+                g.ex.w8s = true;
+                g.ex.w8s_all = true;
+                std.log.info("TF_GLM53_GU_W8S=2: prompt routed gate/up of all items on e4m3 activations (changes output bits)", .{});
+            } else if (std.mem.eql(u8, w8s_setting, "1")) {
+                if (!g.setup.geometry.prompt_experts_p5a) return error.GuW8sNeedsP5a;
+                g.ex.w8s = true;
+                std.log.info("TF_GLM53_GU_W8S=1: prompt routed gate/up of large items on e4m3 activations (changes output bits)", .{});
+            } else if (!std.mem.eql(u8, w8s_setting, "0")) return error.BadGuW8s;
+        }
+        if (std.c.getenv("TF_GLM53_DOWN_W8S")) |dw_value| {
+            const dw_setting = std.mem.span(dw_value);
+            if (std.mem.eql(u8, dw_setting, "1")) {
+                if (!g.ex.w8s) return error.DownW8sNeedsGuW8s;
+                g.ex.down_w8s = true;
+                std.log.info("TF_GLM53_DOWN_W8S=1: prompt routed down of large items on e4m3 activations (changes output bits)", .{});
+            } else if (!std.mem.eql(u8, dw_setting, "0")) return error.BadDownW8s;
+        }
         g.mods[0] = try cuda.Module.load(g.d, cuda.kernels.glm_glue);
         g.module_count = 1;
         for ([_][]const u8{ "glm53_glue", "glm53_mla", "glm53_index", "glm53_head" }, 1..) |name, i| {
@@ -1029,6 +1067,13 @@ const Gpu = struct {
             var w8a8_mod = try loadImage(g.gpa, g.io, g.d, o.fatbins, "glm53_w8a8");
             errdefer w8a8_mod.unload();
             g.w8a8 = try cuda.w8a8.Kernels.fromModule(w8a8_mod);
+            if (std.c.getenv("TF_GLM53_W8_M64")) |m64_value| {
+                const m64_setting = std.mem.span(m64_value);
+                if (std.mem.eql(u8, m64_setting, "1")) {
+                    try g.w8a8.useM64();
+                    std.log.info("TF_GLM53_W8_M64=1: prefill W8A8 GEMM on 64-row tiles, two CTAs an SM", .{});
+                } else if (!std.mem.eql(u8, m64_setting, "0")) return error.BadW8M64;
+            }
             g.w8a8_live = true;
             g.k.w8a8 = g.w8a8.fns;
         }
@@ -1417,7 +1462,8 @@ fn prefillChecked(e: *engine.Engine, ids: []const u32) !u32 {
     var token: u32 = 0;
     while (at < ids.len) {
         try checkStop();
-        const end = @min(ids.len, at + forward.prefill_chunk_rows);
+        // The engine splits a prompt by its own chunk_rows; hand it whole chunks so --chunk-rows 8192 runs 8192-row chunks.
+        const end = @min(ids.len, at + @max(@as(usize, forward.prefill_chunk_rows), e.f.chunk_rows));
         token = try e.prefill(ids[at..end]);
         at = end;
     }

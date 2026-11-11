@@ -178,6 +178,30 @@ __device__ __forceinline__ uint32_t decode2(uint32_t s0, uint32_t s1) {
     }
 }
 
+// The two e4m3 codes decode2<CB_MCG_E4M3> rounds to, low byte = s0, high byte = s1.
+// Stops before the f16 widen (cvt.rn.f16x2.e4m3x2, or e4m3_value + float2half on the fallback).
+// The mcg pair above that round is the same arithmetic as decode2.
+__device__ __forceinline__ uint32_t decode2_e4m3_codes(uint32_t s0, uint32_t s1) {
+    uint32_t x0 = s0 * 0xCBAC1FEDu;
+    uint32_t x1 = s1 * 0xCBAC1FEDu;
+    x0 = (x0 & 0x8FFF8FFFu) ^ 0x3B603B60u;
+    x1 = (x1 & 0x8FFF8FFFu) ^ 0x3B603B60u;
+    const uint32_t lo = __byte_perm(x0, x1, 0x5410);
+    const uint32_t hi = __byte_perm(x0, x1, 0x7632);
+    const half2 summed = __hadd2(*reinterpret_cast<const half2*>(&lo), *reinterpret_cast<const half2*>(&hi));
+    const uint32_t out = *reinterpret_cast<const uint32_t*>(&summed);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+    uint16_t codes;
+    asm volatile("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;\n" : "=h"(codes) : "r"(out));
+    return codes;
+#else
+    const half2 h = *reinterpret_cast<const half2*>(&out);
+    const float a = __half2float(__low2half(h));
+    const float b = __half2float(__high2half(h));
+    return (uint32_t)round_e4m3(a) | ((uint32_t)round_e4m3(b) << 8);
+#endif
+}
+
 // This lane's 8 values of a tile as the B fragments of the tile's two n8 halves (columns 0-7 in b0, 8-15 in b1).
 template <int K2, int CB>
 __device__ __forceinline__ void decode_lane(const uint32_t (&w)[lane_words<K2>()], int lane, uint32_t (&b0)[2],

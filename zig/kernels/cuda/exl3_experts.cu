@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 #include "exl3_decode.cuh"
 
@@ -337,6 +338,222 @@ __device__ __forceinline__ void tf_exl3_experts_rot_in_task(const RotInArgs a) {
 extern "C" __global__ void tf_exl3_experts_rot_in(const RotInArgs a) {
     TF_VBLOCK_ENTER();
     tf_exl3_experts_rot_in_task(a);
+}
+
+// ROT-W4: one CTA a pair, block 128. Warp w rotates matrix (w & 1) and the 128-K blocks (w >> 1), (w >> 1) + 2, ...
+// U blocks a pass: every load of the pass first, then the transforms, then the stores. Same per-element arithmetic as rot_in.
+template <int U>
+__device__ __forceinline__ void tf_exl3_experts_rot_in_w4_pair(const RotInArgs& a, const int p) {
+    const int e = a.pick[p];
+    if (e < 0 || e >= a.experts) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int mat = warp & 1, first = warp >> 1;
+    const int nblk = a.k / 128;
+    const int row = p / a.slots;
+    const half* suh_base = (mat ? a.suh1 : a.suh0) + (size_t)e * a.k + 4 * lane;
+    const uint16_t* x_base = reinterpret_cast<const uint16_t*>(a.x) + (size_t)row * a.x_stride + 4 * lane;
+    half* o_base = (mat ? a.out1 : a.out0) + (size_t)p * a.k + 4 * lane;
+    for (int b0 = first; b0 < nblk; b0 += 2 * U) {
+        float v[U][4];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int blk = b0 + 2 * u;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) v[u][j] = 0.f;
+            if (blk < nblk) {
+                const half* suh = suh_base + blk * 128;
+                const uint16_t* xr = x_base + blk * 128;
+                if (a.x_dtype == 1) {
+                    const __nv_bfloat16* xv = reinterpret_cast<const __nv_bfloat16*>(xr);
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) v[u][j] = __bfloat162float(xv[j]) * __half2float(suh[j]);
+                } else {
+                    const half* xv = reinterpret_cast<const half*>(xr);
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) v[u][j] = __half2float(xv[j]) * __half2float(suh[j]);
+                }
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u)
+            if (b0 + 2 * u < nblk) fwht128(v[u], lane);
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int blk = b0 + 2 * u;
+            if (blk < nblk) {
+                half* o = o_base + blk * 128;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[u][j] * HAD_SCALE);
+            }
+        }
+    }
+}
+extern "C" __global__ void tf_exl3_experts_rot_in_w4u4(const RotInArgs a) { TF_VBLOCK_ENTER(); tf_exl3_experts_rot_in_w4_pair<4>(a, TF_VBID.x); }
+// TF_GLM53_GU_W8S companion: rot_in_w4's fp16 rotation for the pairs of small items only (<= 64 members, the p5a
+// gate/up). Grid (items, 4): CTA y takes members y, y + 4, ... of its item. Same per-element arithmetic as rot_in.
+struct RotInSmallArgs {
+    RotInArgs r;
+    const int* items; // int32 [items][3]: expert, first member, count
+    const int* counts; // counts[0]: items
+    const int* members; // int32 pair indices
+};
+extern "C" __global__ void tf_exl3_experts_rot_in_w4s(const RotInSmallArgs a) {
+    TF_VBLOCK_ENTER();
+    const int item = TF_VBID.x;
+    if (item >= a.counts[0]) return;
+    const int off = a.items[item * 3 + 1], cnt = a.items[item * 3 + 2];
+    if (cnt > 64) return;
+    for (int j = TF_VBID.y; j < cnt; j += 4) tf_exl3_experts_rot_in_w4_pair<4>(a.r, a.members[off + j]);
+}
+// Same Hadamard as rot_in, then one e4m3 code per element and one fp32 scale per 128-K block.
+// scale = amax/448 of the fp32 values still in registers after fwht128 (1 when the block is zero).
+// Byte j of a lane's word is K element 4*lane+j, in K order. The gate/up consumer widens that order.
+struct RotInA8Args {
+    const void* x;
+    int x_stride;
+    int x_dtype;
+    const int* pick;
+    const half* suh0;
+    const half* suh1;
+    uint8_t* out0;
+    uint8_t* out1;
+    float* sc0;
+    float* sc1;
+    int k, slots, experts;
+    // rot_in_w8s only. 0: codes of pair p at byte p * k, its scale at sc[p]. Else codes at byte p * ostride of out
+    // and the scale at byte p * ostride of sc (the engine keeps both inside the pair's fp16 slot).
+    int ostride;
+};
+
+__device__ __forceinline__ uint8_t ra8_quant(float x) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+    return static_cast<uint8_t>(__nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3));
+#else
+    return round_e4m3(x);
+#endif
+}
+
+__device__ __forceinline__ void tf_exl3_experts_rot_in_a8_task(const RotInA8Args a) {
+    const int p = TF_VBID.x, blk = TF_VBID.y, mat = TF_VBID.z;
+    const int e = a.pick[p];
+    if (e < 0 || e >= a.experts) return;
+    const int lane = threadIdx.x;
+    const int row = p / a.slots;
+    const half* suh = (mat ? a.suh1 : a.suh0) + (size_t)e * a.k + blk * 128 + 4 * lane;
+    const uint16_t* xr = reinterpret_cast<const uint16_t*>(a.x) + (size_t)row * a.x_stride + blk * 128 + 4 * lane;
+    float v[4];
+    if (a.x_dtype == 1) {
+        const __nv_bfloat16* xv = reinterpret_cast<const __nv_bfloat16*>(xr);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) v[j] = __bfloat162float(xv[j]) * __half2float(suh[j]);
+    } else {
+        const half* xv = reinterpret_cast<const half*>(xr);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) v[j] = __half2float(xv[j]) * __half2float(suh[j]);
+    }
+    fwht128(v, lane);
+    float scaled[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) scaled[j] = v[j] * HAD_SCALE;
+    float amax = fmaxf(fmaxf(fabsf(scaled[0]), fabsf(scaled[1])), fmaxf(fabsf(scaled[2]), fabsf(scaled[3])));
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    const float scale = amax > 0.0f ? amax / 448.0f : 1.0f;
+    const int blocks = a.k >> 7;
+    if (lane == 0) (mat ? a.sc1 : a.sc0)[(size_t)p * blocks + blk] = scale;
+    uint32_t code_word = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) code_word |= static_cast<uint32_t>(ra8_quant(scaled[j] / scale)) << (8 * j);
+    uint8_t* o = (mat ? a.out1 : a.out0) + (size_t)p * a.k + blk * 128 + 4 * lane;
+    *reinterpret_cast<uint32_t*>(o) = code_word;
+}
+
+extern "C" __global__ void tf_exl3_experts_rot_in_a8(const RotInA8Args a) {
+    TF_VBLOCK_ENTER();
+    tf_exl3_experts_rot_in_a8_task(a);
+}
+
+// GU-W8S rotation. One 512-thread CTA per (pair, matrix): warp w rotates 128-K blocks w, w+16, w+32 and
+// keeps them in registers, so the CTA sees the whole row before it rounds. One fp32 scale per (pair, matrix):
+// amax/448 over all K (1 when the row is zero), written to sc[p]. The gate/up epilogue applies it once.
+// Codes are stored K-permuted inside every 16-K tile: byte 4*t+i holds K 2*t + (i & 1) + 8 * (i >> 1).
+// That is the order one lane's two decode pairs come out in, so the gate/up A register needs no shuffle.
+constexpr int W8S_WARPS = 16;
+constexpr int W8S_BLK = 3;
+
+__device__ __forceinline__ void tf_exl3_experts_rot_in_w8s_task(const RotInA8Args a, float* amax_sh) {
+    const int p = TF_VBID.x, mat = TF_VBID.y;
+    const int e = a.pick[p];
+    if (e < 0 || e >= a.experts) return;
+    const int blocks = a.k >> 7;
+    if (blocks > W8S_WARPS * W8S_BLK) __trap();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = p / a.slots;
+    const half* suh_row = (mat ? a.suh1 : a.suh0) + (size_t)e * a.k;
+    const uint16_t* x_row = reinterpret_cast<const uint16_t*>(a.x) + (size_t)row * a.x_stride;
+    float v[W8S_BLK][4];
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < W8S_BLK; ++i) {
+        const int blk = warp + W8S_WARPS * i;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) v[i][j] = 0.0f;
+        if (blk < blocks) {
+            const half* suh = suh_row + blk * 128 + 4 * lane;
+            const uint16_t* xr = x_row + blk * 128 + 4 * lane;
+            if (a.x_dtype == 1) {
+                const __nv_bfloat16* xv = reinterpret_cast<const __nv_bfloat16*>(xr);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) v[i][j] = __bfloat162float(xv[j]) * __half2float(suh[j]);
+            } else {
+                const half* xv = reinterpret_cast<const half*>(xr);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) v[i][j] = __half2float(xv[j]) * __half2float(suh[j]);
+            }
+            fwht128(v[i], lane);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                v[i][j] *= HAD_SCALE;
+                amax = fmaxf(amax, fabsf(v[i][j]));
+            }
+        }
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    if (lane == 0) amax_sh[warp] = amax;
+    __syncthreads();
+    float all = lane < W8S_WARPS ? amax_sh[lane] : 0.0f;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) all = fmaxf(all, __shfl_xor_sync(0xffffffffu, all, o));
+    const float scale = all > 0.0f ? all / 448.0f : 1.0f;
+    if (threadIdx.x == 0) {
+        float* sc = mat ? a.sc1 : a.sc0;
+        if (a.ostride) *reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(sc) + (size_t)p * a.ostride) = scale;
+        else sc[p] = scale;
+    }
+    const float inv = 1.0f / scale;
+    uint8_t* out_row = (mat ? a.out1 : a.out0) + (size_t)p * (a.ostride ? a.ostride : a.k);
+    const int w = lane & 3, base = lane & ~3, sh = (lane & 1) * 16;
+#pragma unroll
+    for (int i = 0; i < W8S_BLK; ++i) {
+        const int blk = warp + W8S_WARPS * i;
+        if (blk < blocks) {
+            uint32_t code_word = 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) code_word |= static_cast<uint32_t>(ra8_quant(v[i][j] * inv)) << (8 * j);
+            // Word w of a tile is K 2w, 2w+1 (lane w>>1, half w&1) then K 2w+8, 2w+9 (lane 2 + (w>>1), same half).
+            const uint32_t wa = __shfl_sync(0xffffffffu, code_word, base | (w >> 1));
+            const uint32_t wb = __shfl_sync(0xffffffffu, code_word, base | 2 | (w >> 1));
+            const uint32_t word = ((wa >> sh) & 0xffffu) | (((wb >> sh) & 0xffffu) << 16);
+            *reinterpret_cast<uint32_t*>(out_row + blk * 128 + 4 * lane) = word;
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(512) tf_exl3_experts_rot_in_w8s(const RotInA8Args a) {
+    TF_VBLOCK_ENTER();
+    __shared__ float amax_sh[W8S_WARPS];
+    tf_exl3_experts_rot_in_w8s_task(a, amax_sh);
 }
 
 __device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }

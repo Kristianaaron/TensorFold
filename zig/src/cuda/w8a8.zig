@@ -78,9 +78,17 @@ pub fn gemmBlocks(m: usize, n: usize) usize {
 }
 
 /// The two kernels of one call; a value type so Forward's kernel table can hold it (the module stays with Kernels).
+pub const gemm_m64_symbol: [:0]const u8 = "tf_glm53_w8a8_gemm_m64";
+pub const m64_tile_m: usize = 64;
+/// 4 ring stages of a 64-row activation tile (4,096 B) and a 128-column weight tile (8,192 B).
+pub const m64_shared: u32 = 4 * (64 * 64 + 128 * 64);
+
 pub const Fns = struct {
     quant: Function,
     gemm: Function,
+    /// Dynamic shared memory and row-tile height of `gemm` (the release kernel unless Kernels.useM64 ran).
+    gemm_smem: u32 = shared_bytes,
+    gemm_tile_m: usize = tile_m,
 
     /// x bf16 [m][ldx] -> xq e4m3 [m][k] (fragment K order), xs fp32 [k/128][m].
     pub fn quantize(f: Fns, s: Stream, x: u64, ldx: usize, m: usize, k: usize, xq: u64, xs: u64) !void {
@@ -111,7 +119,9 @@ pub const Fns = struct {
         a.add(@as(i32, @intCast(w.n)));
         a.add(@as(i32, @intCast(w.k)));
         a.add(@as(i32, if (out == .f32) 1 else 0));
-        try launch_.launch(f.gemm, .{ .grid = .{ .x = @intCast(gemmBlocks(m, w.n)), .y = 1, .z = 1 }, .block = .{ .x = threads, .y = 1, .z = 1 }, .shared = shared_bytes }, s, &a);
+        const cols: usize = @intCast(w.n);
+        const blocks = ((m + f.gemm_tile_m - 1) / f.gemm_tile_m) * ((cols + tile_n - 1) / tile_n);
+        try launch_.launch(f.gemm, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = threads, .y = 1, .z = 1 }, .shared = f.gemm_smem }, s, &a);
     }
 
     /// Quantize then multiply: the same inputs and output as qmmf's matmulOut, scratch in place of its partials.
@@ -143,6 +153,16 @@ pub const Kernels = struct {
         const gemm = try mod.function(gemm_symbol);
         try gemm.allowDynamicShared(shared_bytes);
         return .{ .mod = mod, .fns = .{ .quant = try mod.function(quant_symbol), .gemm = gemm } };
+    }
+
+    /// TF_GLM53_W8_M64=1: the GEMM becomes tf_glm53_w8a8_gemm_m64 (64-row tiles, 49,152 B, two CTAs an SM; the
+    /// same products, K order and fma chain a row, so the same bits). Call before copying `fns`.
+    pub fn useM64(k: *Kernels) !void {
+        const f = try k.mod.function(gemm_m64_symbol);
+        try f.allowDynamicShared(m64_shared);
+        k.fns.gemm = f;
+        k.fns.gemm_smem = m64_shared;
+        k.fns.gemm_tile_m = m64_tile_m;
     }
 
     pub fn unload(k: *Kernels) void {
@@ -259,6 +279,7 @@ test "host quantizer: per-block amax / 448, codes in xq order, zero blocks scale
 
 test "launch geometry, scratch and the weights the kernel takes" {
     try std.testing.expectEqual(@as(u32, 65536), shared_bytes);
+    try std.testing.expectEqual(@as(u32, 49152), m64_shared);
     try std.testing.expectEqual(@as(usize, 192), gemmBlocks(512, 6144));
     try std.testing.expectEqual(@as(usize, 48), gemmBlocks(1, 6144));
     try std.testing.expectEqual(@as(usize, 768), gemmBlocks(2048, 6144));

@@ -122,6 +122,25 @@ pub fn scratch(base: u64, l: Layer, rows: usize, slots: usize) !Scratch {
     return .{ .xg = xg, .xu = xu, .xd = xd, .z = z, .y = y, .ids = ids, .count = count, .members = members, .rows = rows, .slots = slots };
 }
 
+/// e4m3 codes [P, K] and fp32 scales [P, K/128] for gate (0) and up (1). One kernel parameter, matching RotInA8Args.
+pub const RotA8Args = extern struct {
+    x: u64 = 0,
+    x_stride: i32 = 0,
+    x_dtype: i32 = 0,
+    pick: u64 = 0,
+    suh0: u64 = 0,
+    suh1: u64 = 0,
+    out0: u64 = 0,
+    out1: u64 = 0,
+    sc0: u64 = 0,
+    sc1: u64 = 0,
+    k: i32 = 0,
+    slots: i32 = 0,
+    experts: i32 = 0,
+    /// rot_in_w8s only. 0: codes at p * k, scale at sc[p]. Else codes and scale at byte p * ostride of out and sc.
+    ostride: i32 = 0,
+};
+
 /// The loaded kernels.
 pub const Experts = struct {
     mod: Module,
@@ -129,6 +148,18 @@ pub const Experts = struct {
     router: grouped.Router,
     group: Function,
     rot_in: Function,
+    rot_in_w4: Function = undefined,
+    /// TF_GLM53_ROT_W4: prompt rot_in runs as one 128-thread CTA a pair (same bits).
+    rot_w4: bool = false,
+    /// TF_GLM53_GU_W8S: =10's large items run e4m3 x e4m3 (rot_in_w8s codes, gu_w8s); small items keep fp16 p5a
+    /// behind rot_in_w4s. Changes output bits.
+    w8s: bool = false,
+    /// TF_GLM53_GU_W8S=2: small items run gu_w8s too; no rot_in_w4s and no p5a gate/up launch.
+    w8s_all: bool = false,
+    /// TF_GLM53_DOWN_W8S=1 (needs w8s): items > 64 members run the routed down as e4m3 x e4m3 (pmx xd_w8s + down_w8s);
+    /// small items keep the fp16 p5a down. Changes output bits.
+    down_w8s: bool = false,
+    rot_in_w4s: Function = undefined,
     grouped: [4]Function, // one per codebook
     gateup: Function,
     down_combine: Function,
@@ -137,6 +168,8 @@ pub const Experts = struct {
     p5a: ?p5a.P5a = null,
     plan_rotate: Function = undefined,
     plan_finish: Function = undefined,
+    rot_in_a8: Function = undefined,
+    rot_in_w8s: Function = undefined,
 
     pub fn load(d: *const Driver) !Experts {
         return loadWith(d, false);
@@ -165,6 +198,10 @@ pub const Experts = struct {
         e.group = try e.mod.function("tf_exl3_group");
         try e.group.allowDynamicShared(group_dynamic_shared_bytes);
         e.rot_in = try e.mod.function("tf_exl3_experts_rot_in");
+        e.rot_in_w4 = try e.mod.function("tf_exl3_experts_rot_in_w4u4");
+        e.rot_in_a8 = try e.mod.function("tf_exl3_experts_rot_in_a8");
+        e.rot_in_w8s = try e.mod.function("tf_exl3_experts_rot_in_w8s");
+        e.rot_in_w4s = try e.mod.function("tf_exl3_experts_rot_in_w4s");
         e.grouped = if (noalloc) .{
             try e.mod.function("tf_exl3_grouped_noalloc_0"),
             try e.mod.function("tf_exl3_grouped_noalloc_1"),
@@ -370,4 +407,22 @@ test "the scratch layout is 256-aligned and covered by scratchBytes" {
     try std.testing.expectEqual(@as(u64, 0), sc.count % 256);
     try std.testing.expectEqual(@as(u64, 0), sc.members % 256);
     try std.testing.expectEqual(@as(usize, @intFromPtr(&buf) + bytes), sc.members + @as(usize, 9) * 64 * 4);
+}
+
+test "RotA8Args layout matches the CUDA struct" {
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(RotA8Args, "x"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(RotA8Args, "x_stride"));
+    try std.testing.expectEqual(@as(usize, 12), @offsetOf(RotA8Args, "x_dtype"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(RotA8Args, "pick"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(RotA8Args, "suh0"));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(RotA8Args, "suh1"));
+    try std.testing.expectEqual(@as(usize, 40), @offsetOf(RotA8Args, "out0"));
+    try std.testing.expectEqual(@as(usize, 48), @offsetOf(RotA8Args, "out1"));
+    try std.testing.expectEqual(@as(usize, 56), @offsetOf(RotA8Args, "sc0"));
+    try std.testing.expectEqual(@as(usize, 64), @offsetOf(RotA8Args, "sc1"));
+    try std.testing.expectEqual(@as(usize, 72), @offsetOf(RotA8Args, "k"));
+    try std.testing.expectEqual(@as(usize, 76), @offsetOf(RotA8Args, "slots"));
+    try std.testing.expectEqual(@as(usize, 80), @offsetOf(RotA8Args, "experts"));
+    try std.testing.expectEqual(@as(usize, 84), @offsetOf(RotA8Args, "ostride"));
+    try std.testing.expectEqual(@as(usize, 88), @sizeOf(RotA8Args));
 }

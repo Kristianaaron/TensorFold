@@ -211,6 +211,7 @@ pub fn parseExpertRowsAdapt(raw: ?[]const u8) !usize {
     if (std.mem.eql(u8, value, "0")) return 0;
     if (std.mem.eql(u8, value, "2048")) return 2048;
     if (std.mem.eql(u8, value, "4096")) return 4096;
+    if (std.mem.eql(u8, value, "8192")) return 8192;
     return error.BadExpertRowsAdapt;
 }
 
@@ -1026,6 +1027,48 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     const gather_ovl_raw = std.c.getenv("TF_GLM53_GATHER_OVL");
     const gather_ovl = try forward.parseGatherOvl(if (gather_ovl_raw) |v| std.mem.span(v) else null);
     if (gather_ovl != 0) std.log.info("TF_GLM53_GATHER_OVL=1: cover the final grouped-prefill attention gather with deferred shared expert MLPs", .{});
+    const rot_w4_raw = std.c.getenv("TF_GLM53_ROT_W4");
+    const rot_w4 = if (rot_w4_raw) |rot_value| blk: {
+        const rot_setting = std.mem.span(rot_value);
+        if (std.mem.eql(u8, rot_setting, "0")) break :blk false;
+        if (std.mem.eql(u8, rot_setting, "1")) break :blk true;
+        return error.BadRotW4;
+    } else false;
+    if (rot_w4) std.log.info("TF_GLM53_ROT_W4=1: prompt routed rotation as one CTA a pair", .{});
+    const gu_mb_raw = std.c.getenv("TF_GLM53_GU_MB");
+    const gu_mb = if (gu_mb_raw) |gu_value| blk: {
+        const gu_setting = std.mem.span(gu_value);
+        if (std.mem.eql(u8, gu_setting, "0")) break :blk false;
+        if (std.mem.eql(u8, gu_setting, "1")) break :blk true;
+        return error.BadGuMb;
+    } else false;
+    if (gu_mb) std.log.info("TF_GLM53_GU_MB=1: prompt routed gate/up through a 5-slot mbarrier ring", .{});
+    const gu_w8s_raw = std.c.getenv("TF_GLM53_GU_W8S");
+    const gu_w8s: u8 = if (gu_w8s_raw) |w8s_value| blk: {
+        const w8s_setting = std.mem.span(w8s_value);
+        if (std.mem.eql(u8, w8s_setting, "0")) break :blk 0;
+        if (std.mem.eql(u8, w8s_setting, "1")) break :blk 1;
+        if (std.mem.eql(u8, w8s_setting, "2")) break :blk 2;
+        return error.BadGuW8s;
+    } else 0;
+    if (gu_w8s == 1) std.log.info("TF_GLM53_GU_W8S=1: prompt routed gate/up of large items on e4m3 activations (changes output bits)", .{});
+    if (gu_w8s == 2) std.log.info("TF_GLM53_GU_W8S=2: prompt routed gate/up of all items on e4m3 activations (changes output bits)", .{});
+    const down_w8s = if (std.c.getenv("TF_GLM53_DOWN_W8S")) |dw_value| blk: {
+        const dw_setting = std.mem.span(dw_value);
+        if (std.mem.eql(u8, dw_setting, "0")) break :blk false;
+        if (std.mem.eql(u8, dw_setting, "1")) break :blk true;
+        return error.BadDownW8s;
+    } else false;
+    if (down_w8s and gu_w8s == 0) return error.DownW8sNeedsGuW8s;
+    if (down_w8s) std.log.info("TF_GLM53_DOWN_W8S=1: prompt routed down of large items on e4m3 activations (changes output bits)", .{});
+    const w8_m64_raw = std.c.getenv("TF_GLM53_W8_M64");
+    const w8_m64 = if (w8_m64_raw) |m64_value| blk: {
+        const m64_setting = std.mem.span(m64_value);
+        if (std.mem.eql(u8, m64_setting, "0")) break :blk false;
+        if (std.mem.eql(u8, m64_setting, "1")) break :blk true;
+        return error.BadW8M64;
+    } else false;
+    if (w8_m64) std.log.info("TF_GLM53_W8_M64=1: prefill W8A8 GEMM on 64-row tiles, two CTAs an SM", .{});
 
     const prompt_mla = forward.promptMlaSwitch();
     const coll_fuse_requested = collFuseSwitch();
@@ -1295,8 +1338,16 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     if (geometry.pre_fuse != .off or geometry.prep_fuse != .off) try own.lane.loadGroup();
     own.alive_lane = true;
     own.experts = try cuda.exl3_experts.Experts.loadWith(ctx.d, moe_noalloc);
+    own.experts.rot_w4 = rot_w4;
+    if (gu_w8s != 0 and prompt_experts != .p5a) return error.GuW8sNeedsP5a;
+    own.experts.w8s = gu_w8s != 0;
+    own.experts.w8s_all = gu_w8s == 2;
+    own.experts.down_w8s = down_w8s;
     own.alive_experts = true;
     if (prompt_experts == .pmx or prompt_experts == .p5a) own.experts.pmx = try cuda.exl3_experts.pmx.Pmx.load(ctx.d);
+    if (gu_mb) {
+        if (own.experts.pmx) |*px| try px.useGuMb() else return error.GuMbNeedsPmx;
+    }
     if (prompt_experts == .p5a) own.experts.p5a = try cuda.exl3_experts.p5a.P5a.load(ctx.d);
     if (prompt_experts != .off) std.log.info("TF_GLM53_PROMPT_EXPERTS dispatch: mode={s} wide={} pmx={} p5a={}", .{ @tagName(prompt_experts), geometry.prompt_experts_wide, geometry.prompt_experts_pmx, geometry.prompt_experts_p5a });
     if ((prompt_experts == .wide or prompt_experts == .pmx or prompt_experts == .p5a) and own.experts.prompt.wide == null) return error.PromptExpertsWideKernelsMissing;
@@ -1319,6 +1370,7 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     if (geometry.prefill_w8a8) {
         own.w8a8 = try cuda.w8a8.Kernels.load(ctx.d, cuda.kernels.glm53_w8a8);
         own.alive_w8a8 = true;
+        if (w8_m64) try own.w8a8.useM64();
         own.kernels.w8a8 = own.w8a8.fns;
         if (geometry.prefill_w8a8_all) {
             std.log.info("TF_GLM53_PREFILL_W8A8=2: prefill o_proj and every other FP8B prefill projection this kernel serves run W8A8 (e4m3 rows, fp32 scale per row and 128-K block); lossy, KLD-gated", .{});
@@ -1577,7 +1629,7 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
 
     var digest_plan = plan;
     if (draft_ingest_side) digest_plan.weights.drafter = (digest_plan.weights.drafter orelse return error.DraftIngestSideNeedsDrafter) - draft_ingest_stage_bytes;
-    const digest = recal_mod.digest(try settingsDigest(gpa, io, dir, o, cfg, digest_plan, choice.rows, lowrank_decode, if (own.alive_ablation) own.ablation.digest else null, geometry.prompt_mla, geometry.smla_p, geometry.smla_fp8, geometry.smla_p3, geometry.shard_qkv_a, if (geometry.prefill_w8a8_all) @as(u8, 2) else @as(u8, @intFromBool(geometry.prefill_w8a8)), qmmf_var, prompt_experts, prefetch_enabled, tbo_enabled, geometry.coll_fuse, geometry.partial_roce, geometry.q_one_gather, piece_pipe, moe_pipe, moe_ring, index_merge, index_pipe, drafter_share, graph_reserve_bytes, row_prune, defer_draft_fill, decode_mla_mode, geometry.index_mma_rows, geometry.index_qs, verify_max, attn_pipe, ws_trim, moe_post, comm_prio, geometry.pre_fuse, geometry.prep_fuse, decode_union, lane_chances, adapt_rows, adapt_limit_position, reuse_grain, side_rows, memslim, one_frame, draft_down4, geometry.gather_ovl, geometry.moe_ep), recal_sha, sweep_on);
+    const digest = recal_mod.digest(try settingsDigest(gpa, io, dir, o, cfg, digest_plan, choice.rows, lowrank_decode, if (own.alive_ablation) own.ablation.digest else null, geometry.prompt_mla, geometry.smla_p, geometry.smla_fp8, geometry.smla_p3, geometry.shard_qkv_a, if (geometry.prefill_w8a8_all) @as(u8, 2) else @as(u8, @intFromBool(geometry.prefill_w8a8)), qmmf_var, prompt_experts, prefetch_enabled, tbo_enabled, geometry.coll_fuse, geometry.partial_roce, geometry.q_one_gather, piece_pipe, moe_pipe, moe_ring, index_merge, index_pipe, drafter_share, graph_reserve_bytes, row_prune, defer_draft_fill, decode_mla_mode, geometry.index_mma_rows, geometry.index_qs, verify_max, attn_pipe, ws_trim, moe_post, comm_prio, geometry.pre_fuse, geometry.prep_fuse, decode_union, lane_chances, adapt_rows, adapt_limit_position, reuse_grain, side_rows, memslim, one_frame, draft_down4, geometry.gather_ovl, rot_w4, gu_mb, gu_w8s, w8_m64, geometry.moe_ep), recal_sha, sweep_on);
     try cuda.tp_watch.ready(io, digest);
     if (prefix_cache_enabled) {
         const a = try prefix_cache.kvsave.cutAlignment(try expertRows());
@@ -2045,7 +2097,7 @@ test "pre-fuse digest is unchanged off and distinguishes the four enabled values
     for (values, 0..) |a, i| for (values[i + 1 ..]) |b| try std.testing.expect(!std.mem.eql(u8, &a, &b));
 }
 
-fn settingsDigest(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, o: Options, cfg: weights.Config, plan: weights.Plan, effective_expert_rows: usize, lowrank_decode: bool, ablate_digest: ?[32]u8, prompt_mla: forward.PromptMlaMode, smla_p: bool, smla_fp8: bool, smla_p3: bool, shard_qkv_a: bool, prefill_w8a8: u8, qmmf_var: bool, prompt_experts: forward.PromptExperts, prefetch_enabled: bool, tbo_enabled: bool, coll_fuse: bool, partial_roce: bool, q_one_gather: bool, piece_pipe: bool, moe_pipe: bool, moe_ring: u8, index_merge: u8, index_pipe: bool, drafter_share: bool, graph_reserve_bytes: u64, row_prune: bool, defer_draft_fill: bool, decode_mla: forward.DecodeMlaMode, index_mma_rows: usize, index_qs: u8, verify_max: usize, attn_pipe: bool, ws_trim: bool, moe_post: bool, comm_prio: bool, pre_fuse: forward.PreFuse, prep_fuse: forward.PrepFuse, decode_union: bool, lane_chances: bool, adapt_rows: usize, adapt_limit: usize, fine_reuse_grain: usize, side_rows: usize, memslim: bool, one_frame: bool, draft_down4: bool, gather_ovl: u8, moe_ep: bool) ![32]u8 {
+fn settingsDigest(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, o: Options, cfg: weights.Config, plan: weights.Plan, effective_expert_rows: usize, lowrank_decode: bool, ablate_digest: ?[32]u8, prompt_mla: forward.PromptMlaMode, smla_p: bool, smla_fp8: bool, smla_p3: bool, shard_qkv_a: bool, prefill_w8a8: u8, qmmf_var: bool, prompt_experts: forward.PromptExperts, prefetch_enabled: bool, tbo_enabled: bool, coll_fuse: bool, partial_roce: bool, q_one_gather: bool, piece_pipe: bool, moe_pipe: bool, moe_ring: u8, index_merge: u8, index_pipe: bool, drafter_share: bool, graph_reserve_bytes: u64, row_prune: bool, defer_draft_fill: bool, decode_mla: forward.DecodeMlaMode, index_mma_rows: usize, index_qs: u8, verify_max: usize, attn_pipe: bool, ws_trim: bool, moe_post: bool, comm_prio: bool, pre_fuse: forward.PreFuse, prep_fuse: forward.PrepFuse, decode_union: bool, lane_chances: bool, adapt_rows: usize, adapt_limit: usize, fine_reuse_grain: usize, side_rows: usize, memslim: bool, one_frame: bool, draft_down4: bool, gather_ovl: u8, rot_w4: bool, gu_mb: bool, gu_w8s: u8, w8_m64: bool, moe_ep: bool) ![32]u8 {
     const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
     defer gpa.free(path);
     const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 24));
@@ -2074,6 +2126,14 @@ fn settingsDigest(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, o: Option
         hash.update(std.mem.asBytes(&index_qs));
     }
     if (gather_ovl != 0) hash.update("TF_GLM53_GATHER_OVL=1");
+    if (rot_w4) hash.update("TF_GLM53_ROT_W4=1");
+    if (gu_mb) hash.update("TF_GLM53_GU_MB=1");
+    if (gu_w8s == 1) hash.update("TF_GLM53_GU_W8S=1");
+    if (gu_w8s == 2) hash.update("TF_GLM53_GU_W8S=2");
+    if (std.c.getenv("TF_GLM53_DOWN_W8S")) |dw_value| {
+        if (std.mem.eql(u8, std.mem.span(dw_value), "1")) hash.update("TF_GLM53_DOWN_W8S=1");
+    }
+    if (w8_m64) hash.update("TF_GLM53_W8_M64=1");
     // Off (8) hashes nothing, so the default digest is unchanged; 16 adds its value.
     if (verify_max != 8) {
         hash.update("TF_GLM53_VERIFY_MAX=");

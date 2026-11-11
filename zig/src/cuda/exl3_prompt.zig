@@ -156,7 +156,7 @@ pub const Kernels = struct {
         const a: pmx_mod.PmxArgs = .{ .x0 = sc.xg, .x1 = sc.xu, .tp0 = l.gate, .tp1 = l.up, .k2_0 = l.gate_k2, .k2_1 = l.up_k2, .items = p.items, .counts = p.counts, .members = p.members, .sv0 = l.svh_g, .sv1 = l.svh_u, .sd = l.suh_d, .xd = sc.xd, .y = sc.y, .K = i(l.dims), .N = i(l.width), .E = i(l.experts), .limit = l.limit, .act_mode = l.act_mode };
         args.add(a);
         const pmx_fn = pmx.gu[c];
-        try launch.launch(pmx_fn, .{ .grid = .{ .x = @intCast(l.width / 128), .y = @intCast(items), .z = 1 }, .block = .{ .x = 512 }, .shared = @intCast(pmx_mod.gu_smem) }, s, &args);
+        try launch.launch(pmx_fn, .{ .grid = .{ .x = @intCast(l.width / 128), .y = @intCast(items), .z = 1 }, .block = .{ .x = 512 }, .shared = @intCast(pmx.gu_shared[c]) }, s, &args);
         try k.downWide(s, l, rows, sc, p);
     }
 
@@ -169,7 +169,7 @@ pub const Kernels = struct {
         var args: launch.Args = .{};
         const a: pmx_mod.PmxArgs = .{ .x0 = sc.xg, .x1 = sc.xu, .tp0 = l.gate, .tp1 = l.up, .k2_0 = l.gate_k2, .k2_1 = l.up_k2, .items = p.items, .counts = p.counts, .members = p.members, .sv0 = l.svh_g, .sv1 = l.svh_u, .sd = l.suh_d, .xd = sc.xd, .y = sc.y, .K = i(l.dims), .N = i(l.width), .E = i(l.experts), .limit = l.limit, .act_mode = l.act_mode };
         args.add(a);
-        try launch.launch(pmx.gu[c], .{ .grid = .{ .x = @intCast(l.width / 128), .y = @intCast(items), .z = 1 }, .block = .{ .x = 512 }, .shared = @intCast(pmx_mod.gu_smem) }, s, &args);
+        try launch.launch(pmx.gu[c], .{ .grid = .{ .x = @intCast(l.width / 128), .y = @intCast(items), .z = 1 }, .block = .{ .x = 512 }, .shared = @intCast(pmx.gu_shared[c]) }, s, &args);
     }
 
     /// =10 down: items <= 64 members on p5a, larger ones on =2's wide down.
@@ -187,9 +187,66 @@ pub const Kernels = struct {
         if (l.width > l.dims or l.shared_input) return error.Exl3Shape;
         if (k.wide == null) return error.Exl3PromptWideMissing;
         if ((try mul(try mul(rows, sc.slots), l.dims)) > std.math.maxInt(i32)) return error.Exl3Shape;
-        try k.prepare(e, router, s, l, x, stride, picks, rows, sc, p, wide_tile);
-        try k.gateUpP5a(pmx, small, s, l, rows, sc, p);
-        try k.downP5a(small, s, l, rows, sc, p);
+        if (e.w8s and l.codebook == .mcg_e4m3) {
+            try k.prepareW8s(e, router, s, l, x, stride, picks, rows, sc, p);
+            try k.gateUpW8s(pmx, small, e.w8s_all, s, l, rows, sc, p);
+        } else {
+            try k.prepare(e, router, s, l, x, stride, picks, rows, sc, p, wide_tile);
+            try k.gateUpP5a(pmx, small, s, l, rows, sc, p);
+        }
+        if (e.w8s and e.down_w8s and l.codebook == .mcg_e4m3) {
+            try k.downW8s(pmx, small, s, l, picks, rows, sc, p);
+        } else {
+            try k.downP5a(small, s, l, rows, sc, p);
+        }
+    }
+
+    /// TF_GLM53_DOWN_W8S: p5a down for items <= 64 members (fp16 xd, =10's bits), then xd_w8s writes every local pair's
+    /// e4m3 codes and fp32 scale into its sc.xg slot (free once gate/up is done: 2 * dims bytes a pair, codes at bytes
+    /// 0..width, scale at byte width) and down_w8s runs the items > 64 members, 256 model columns a CTA.
+    pub fn downW8s(k: Kernels, pmx: *const pmx_mod.Pmx, small: *const p5a_mod.P5a, s: Stream, l: ex.Layer, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan) !void {
+        _ = k;
+        if (l.width % 128 != 0 or l.width > 4096 or l.dims % 256 != 0 or l.width + 4 > 2 * l.dims) return error.Exl3Shape;
+        const pairs = rows * sc.slots;
+        const items = grouped.maxItems(pairs, l.experts, wide_tile);
+        try go(small.down[1], s, .{ l.dims / 256, items, 1 }, p5a_mod.threads, downArgs(l, sc, p));
+        var q: launch.Args = .{};
+        inline for (.{ sc.xd, picks, sc.xg, i(l.width), i(2 * l.dims) }) |v| q.add(v);
+        try launch.launch(pmx.xd_w8s, .{ .grid = .{ .x = @intCast(pairs), .y = 1, .z = 1 }, .block = .{ .x = 128 } }, s, &q);
+        var args: launch.Args = .{};
+        args.add(pmx_mod.DownW8Args{ .xq = sc.xg, .td = l.down, .k2 = l.down_k2, .items = p.items, .counts = p.counts, .members = p.members, .svh = l.svh_d, .y = sc.y, .K = i(l.width), .D = i(l.dims), .xs = i(2 * l.dims) });
+        try launch.launch(pmx.down_w8s, .{ .grid = .{ .x = @intCast(l.dims / 256), .y = @intCast(items), .z = 1 }, .block = .{ .x = 512 }, .shared = @intCast(pmx_mod.down_w8_smem) }, s, &args);
+    }
+
+    /// TF_GLM53_GU_W8S phase 1: the plan, then two rotations into the same pair slots of sc.xg/sc.xu (2 * dims bytes a
+    /// pair). rot_in_w8s writes every local pair as e4m3 codes (bytes 0..dims) with its fp32 scale at byte dims;
+    /// rot_in_w4s then overwrites the slots of small items' pairs (<= 64 members) with =10's fp16 rotation.
+    pub fn prepareW8s(k: Kernels, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan) !void {
+        _ = k;
+        if (!eligibleTiles(l) or l.shared_input or rows == 0 or rows > sc.rows or stride < l.dims or stride > std.math.maxInt(i32)) return error.Exl3Shape;
+        // rot_in_w8s holds a whole row in one CTA: 16 warps x 3 blocks of 128 K. The scale sits 4-byte aligned after the codes.
+        if (l.dims % 128 != 0 or l.dims / 128 > 48 or 2 * l.dims > std.math.maxInt(i32)) return error.Exl3Shape;
+        _ = try bytes(l, rows, sc.slots, false);
+        const pairs = rows * sc.slots;
+        try router.route(s, picks, pairs, l.experts, wide_tile, p);
+        var codes: launch.Args = .{};
+        codes.add(ex.RotA8Args{ .x = x, .x_stride = i(stride), .x_dtype = @intFromEnum(ex.DType.bf16), .pick = picks, .suh0 = l.suh_g, .suh1 = l.suh_u, .out0 = sc.xg, .out1 = sc.xu, .sc0 = sc.xg + l.dims, .sc1 = sc.xu + l.dims, .k = i(l.dims), .slots = i(sc.slots), .experts = i(l.experts), .ostride = i(2 * l.dims) });
+        try launch.launch(e.rot_in_w8s, .{ .grid = .{ .x = @intCast(pairs), .y = 2, .z = 1 }, .block = .{ .x = 512 } }, s, &codes);
+        if (e.w8s_all) return;
+        const items = grouped.maxItems(pairs, l.experts, wide_tile);
+        var small: launch.Args = .{};
+        inline for (.{ x, i(stride), @as(i32, @backingInt(ex.DType.bf16)), picks, l.suh_g, l.suh_u, sc.xg, sc.xu, i(l.dims), i(sc.slots), i(l.experts), p.items, p.counts, p.members }) |v| small.add(v);
+        try launch.launch(e.rot_in_w4s, .{ .grid = .{ .x = @intCast(items), .y = 4, .z = 1 }, .block = .{ .x = 128 } }, s, &small);
+    }
+
+    /// TF_GLM53_GU_W8S gate/up: items <= 64 members on p5a (fp16, =10's bits), larger ones on the e4m3 x e4m3 gu_w8s.
+    pub fn gateUpW8s(k: Kernels, pmx: *const pmx_mod.Pmx, small: *const p5a_mod.P5a, all: bool, s: Stream, l: ex.Layer, rows: usize, sc: Scratch, p: grouped.Plan) !void {
+        _ = k;
+        const items = grouped.maxItems(rows * sc.slots, l.experts, wide_tile);
+        if (!all) try go(small.gu[1], s, .{ l.width / 128, items, 1 }, p5a_mod.threads, guArgs(l, sc, p));
+        var args: launch.Args = .{};
+        args.add(pmx_mod.PmxA8Args{ .x0 = sc.xg, .x1 = sc.xu, .s0 = sc.xg + l.dims, .s1 = sc.xu + l.dims, .tp0 = l.gate, .tp1 = l.up, .k2_0 = l.gate_k2, .k2_1 = l.up_k2, .items = p.items, .counts = p.counts, .members = p.members, .sv0 = l.svh_g, .sv1 = l.svh_u, .sd = l.suh_d, .xd = sc.xd, .y = sc.y, .K = i(l.dims), .N = i(l.width), .E = i(l.experts), .limit = l.limit, .act_mode = l.act_mode, .xs = i(2 * l.dims), .all = @intFromBool(all) });
+        try launch.launch(pmx.gu_w8s, .{ .grid = .{ .x = @intCast(l.width / 128), .y = @intCast(items), .z = 1 }, .block = .{ .x = 512 }, .shared = @intCast(pmx_mod.gu_w8_smem) }, s, &args);
     }
 
     /// Phase 1 of both paths: shape checks, the plan at `route_tile`, the rotated gate/up inputs.
@@ -204,7 +261,11 @@ pub const Kernels = struct {
         } else {
             var args: launch.Args = .{};
             inline for (.{ x, i(stride), @as(i32, @backingInt(ex.DType.bf16)), picks, l.suh_g, l.suh_u, sc.xg, sc.xu, i(l.dims), i(sc.slots), i(l.experts) }) |v| args.add(v);
-            try launch.launch(e.rot_in, .{ .grid = .{ .x = @intCast(pairs), .y = @intCast(l.dims / 128), .z = 2 }, .block = .{ .x = 32 } }, s, &args);
+            if (e.rot_w4) {
+                try launch.launch(e.rot_in_w4, .{ .grid = .{ .x = @intCast(pairs), .y = 1, .z = 1 }, .block = .{ .x = 128 } }, s, &args);
+            } else {
+                try launch.launch(e.rot_in, .{ .grid = .{ .x = @intCast(pairs), .y = @intCast(l.dims / 128), .z = 2 }, .block = .{ .x = 32 } }, s, &args);
+            }
         }
     }
 

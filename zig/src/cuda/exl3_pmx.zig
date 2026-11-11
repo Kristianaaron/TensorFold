@@ -13,7 +13,15 @@ const Function = module.Function;
 
 pub const bm: usize = 128;
 pub const gu_smem: usize = 77_824;
+/// tf_glm53_pmx_gu_mb5l2_e4m3: 5 ring slots of one 19,456 B gate/up stage plus a full/empty mbarrier pair a slot.
+pub const gu_mb5_smem: usize = 5 * 19_456 + 5 * 16;
+/// Seven stages of e4m3 X (2*128*32) and trellis words (2*2*8*24*4), plus one fp16 expand buffer (2*128*32*2).
+pub const gu_a8_smem: usize = 7 * (2 * bm * 32 + 2 * 2 * 8 * 24 * 4) + 2 * bm * 32 * 2;
+/// Two stages. One stage is a 128-K scale block: e4m3 X (2*128*128) and eight trellis tiles (2*8*8*24*4).
+pub const gu_w8_smem: usize = 2 * (2 * bm * 128 + 2 * 8 * 8 * 24 * 4);
 pub const dn_smem: usize = 38_912;
+/// TF_GLM53_DOWN_W8S: three stages. One stage is a 128-K block: e4m3 X (128*128) and 8 x 16 trellis tiles (8*16*24*4).
+pub const down_w8_smem: usize = 3 * (bm * 128 + 8 * 16 * 24 * 4);
 
 pub fn eligibleWidths(k2: []const i32) bool {
     if (k2.len == 0) return false;
@@ -101,13 +109,64 @@ pub const PmxArgs = extern struct {
     act_mode: i32,
 };
 
+pub const PmxA8Args = extern struct {
+    x0: u64 = 0,
+    x1: u64 = 0,
+    s0: u64 = 0,
+    s1: u64 = 0,
+    tp0: u64 = 0,
+    tp1: u64 = 0,
+    k2_0: u64 = 0,
+    k2_1: u64 = 0,
+    items: u64 = 0,
+    counts: u64 = 0,
+    members: u64 = 0,
+    sv0: u64 = 0,
+    sv1: u64 = 0,
+    sd: u64 = 0,
+    xd: u64 = 0,
+    y: u64 = 0,
+    K: i32 = 0,
+    N: i32 = 0,
+    E: i32 = 0,
+    limit: f32 = 0,
+    act_mode: i32 = 0,
+    /// gu_w8s only. 0: X row r at r * K, scale at s[r]. Else X row and scale at byte r * xs of x and s.
+    xs: i32 = 0,
+    /// gu_w8s only. Nonzero: items of <= 64 members run here too.
+    all: i32 = 0,
+};
+
+/// tf_glm53_pmx_down_w8s_e4m3 (pmx.cu DownW8Args): codes row p and its fp32 scale at byte p * xs and p * xs + K of xq.
+pub const DownW8Args = extern struct {
+    xq: u64 = 0,
+    td: u64 = 0,
+    k2: u64 = 0,
+    items: u64 = 0,
+    counts: u64 = 0,
+    members: u64 = 0,
+    svh: u64 = 0,
+    y: u64 = 0,
+    K: i32 = 0,
+    D: i32 = 0,
+    xs: i32 = 0,
+};
+
 pub const Pmx = struct {
     mod: Module,
     plan_mod: Module,
     router: grouped.Router,
     gu: [2]Function,
+    /// Dynamic shared memory of each `gu` entry.
+    gu_shared: [2]usize = .{ gu_smem, gu_smem },
     dn: [2]Function,
     dequant: [4]Function,
+    gu_a8: Function = undefined,
+    gu_w8: Function = undefined,
+    gu_w8s: Function = undefined,
+    /// TF_GLM53_DOWN_W8S: tf_glm53_pmx_xd_w8s (xd -> e4m3 codes + one scale a pair) and the e4m3 down.
+    xd_w8s: Function = undefined,
+    down_w8s: Function = undefined,
 
     pub fn load(d: *const Driver) !Pmx {
         if (!kernels.available) return error.BuiltWithoutKernels;
@@ -118,6 +177,15 @@ pub const Pmx = struct {
         p.router = try grouped.Router.resolve(p.plan_mod);
         p.gu = .{ try p.mod.function("tf_glm53_pmx_gu_mcg"), try p.mod.function("tf_glm53_pmx_gu_e4m3") };
         for (p.gu) |f| try f.allowDynamicShared(gu_smem);
+        p.gu_a8 = try p.mod.function("tf_glm53_pmx_gu_a8_e4m3");
+        try p.gu_a8.allowDynamicShared(@as(u32, @intCast(gu_a8_smem)));
+        p.gu_w8 = try p.mod.function("tf_glm53_pmx_gu_w8_e4m3");
+        try p.gu_w8.allowDynamicShared(@as(u32, @intCast(gu_w8_smem)));
+        p.gu_w8s = try p.mod.function("tf_glm53_pmx_gu_w8s_e4m3");
+        try p.gu_w8s.allowDynamicShared(@as(u32, @intCast(gu_w8_smem)));
+        p.xd_w8s = try p.mod.function("tf_glm53_pmx_xd_w8s");
+        p.down_w8s = try p.mod.function("tf_glm53_pmx_down_w8s_e4m3");
+        try p.down_w8s.allowDynamicShared(@as(u32, @intCast(down_w8_smem)));
         // TODO(P2): resolve down-kernel entries when the down/combine path is added.
         p.dn = .{ undefined, undefined };
         p.dequant = .{
@@ -127,6 +195,14 @@ pub const Pmx = struct {
             try p.mod.function("tf_glm53_pmx_dequant_6_e4m3"),
         };
         return p;
+    }
+
+    /// TF_GLM53_GU_MB=1: the e4m3 gate/up entry becomes the 5-slot mbarrier ring with prefetch lead 2 (same bits).
+    pub fn useGuMb(p: *Pmx) !void {
+        const f = try p.mod.function("tf_glm53_pmx_gu_mb5l2_e4m3");
+        try f.allowDynamicShared(gu_mb5_smem);
+        p.gu[1] = f;
+        p.gu_shared[1] = gu_mb5_smem;
     }
 
     pub fn unload(p: *Pmx) void {
@@ -155,7 +231,19 @@ test "scratch regions align and cover allocation" {
 
 test "gate-up dynamic shared memory fits sm_89 limit" {
     try std.testing.expect(gu_smem <= 101_376);
+    try std.testing.expectEqual(@as(usize, 97_360), gu_mb5_smem);
+    try std.testing.expect(gu_mb5_smem + 128 * @sizeOf(i32) <= 101_376);
     try std.testing.expectEqual(@as(usize, 384), grouped.maxItems(16384, 256, 128));
+}
+
+test "a8 gate-up shared memory matches the kernel and fits sm_89" {
+    try std.testing.expectEqual(@as(usize, 95_232), gu_a8_smem);
+    try std.testing.expect(gu_a8_smem <= 101_376);
+}
+
+test "w8 gate-up shared memory matches the kernel and fits sm_89" {
+    try std.testing.expectEqual(@as(usize, 90_112), gu_w8_smem);
+    try std.testing.expect(gu_w8_smem <= 101_376);
 }
 
 test "PmxArgs layout matches CUDA ABI" {
@@ -178,4 +266,39 @@ test "PmxArgs layout matches CUDA ABI" {
     try std.testing.expectEqual(@as(usize, 120), @offsetOf(PmxArgs, "E"));
     try std.testing.expectEqual(@as(usize, 124), @offsetOf(PmxArgs, "limit"));
     try std.testing.expectEqual(@as(usize, 128), @offsetOf(PmxArgs, "act_mode"));
+}
+
+test "PmxA8Args layout matches the CUDA struct" {
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(PmxA8Args, "x0"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(PmxA8Args, "x1"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(PmxA8Args, "s0"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(PmxA8Args, "s1"));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(PmxA8Args, "tp0"));
+    try std.testing.expectEqual(@as(usize, 40), @offsetOf(PmxA8Args, "tp1"));
+    try std.testing.expectEqual(@as(usize, 48), @offsetOf(PmxA8Args, "k2_0"));
+    try std.testing.expectEqual(@as(usize, 56), @offsetOf(PmxA8Args, "k2_1"));
+    try std.testing.expectEqual(@as(usize, 64), @offsetOf(PmxA8Args, "items"));
+    try std.testing.expectEqual(@as(usize, 72), @offsetOf(PmxA8Args, "counts"));
+    try std.testing.expectEqual(@as(usize, 80), @offsetOf(PmxA8Args, "members"));
+    try std.testing.expectEqual(@as(usize, 88), @offsetOf(PmxA8Args, "sv0"));
+    try std.testing.expectEqual(@as(usize, 96), @offsetOf(PmxA8Args, "sv1"));
+    try std.testing.expectEqual(@as(usize, 104), @offsetOf(PmxA8Args, "sd"));
+    try std.testing.expectEqual(@as(usize, 112), @offsetOf(PmxA8Args, "xd"));
+    try std.testing.expectEqual(@as(usize, 120), @offsetOf(PmxA8Args, "y"));
+    try std.testing.expectEqual(@as(usize, 128), @offsetOf(PmxA8Args, "K"));
+    try std.testing.expectEqual(@as(usize, 132), @offsetOf(PmxA8Args, "N"));
+    try std.testing.expectEqual(@as(usize, 136), @offsetOf(PmxA8Args, "E"));
+    try std.testing.expectEqual(@as(usize, 140), @offsetOf(PmxA8Args, "limit"));
+    try std.testing.expectEqual(@as(usize, 144), @offsetOf(PmxA8Args, "act_mode"));
+    try std.testing.expectEqual(@as(usize, 148), @offsetOf(PmxA8Args, "xs"));
+    try std.testing.expectEqual(@as(usize, 160), @sizeOf(PmxA8Args));
+}
+
+test "DownW8Args mirrors pmx.cu DownW8Args" {
+    try std.testing.expectEqual(@as(usize, 56), @offsetOf(DownW8Args, "y"));
+    try std.testing.expectEqual(@as(usize, 64), @offsetOf(DownW8Args, "K"));
+    try std.testing.expectEqual(@as(usize, 72), @offsetOf(DownW8Args, "xs"));
+    try std.testing.expectEqual(@as(usize, 80), @sizeOf(DownW8Args));
+    try std.testing.expectEqual(@as(usize, 86_016), down_w8_smem);
+    try std.testing.expect(down_w8_smem + 128 * 4 <= 101_376);
 }

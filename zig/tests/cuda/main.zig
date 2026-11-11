@@ -84,6 +84,7 @@ const glm53_pmx_tests = @import("glm53_pmx_tests.zig");
 const glm53_prompt_experts_tests = @import("glm53_prompt_experts_tests.zig");
 const glm53_prompt_wide_tests = @import("glm53_prompt_wide_tests.zig");
 const glm53_p5a_tests = @import("glm53_p5a_tests.zig");
+const glm53_ra8_tests = @import("glm53_ra8_tests.zig");
 const glm53_fp8_backend_probe = @import("glm53_fp8_backend_probe");
 const glm53_prefill_bf16_tests = @import("glm53_prefill_bf16_tests.zig");
 const glm53_w8a8_tests = @import("glm53_w8a8_tests.zig");
@@ -247,6 +248,7 @@ const usage =
     \\  glm53-p5a              GLM-5.3 TF_GLM53_PROMPT_EXPERTS=10 small-item kernels byte-equal to =3 and =1; =3 vs =1; resources; bench
     \\  glm53-p5ax             GLM-5.3 =10 vs =3 byte sweep: rows 1..2048, items 1..256, 4 routings, 2 rank weight sets, splits
     \\  glm53-p5a-bench        the shared P5 routed bench (=3 vs =10)
+    \\  glm53-ra8              ROUTED-A8 e4m3 rotated activations against release pmx gate/up, bench
     \\  glm53-prefill            GLM-5.3 CUTLASS FP8 prefill shapes vs MMA, seeded and row-tiled
     \\  glm53-prefill-bf16       GLM-5.3 BF16 dequant/cuBLASLt prefill vs MMA and fixed-row chunk invariance
     \\  glm53-w8a8               GLM-5.3 TF_GLM53_PREFILL_W8A8 o_proj vs default qmmf: KLD-gate metrics, layout, row invariance, bench
@@ -461,6 +463,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "glm53-p5a")) return glm53_p5a_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm53-p5ax")) return glm53_p5a_tests.sweep(gpu);
     if (std.mem.eql(u8, cmd, "glm53-p5a-bench")) return glm53_p5a_tests.bench(gpu);
+    if (std.mem.eql(u8, cmd, "glm53-ra8")) return glm53_ra8_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm53-prefill")) return glm53_fp8_backend_probe.runPrefill(gpu);
     if (std.mem.eql(u8, cmd, "glm53-prefill-bf16")) return glm53_prefill_bf16_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm53-w8a8")) return glm53_w8a8_tests.run(gpu);
