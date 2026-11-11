@@ -17,6 +17,7 @@ pub fn run(gpu: anytype) !void {
     defer stream.deinit();
     var failed = false;
     try case(gpu, &lane, stream, 2048, 1024, 0, "q_a", &failed);
+    try case(gpu, &lane, stream, 2048, 1024, 1024, "q_a", &failed);
     try case(gpu, &lane, stream, 576, 256, 0, "kv_a", &failed);
     try case(gpu, &lane, stream, 576, 320, 256, "kv_a", &failed);
     if (failed) return error.TestUnexpectedResult;
@@ -83,13 +84,18 @@ fn case(gpu: check.Gpu, lane: *const cuda.qmmf.Lane, stream: cuda.Stream, full_n
         defer full_again.free();
         var half = try cuda.DeviceBuffer.alloc(gpu.d, rows * half_n * 2);
         defer half.free();
+        var half_unpinned = try cuda.DeviceBuffer.alloc(gpu.d, rows * half_n * 2);
+        defer half_unpinned.free();
         var part_full = try cuda.DeviceBuffer.alloc(gpu.d, @max(lane.partBytes(rows, w_full), 4));
         defer part_full.free();
         var part_half = try cuda.DeviceBuffer.alloc(gpu.d, @max(lane.partBytesPinned(rows, w_half, full_n), 4));
         defer part_half.free();
+        var part_half_unpinned = try cuda.DeviceBuffer.alloc(gpu.d, @max(lane.partBytes(rows, w_half), 4));
+        defer part_half_unpinned.free();
         try lane.matmulOut(stream, dx.ptr, k, rows, w_full, full.ptr, .bf16, part_full.ptr);
         try lane.matmulOut(stream, dx.ptr, k, rows, w_full, full_again.ptr, .bf16, part_full.ptr);
         try lane.matmulOutPinned(stream, dx.ptr, k, rows, w_half, half.ptr, .bf16, part_half.ptr, full_n);
+        try lane.matmulOut(stream, dx.ptr, k, rows, w_half, half_unpinned.ptr, .bf16, part_half_unpinned.ptr);
         try stream.synchronize();
         const full_bytes = try download(gpu, full);
         defer a.free(full_bytes);
@@ -97,6 +103,8 @@ fn case(gpu: check.Gpu, lane: *const cuda.qmmf.Lane, stream: cuda.Stream, full_n
         defer a.free(full_again_bytes);
         const half_bytes = try download(gpu, half);
         defer a.free(half_bytes);
+        const half_unpinned_bytes = try download(gpu, half_unpinned);
+        defer a.free(half_unpinned_bytes);
         if (!std.mem.eql(u8, full_again_bytes, full_bytes)) {
             failed.* = true;
             reportDiff(label, rows, "full-repeat", full_bytes, full_again_bytes, full_n, full_n, full_n, w_full, lane.clusters, packed_scales_full[0], 0);
@@ -109,6 +117,10 @@ fn case(gpu: check.Gpu, lane: *const cuda.qmmf.Lane, stream: cuda.Stream, full_n
             reportDiff(label, rows, "full-vs-half", full_slice, half_bytes, half_n, full_n, full_n, w_full, lane.clusters, packed_scales_half[0], row0);
         } else {
             std.debug.print("RESULT glm53-shard-qkv-a {s} slice_row={d} rows={d}: byte-identical\n", .{ label, row0, rows });
+        }
+        if (!std.mem.eql(u8, half_unpinned_bytes, full_slice)) {
+            failed.* = true;
+            reportDiff(label, rows, "full-vs-half-unpinned", full_slice, half_unpinned_bytes, half_n, full_n, half_n, w_full, lane.clusters, packed_scales_half[0], row0);
         }
     }
 }

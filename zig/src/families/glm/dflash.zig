@@ -63,6 +63,7 @@ pub const Geometry = struct {
     mask: u32 = MASK,
     eps: f32 = EPS,
     tap_streams: usize = 4,
+    down4: bool = false,
 
     pub fn kvWidth(g: Geometry) usize {
         return g.kv_heads * g.head_dim;
@@ -184,8 +185,8 @@ pub fn kernelShape(g: Geometry) !KernelShape {
 /// A drafter linear: 4 bits (--drafter-bits 4, the default; they only propose) or bf16 tiled for glm_mm.
 pub const Lin = union(enum) { q4: q4.Q4, bf16: mm.Tiled };
 
-/// down and the selector's projection stay bf16 (their fp32 outputs are gathered or read on the host).
-pub const LayerW = struct { in_norm: u64, post_norm: u64, qn: u64, kn: u64, a_base: u64, m_base: u64, qkv: Lin, kv: Lin, o: Lin, gu: Lin, down: mm.Tiled, a_proj: Lin, m_proj: Lin };
+/// down is bf16 unless down4 is set; the selector's projection stays bf16 (their fp32 outputs are gathered or read on the host).
+pub const LayerW = struct { in_norm: u64, post_norm: u64, qn: u64, kn: u64, a_base: u64, m_base: u64, qkv: Lin, kv: Lin, o: Lin, gu: Lin, down: mm.Tiled, a_proj: Lin, m_proj: Lin, down4: ?q4.Q4 = null };
 
 /// A stream's drafter state by slot: its ring, where its context starts, and its last verify's tap rows.
 pub const Slot = struct {
@@ -198,7 +199,7 @@ pub const Slot = struct {
 };
 
 /// One stream's request: `n` rows of its last verify into its context first (0: none), the anchor, rank 0's `out`.
-pub const Req = struct { slot: u32, pos: i64, n: usize, anchor: u32, out: ?[]u32 = null, probs: ?[]f64 = null };
+pub const Req = struct { slot: u32, pos: i64, n: usize, anchor: u32, out: ?[]u32 = null, probs: ?[]f64 = null, key_seed: u64 = 0, key_temp: f64 = 0 };
 
 /// Context runs: `n` tap rows at `taps` (consecutive), positions pos0.., into `ring`.
 pub const Run = struct { ring: u64, taps: u64, n: usize, pos0: i64 };
@@ -291,8 +292,15 @@ pub const Drafter = struct {
     h_crings: []u64 = &.{},
     cand: []i32 = &.{}, // all ranks' gathered candidates, [world][MAX_M][CW]
     gh: []f32 = &.{}, // the selector's hidden projections [MAX_M][RANK]
+    stage: u64 = 0, // TF_GLM53_DRAFT_INGEST_SIDE: the stage's device base (0: off)
+    stage_commit: ?cuda.Function = null,
+    pass_graph: ?*anyopaque = null, // TF_GLM53_DRAFT_GRAPH: passDevice for pass_graph_s streams
+    pass_graph_s: usize = 0,
+    graph_engine: cuda.graph_cache.CudaEngine = undefined,
+    graph_checks: u8 = 0, // replays still compared against an eager pass
 
     pub fn deinit(dr: *Drafter) void {
+        if (dr.pass_graph) |x| { const ge = dr.graph_engine.engine(); ge.free(ge.ctx, x); }
         for (dr.slots.items) |*s| if (s.ring) |*r| r.free();
         dr.slots.deinit(dr.gpa);
         dr.gpa.free(dr.layers);
@@ -346,6 +354,13 @@ pub const Drafter = struct {
         s.v_rows = 0;
     }
 
+    /// Reuse the resident ring below the decode-overwrite floor, retaining its rows before `from`.
+    pub fn rewind(dr: *Drafter, i: u32, floor: usize, from: usize) !void {
+        const s = try dr.slot(i);
+        s.from = @min(@as(i64, @intCast(from)), @max(s.from, @as(i64, @intCast(floor))));
+        s.v_rows = 0;
+    }
+
     /// A verify on slot `i` wrote `rows` tap rows at row `row0` of taps_step, for positions pos0...
     pub fn noteVerify(dr: *Drafter, i: u32, row0: usize, rows: usize, pos0: usize, first: bool) !void {
         if (first) dr.verifies += 1; // a shared verify's parts share one
@@ -381,6 +396,69 @@ pub const Drafter = struct {
         try block.ingestPass(dr, e, N);
     }
 
+    /// TF_GLM53_DRAFT_GRAPH, at setup on both ranks in step: one eager pass on a position-0 request on slot 0
+    /// (scratch only; it loads every kernel and connects the gathers), then passDevice captured for one stream.
+    pub fn capturePass(dr: *Drafter, e: anytype, rank0: bool) !void {
+        if (dr.geometry.kind != .dspark or dr.slots.items.len == 0 or dr.slots.items[0].ring == null) return error.DraftGraphNeedsDspark;
+        const bs = dr.geometry.block_size;
+        dr.h_rings[0] = dr.slots.items[0].ring.?.ptr;
+        dr.h_starts[0] = 0;
+        dr.h_froms[0] = 0;
+        for (0..bs) |t| {
+            dr.h_ids[t] = @intCast(if (t == 0) 0 else dr.geometry.mask);
+            dr.h_bpos[t] = @intCast(t);
+        }
+        try block.upload(dr, e, dr.ids, std.mem.sliceAsBytes(dr.h_ids[0..bs]));
+        try block.upload(dr, e, dr.bpos, std.mem.sliceAsBytes(dr.h_bpos[0..bs]));
+        try block.upload(dr, e, dr.rings, std.mem.sliceAsBytes(dr.h_rings[0..1]));
+        try block.upload(dr, e, dr.starts, std.mem.sliceAsBytes(dr.h_starts[0..1]));
+        try block.upload(dr, e, dr.froms, std.mem.sliceAsBytes(dr.h_froms[0..1]));
+        try block.pass(dr, e, 1, rank0);
+        try e.stream.synchronize();
+        const E = @TypeOf(e);
+        const Body = struct {
+            dr: *Drafter,
+            e: E,
+            rank0: bool,
+            fn run(ctx: *anyopaque, stream: cuda.Stream) anyerror!void {
+                const b: *@This() = @ptrCast(@alignCast(ctx));
+                var on = b.e.*;
+                on.stream = stream;
+                try block.passDevice(b.dr, &on, 1, b.rank0);
+            }
+        };
+        var body: Body = .{ .dr = dr, .e = e, .rank0 = rank0 };
+        dr.graph_engine = .{ .d = dr.d };
+        const ge = dr.graph_engine.engine();
+        dr.pass_graph = try ge.capture(ge.ctx, e.stream, .{ .ctx = &body, .run = Body.run });
+        dr.pass_graph_s = 1;
+        dr.graph_checks = 2;
+    }
+
+    /// The first replays: the eager device pass, then the graph on the same inputs; candidates and normed rows must
+    /// match byte for byte (both ranks run it in step, so the gathers pair up).
+    fn graphParity(dr: *Drafter, e: anytype, S: usize, M: usize, rank0: bool) !void {
+        const ints = @import("dflash_candidates.zig").Layout.init(dr.world, M, cw(dr.geometry)).read;
+        const hn_bytes = M * dr.geometry.hidden * 2;
+        const want_c = try dr.gpa.alloc(i32, ints);
+        defer dr.gpa.free(want_c);
+        const got_c = try dr.gpa.alloc(i32, ints);
+        defer dr.gpa.free(got_c);
+        const want_h = try dr.gpa.alloc(u8, hn_bytes);
+        defer dr.gpa.free(want_h);
+        const got_h = try dr.gpa.alloc(u8, hn_bytes);
+        defer dr.gpa.free(got_h);
+        try block.passDevice(dr, e, S, rank0);
+        try block.download(dr, e, std.mem.sliceAsBytes(want_c), dr.gtk);
+        try block.download(dr, e, want_h, dr.hn);
+        const ge = dr.graph_engine.engine();
+        try ge.launch(ge.ctx, dr.pass_graph.?, e.stream);
+        try block.download(dr, e, std.mem.sliceAsBytes(got_c), dr.gtk);
+        try block.download(dr, e, got_h, dr.hn);
+        if (!std.mem.eql(i32, want_c, got_c) or !std.mem.eql(u8, want_h, got_h)) return error.DraftGraphMismatch;
+        std.log.info("TF_GLM53_DRAFT_GRAPH=1: graph pass equals the eager pass (candidates {d} B, rows {d} B)", .{ ints * 4, hn_bytes });
+    }
+
     /// Kept rows into each context, then the block pass for every stream (every rank); rank 0 selects 7 drafts each.
     pub fn draft(dr: *Drafter, e: anytype, reqs: []const Req) !void {
         if (reqs.len == 0) return;
@@ -394,6 +472,11 @@ pub const Drafter = struct {
             if (s.v_step != dr.verifies or q.n > s.v_rows or s.v_pos0 + @as(i64, @intCast(q.n)) != q.pos) {
                 s.from = q.pos; // its verify rows were overwritten (or never written): its context restarts here
                 dr.lost += 1;
+                continue;
+            }
+            if (dr.stage != 0) {
+                if (s.v_row0 != 0) return error.StagedIngestNeedsRowZero;
+                try block.commitStaged(dr, e, dr.stage, s.ring.?.ptr, s.v_pos0, q.n, dr.stage_commit orelse return error.StagedIngestNotOpen);
                 continue;
             }
             runs[nr] = .{ .ring = s.ring.?.ptr, .taps = dr.taps_step + s.v_row0 * dr.geometry.tapRowBytes(), .n = q.n, .pos0 = s.v_pos0 };
@@ -420,7 +503,15 @@ pub const Drafter = struct {
         try block.upload(dr, e, dr.froms, std.mem.sliceAsBytes(dr.h_froms[0..S]));
         const rank0 = reqs[0].out != null;
         tm = try dr.mark(e, .{ tm, 1 });
-        try block.pass(dr, e, S, rank0);
+        if (dr.pass_graph != null and S == dr.pass_graph_s) {
+            if (comptime @hasDecl(@TypeOf(e.*), "embedDraftUpload")) try e.embedDraftUpload(M) else return error.DraftGraphNeedsShardHook;
+            const ge = dr.graph_engine.engine();
+            if (dr.graph_checks > 0) {
+                dr.graph_checks -= 1;
+                try dr.graphParity(e, S, M, rank0);
+            } else try ge.launch(ge.ctx, dr.pass_graph.?, e.stream);
+            if (dr.geometry.confidence and rank0) try block.download(dr, e, std.mem.sliceAsBytes(dr.hrows[0 .. M * dr.geometry.hidden]), dr.hn);
+        } else try block.pass(dr, e, S, rank0);
         tm = try dr.mark(e, .{ tm, 2 });
         if (rank0) {
             try block.download(dr, e, std.mem.sliceAsBytes(dr.cand[0..@import("dflash_candidates.zig").Layout.init(dr.world, M, cw(dr.geometry)).read]), dr.gtk);

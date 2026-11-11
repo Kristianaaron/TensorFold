@@ -18,18 +18,18 @@ const Params = ?[*]?*anyopaque;
 /// Kernel names by fake function handle (handle = index + 1).
 const names = [_][]const u8{
     "tf_glm_rmsnorm_6144",      "tf_glm_rmsnorm_2048",           "tf_glm_residual_add",       "tf_glm_embed_b16",               "tf_glm_router_part",
-    "tf_glm_router_tile",       "tf_glm_topk",                   "tf_glm_slice_sum",          "tf_glm53_lowrank_partial",       "tf_glm53_lowrank_reduce", "tf_glm53_lowrank_decode",
+    "tf_glm_router_tile",       "tf_glm_topk",                   "tf_glm_topk_compact",        "tf_glm_slice_sum",               "tf_glm53_lowrank_partial", "tf_glm53_lowrank_reduce", "tf_glm53_lowrank_decode",
     "tf_glm53_lowrank_finish",  "tf_glm53_embed_pick",           "tf_glm53_add_partial",      "tf_glm53_swiglu_plain",          "tf_glm53_kv_write",
-    "tf_glm53_qpe_pack",        "tf_glm53_absorb",               "tf_glm53_attend",           "tf_glm53_mla_merge",             "tf_glm53_expand_v", "tf_glm53_absorb_decode", "tf_glm53_expand_v_decode", "tf_glm53_absorb_decode_v2", "tf_glm53_absorb_decode_v3", "tf_glm53_expand_v_decode_v2",
+    "tf_glm53_qpe_pack",        "tf_glm53_absorb",               "tf_glm53_attend",           "tf_glm53_mla_merge",             "tf_glm53_expand_v", "tf_glm53_absorb_decode", "tf_glm53_expand_v_decode", "tf_glm53_absorb_decode_v2", "tf_glm53_absorb_decode_v3", "tf_glm53_expand_v_decode_v2", "tf_glm53_expand_v_decode_v2_16",
     "tf_glm53_index_key",       "tf_glm53_index_q",              "tf_glm53_index_scores",     "tf_glm53_index_scores_oracle",   "tf_glm53_topk",
-    "tf_glm53_merge",           "tf_glm53_merge2",               "tf_glm53_top1_f32",          "tf_glm53_cand_part_f32",         "tf_glm53_cand_merge_f32",        "tf_glm53_lse_f32",
+    "tf_glm53_merge",           "tf_glm53_merge2",               "tf_glm53_top1_f32",          "tf_glm53_cand_part_f32",         "tf_glm53_cand_part_fast_f32",   "tf_glm53_cand_merge_f32",        "tf_glm53_lse_f32",
     "tf_glm53_gate_gather_f32", "tf_glm53_gate_mass_f32",        "qmmf_bf16",                 "qmmf_f32",                       "qmmf_reduce",
     "exl3_group",               "exl3_rot_in",                   "exl3_grouped",              "exl3_gateup",                    "exl3_down_combine",
     "tf_exl3_prompt_rotate",    "tf_exl3_prompt_gu",              "tf_exl3_prompt_down",       "tf_exl3_prompt_gu_e4m3",            "tf_exl3_prompt_down_e4m3",
     "group_plan_small",         "group_plan_rank",                "group_plan_offsets",        "group_plan_scatter",
-    "tf_glm53_cand_fill_f32",   "tf_glm53_lowrank_combine_bf16", "tf_glm53_moe_residual_add", "tf_glm53_residual_rmsnorm_6144", "tf_glm53_attend_mma", "tf_glm53_attend_split_merge", "tf_glm53_index_scores_mma_4", "tf_glm53_index_scores_mma_8", "tf_glm53_index_scores_mma_16", "tf_glm53_ablate_6144", "tf_glm53_unpack_bf16_rows", "df_tap_glm", "tf_glm53_absorb_prompt_mma", "tf_glm53_expand_v_prompt_mma", "tf_glm53_smla_p",
-    "tf_glm53_cand_fill_f32",   "tf_glm53_lowrank_combine_bf16", "tf_glm53_moe_residual_add", "tf_glm53_residual_rmsnorm_6144", "tf_glm53_attend_mma", "tf_glm53_attend_split_merge", "tf_glm53_index_scores_mma_4", "tf_glm53_index_scores_mma_8", "tf_glm53_index_scores_mma_16", "tf_glm53_ablate_6144", "tf_glm53_unpack_bf16_rows", "df_tap_glm", "tf_glm53_absorb_prompt_mma", "tf_glm53_expand_v_prompt_mma", "tf_glm53_smla_p", "tf_glm53_smla_p_fp8",
-    "tf_glm53_absorb_prompt_mma_big", "tf_glm53_expand_v_prompt_mma_big", "tf_glm53_lowrank_combine_bf16_decode",
+    "tf_glm53_cand_fill_f32",   "tf_glm53_lowrank_combine_bf16", "tf_glm53_moe_residual_add", "tf_glm53_residual_rmsnorm_6144", "tf_glm53_attend_mma", "tf_glm53_attend_split_merge", "tf_glm53_index_scores_mma_4", "tf_glm53_index_scores_mma_8", "tf_glm53_index_scores_mma_16", "tf_glm53_index_scores_qs_s2", "tf_glm53_index_scores_qs_s3", "tf_glm53_index_scores_qs2_k64_s2", "tf_glm53_index_scores_qs2_k32_s2", "tf_glm53_index_scores_qs2_k32_s3", "tf_glm53_ablate_6144", "tf_glm53_unpack_bf16_rows", "df_tap_glm", "tf_glm53_absorb_prompt_mma", "tf_glm53_expand_v_prompt_mma", "tf_glm53_smla_p",
+    "tf_glm53_cand_fill_f32",   "tf_glm53_lowrank_combine_bf16", "tf_glm53_moe_residual_add", "tf_glm53_residual_rmsnorm_6144", "tf_glm53_attend_mma", "tf_glm53_attend_split_merge", "tf_glm53_index_scores_mma_4", "tf_glm53_index_scores_mma_8", "tf_glm53_index_scores_mma_16", "tf_glm53_index_scores_qs_s2", "tf_glm53_index_scores_qs_s3", "tf_glm53_index_scores_qs2_k64_s2", "tf_glm53_index_scores_qs2_k32_s2", "tf_glm53_index_scores_qs2_k32_s3", "tf_glm53_ablate_6144", "tf_glm53_unpack_bf16_rows", "df_tap_glm", "tf_glm53_absorb_prompt_mma", "tf_glm53_expand_v_prompt_mma", "tf_glm53_smla_p", "tf_glm53_smla_p_fp8",
+    "tf_glm53_absorb_prompt_mma_big", "tf_glm53_expand_v_prompt_mma_big", "tf_glm53_absorb_prompt_p2", "tf_glm53_expand_v_prompt_p2", "tf_glm53_expand_v_prompt_p2n", "tf_glm53_lowrank_combine_bf16_decode",
     "tf_exl3_prompt_gu_s",      "tf_exl3_prompt_gu_s_e4m3",      "tf_exl3_prompt_down_s",     "tf_exl3_prompt_down_s_e4m3",
     "tf_exl3_prompt_wup",       "tf_exl3_prompt_wup_e4m3",       "tf_exl3_prompt_wgate",      "tf_exl3_prompt_wgate_e4m3",
     "tf_exl3_prompt_wdown",     "tf_exl3_prompt_wdown_e4m3",
@@ -38,13 +38,26 @@ const names = [_][]const u8{
     "tf_glm53_smla_union",      "tf_glm53_smla_p3", "tf_qmmf_group_fp8b_16c", "tf_qmmf_group_fp8b_32c", "tf_qmmf_group_fp8b_64c", "tf_qmmf_group_fp8b_64f",
     "tf_glm53_attend_verify",
     "tf_glm53_p5a_gu_mcg", "tf_glm53_p5a_gu_e4m3", "tf_glm53_p5a_down_mcg", "tf_glm53_p5a_down_e4m3",
-    "tf_glm53_mask_f32",
+    "tf_glm53_mask_f32", "tf_glm53_cand2_fill_f32", "tf_glm53_cand2_hist_f32", "tf_glm53_cand2_select_f32",
+    "tf_glm53_moe_residual_rmsnorm_6144", "tf_glm53_absorb_qpe_decode_v3",
+    "l2pf_segments", "l2pf_paced",
+    "tf_glm53_rmsnorm_2048_halves",
 };
 
 fn id(comptime name: []const u8) usize {
     @setEvalBranchQuota(100_000);
     inline for (names, 0..) |n, i| if (comptime std.mem.eql(u8, n, name)) return i + 1;
     @compileError("unknown kernel " ++ name);
+}
+
+fn candFastFromEnv() bool {
+    const value = std.c.getenv("TF_GLM53_CAND_FAST") orelse return false;
+    return std.mem.eql(u8, std.mem.span(value), "1");
+}
+
+fn candV2FromEnv() bool {
+    const value = std.c.getenv("TF_GLM53_CAND_V2") orelse return false;
+    return std.mem.eql(u8, std.mem.span(value), "1");
 }
 
 var driver: cuda.Driver = undefined;
@@ -54,16 +67,19 @@ fn func(comptime name: []const u8) cuda.Function {
 }
 
 const max_args = 24;
-const Launch = struct { name: usize, grid: [3]u32, block: [3]u32, shared: u32, nargs: usize, args: [max_args]u64 };
+const Launch = struct { name: usize, grid: [3]u32, block: [3]u32, shared: u32, nargs: usize, args: [max_args]u64, group_outs: [3]u64 = @splat(0) };
 const Gather = struct { phase: forward.Phase, bytes: usize, mine: u64, all: u64, send_recv: bool, recv_bytes: usize = 0, ctx: usize = 0, stream: usize = 0 };
 /// One ordered step on some stream: a kernel, a collective, an event record or an event wait.
 const Step = struct { kind: enum { launch, collective, record, wait }, what: usize, stream: usize };
 const Upload = struct { dst: u64, bytes: []u8 };
+const CopyRecord = struct { src: u64, dst: u64, src_pitch: usize, dst_pitch: usize, width: usize, height: usize, stream: usize };
 const EventStamp = struct { handle: usize, ms: f64 };
 
 /// Argument layouts of the kernels the contract checks read (p pointer, i i32, l i64, u u32, f f32).
 fn layout(name: usize) ?[]const u8 {
     const table = .{
+        .{ "l2pf_paced", "piupp" }, // rows ptr, rows, chunk, ns a piece, start
+        .{ "l2pf_segments", "piu" },
         .{ "tf_glm53_lowrank_partial", "pppiiiiii" },
         .{ "tf_glm53_lowrank_decode", "pppiiiiii" },
         .{ "tf_glm53_lowrank_reduce", "ppii" },
@@ -90,16 +106,29 @@ fn layout(name: usize) ?[]const u8 {
         .{ "tf_glm53_expand_v_prompt_mma", "ppppiii" },
         .{ "tf_glm53_absorb_prompt_mma_big", "ppppiii" },
         .{ "tf_glm53_expand_v_prompt_mma_big", "ppppiii" },
+        .{ "tf_glm53_absorb_prompt_p2", "ppppiii" },
+        .{ "tf_glm53_expand_v_prompt_p2", "ppppiii" },
+        .{ "tf_glm53_expand_v_prompt_p2n", "ppppiii" },
         .{ "tf_glm53_expand_v_decode", "ppppiii" },
         .{ "tf_glm53_expand_v_decode_v2", "ppppiii" },
+        .{ "tf_glm53_expand_v_decode_v2_16", "ppppiii" },
 
         .{ "tf_glm53_index_key", "pppppppiiiif" },
         .{ "tf_glm53_index_q", "pppp" },
         .{ "tf_glm53_index_scores", "ppiipppiiii" },
+        .{ "tf_glm53_index_scores_qs_s2", "ppiipppiiiiiii" },
+        .{ "tf_glm53_index_scores_qs_s3", "ppiipppiiiiiii" },
+        .{ "tf_glm53_index_scores_qs2_k64_s2", "ppiipppiiiiiii" },
+        .{ "tf_glm53_index_scores_qs2_k32_s2", "ppiipppiiiiiii" },
+        .{ "tf_glm53_index_scores_qs2_k32_s3", "ppiipppiiiiiii" },
         .{ "tf_glm53_merge", "ppppppiiii" },
         .{ "tf_glm53_merge2", "ppppppiiiii" },
         .{ "tf_glm_rmsnorm_6144", "plpplpfi" },
+        .{ "tf_glm53_residual_rmsnorm_6144", "ppppif" },
+        .{ "tf_glm53_moe_residual_rmsnorm_6144", "ppppif" },
+        .{ "tf_glm53_absorb_qpe_decode_v3", "ppppiiippp" },
         .{ "tf_glm_rmsnorm_2048", "plpplpfi" },
+        .{ "tf_glm53_rmsnorm_2048_halves", "pplpplf" },
         .{ "tf_glm_residual_add", "ppplli" },
         .{ "tf_glm_embed_b16", "pppli" },
         .{ "tf_glm53_embed_pick", "pppiii" },
@@ -108,6 +137,9 @@ fn layout(name: usize) ?[]const u8 {
         .{ "qmmf_f32", "pppfppiiiiiii" },
         .{ "tf_glm53_top1_f32", "puupp" },
         .{ "tf_glm53_mask_f32", "puupu" },
+        .{ "tf_glm53_cand2_fill_f32", "ppupu" },
+        .{ "tf_glm53_cand2_hist_f32", "puup" },
+        .{ "tf_glm53_cand2_select_f32", "puuuppp" },
         .{ "tf_glm53_lse_f32", "pup" },
         .{ "tf_glm53_ablate_6144", "ppippppif" },
         .{ "df_tap_glm", "ppiiii" },
@@ -124,6 +156,7 @@ const Rec = struct {
     var gathers: std.ArrayList(Gather) = .empty;
     var uploads: std.ArrayList(Upload) = .empty;
     var copies: usize = 0;
+    var copy_log: std.ArrayList(CopyRecord) = .empty;
     var gate_calls: usize = 0;
     var gate_token: u64 = 0;
     var gate_status: u64 = 0;
@@ -132,6 +165,7 @@ const Rec = struct {
     var event_clock_ms: f64 = 0;
     var use_event_clock = false;
     var next_event: usize = 0x700000;
+    var next_stream: usize = 0x51de;
 
     fn eventElapsed(ms: *f32, start: abi.Event, end: abi.Event) callconv(.c) abi.Result {
         if (use_event_clock) {
@@ -165,7 +199,8 @@ const Rec = struct {
     }
 
     fn streamCreate(out: *abi.Stream, _: c_uint) callconv(.c) abi.Result {
-        out.* = @ptrFromInt(0x51de);
+        out.* = @ptrFromInt(next_stream);
+        next_stream += 1;
         return abi.success;
     }
 
@@ -198,10 +233,10 @@ const Rec = struct {
         for (uploads.items) |u| gpa.free(u.bytes);
         uploads.clearRetainingCapacity();
         copies = 0;
+        copy_log.clearRetainingCapacity();
         gate_calls = 0;
         gate_token = 0;
         gate_status = 0;
-        next_event = 0x700000;
     }
 
     fn free() void {
@@ -209,6 +244,7 @@ const Rec = struct {
         launches.deinit(gpa);
         gathers.deinit(gpa);
         uploads.deinit(gpa);
+        copy_log.deinit(gpa);
         order.deinit(gpa);
         event_stamps.deinit(gpa);
         order = .empty;
@@ -217,6 +253,7 @@ const Rec = struct {
         launches = .empty;
         gathers = .empty;
         uploads = .empty;
+        copy_log = .empty;
         event_stamps = .empty;
     }
 
@@ -237,6 +274,13 @@ const Rec = struct {
                 };
             }
         }
+        if (name == id("tf_qmmf_group_fp8b_16c") or name == id("tf_qmmf_group_fp8b_32c") or name == id("tf_qmmf_group_fp8b_64c") or name == id("tf_qmmf_group_fp8b_64f")) {
+            const group_args: cuda.qmmf.GroupArgsAbi = @as(*const cuda.qmmf.GroupArgsAbi, @ptrCast(@alignCast(params.?[0].?))).*;
+            const group_count: usize = @intCast(group_args.count);
+            for (0..@min(group_count, l.group_outs.len)) |i| {
+                l.group_outs[i] = group_args.seg[i].out;
+            }
+        }
         launches.append(gpa, l) catch @panic("recording");
     }
 
@@ -252,8 +296,9 @@ const Rec = struct {
         return abi.success;
     }
 
-    fn copy2d(_: *const abi.Memcpy2D, _: abi.Stream) callconv(.c) abi.Result {
+    fn copy2d(copy: *const abi.Memcpy2D, stream: abi.Stream) callconv(.c) abi.Result {
         copies += 1;
+        copy_log.append(gpa, .{ .src = copy.src, .dst = copy.dst, .src_pitch = copy.src_pitch, .dst_pitch = copy.dst_pitch, .width = copy.width, .height = copy.height, .stream = @intFromPtr(stream) }) catch @panic("recording");
         return abi.success;
     }
 
@@ -269,6 +314,12 @@ const Rec = struct {
     fn sendRecv(ctx: *anyopaque, s: cuda.Stream, send: u64, send_bytes: usize, recv: u64, recv_bytes: usize, _: usize, phase: forward.Phase) anyerror!void {
         try gathers.append(gpa, .{ .phase = phase, .bytes = send_bytes, .mine = send, .all = recv, .send_recv = true, .recv_bytes = recv_bytes, .ctx = @intFromPtr(ctx), .stream = if (s.handle) |h| @intFromPtr(h) else 0 });
         step(.collective, @backingInt(phase), s.handle);
+    }
+
+    fn oneShot(ctx: *anyopaque, s: cuda.Stream, mine: u64, all: u64, bytes: usize) anyerror!void {
+        // Decode's only one-shot gather in these fixtures is the attention partial (PARTIAL_ROCE; COLL_FUSE is off).
+        try gathers.append(gpa, .{ .phase = .attention_partial, .bytes = bytes, .mine = mine, .all = all, .send_recv = false, .ctx = @intFromPtr(ctx), .stream = if (s.handle) |h| @intFromPtr(h) else 0 });
+        step(.collective, @backingInt(forward.Phase.attention_partial), s.handle);
     }
 
     fn gate(_: *anyopaque, _: cuda.Stream, token: u64, status: u64) anyerror!void {
@@ -352,11 +403,13 @@ fn fakeKernels(lane: *const cuda.qmmf.Lane, ex: *const cuda.exl3_experts.Experts
     k.glue53 = .{ .lowrank = .{ .partial = func("tf_glm53_lowrank_partial"), .reduce = func("tf_glm53_lowrank_reduce"), .finish = func("tf_glm53_lowrank_finish"), .decode = func("tf_glm53_lowrank_decode") }, .embed_pick = func("tf_glm53_embed_pick"), .lowrank_combine_bf16 = func("tf_glm53_lowrank_combine_bf16"), .lowrank_combine_bf16_decode = func("tf_glm53_lowrank_combine_bf16_decode"), .residual_add_bf16 = func("tf_glm53_moe_residual_add") };
     k.swiglu_plain = func("tf_glm53_swiglu_plain");
     k.residual_rmsnorm_6144 = func("tf_glm53_residual_rmsnorm_6144");
+    k.moe_residual_rmsnorm_6144 = null;
+    k.rmsnorm_2048_halves = null;
 
-    k.mla = .{ .prep_fn = func("tf_glm53_kv_write"), .qpe_fn = func("tf_glm53_qpe_pack"), .absorb_fn = func("tf_glm53_absorb"), .absorb_decode_fn = func("tf_glm53_absorb_decode"), .absorb_decode_v2_fn = func("tf_glm53_absorb_decode_v2"), .absorb_decode_v3_fn = func("tf_glm53_absorb_decode_v3"), .attend_fn = func("tf_glm53_attend"), .attend_mma_fn = func("tf_glm53_attend_mma"), .attend_split_merge_fn = func("tf_glm53_attend_split_merge"), .attend_kernel = .scalar, .merge_fn = func("tf_glm53_mla_merge"), .expand_fn = func("tf_glm53_expand_v"), .expand_decode_fn = func("tf_glm53_expand_v_decode"), .expand_decode_v2_fn = func("tf_glm53_expand_v_decode_v2"), .absorb_prompt_fn = func("tf_glm53_absorb_prompt_mma"), .expand_prompt_fn = func("tf_glm53_expand_v_prompt_mma"), .smla_p_fn = func("tf_glm53_smla_p"), .smla_fp8_fn = func("tf_glm53_smla_p_fp8"), .absorb_prompt_big_fn = func("tf_glm53_absorb_prompt_mma_big"), .expand_prompt_big_fn = func("tf_glm53_expand_v_prompt_mma_big") }; // the recorded contract below is the scalar attend's; the mma path is covered on GPU (glm53-mla, graph replay)
+    k.mla = .{ .prep_fn = func("tf_glm53_kv_write"), .qpe_fn = func("tf_glm53_qpe_pack"), .absorb_fn = func("tf_glm53_absorb"), .absorb_decode_fn = func("tf_glm53_absorb_decode"), .absorb_decode_v2_fn = func("tf_glm53_absorb_decode_v2"), .absorb_decode_v3_fn = func("tf_glm53_absorb_decode_v3"), .attend_fn = func("tf_glm53_attend"), .attend_mma_fn = func("tf_glm53_attend_mma"), .attend_split_merge_fn = func("tf_glm53_attend_split_merge"), .attend_kernel = .scalar, .merge_fn = func("tf_glm53_mla_merge"), .expand_fn = func("tf_glm53_expand_v"), .expand_decode_fn = func("tf_glm53_expand_v_decode"), .expand_decode_v2_fn = func("tf_glm53_expand_v_decode_v2"), .expand_decode_v2_16_fn = func("tf_glm53_expand_v_decode_v2_16"), .absorb_prompt_fn = func("tf_glm53_absorb_prompt_mma"), .expand_prompt_fn = func("tf_glm53_expand_v_prompt_mma"), .smla_p_fn = func("tf_glm53_smla_p"), .smla_fp8_fn = func("tf_glm53_smla_p_fp8"), .absorb_prompt_big_fn = func("tf_glm53_absorb_prompt_mma_big"), .expand_prompt_big_fn = func("tf_glm53_expand_v_prompt_mma_big"), .absorb_prompt_p2_fn = func("tf_glm53_absorb_prompt_p2"), .expand_prompt_p2_fn = func("tf_glm53_expand_v_prompt_p2"), .expand_prompt_p2n_fn = func("tf_glm53_expand_v_prompt_p2n") }; // the recorded contract below is the scalar attend's; the mma path is covered on GPU (glm53-mla, graph replay)
 
-    k.index = .{ .key = func("tf_glm53_index_key"), .query = func("tf_glm53_index_q"), .score = func("tf_glm53_index_scores"), .score_mma_4 = func("tf_glm53_index_scores_mma_4"), .score_mma_8 = func("tf_glm53_index_scores_mma_8"), .score_mma_16 = func("tf_glm53_index_scores_mma_16"), .score_kernel = .scalar, .score_oracle = func("tf_glm53_index_scores_oracle"), .select = func("tf_glm53_topk"), .merge_fn = func("tf_glm53_merge"), .merge2_fn = func("tf_glm53_merge2") };
-    k.head = .{ .top1_fn = func("tf_glm53_top1_f32"), .mask_fn = func("tf_glm53_mask_f32"), .candidates_fill_fn = func("tf_glm53_cand_fill_f32"), .candidates_part_fn = func("tf_glm53_cand_part_f32"), .candidates_merge_fn = func("tf_glm53_cand_merge_f32"), .lse_fn = func("tf_glm53_lse_f32"), .gate_gather_fn = func("tf_glm53_gate_gather_f32"), .gate_mass_fn = func("tf_glm53_gate_mass_f32") };
+    k.index = .{ .key = func("tf_glm53_index_key"), .query = func("tf_glm53_index_q"), .score = func("tf_glm53_index_scores"), .score_mma_4 = func("tf_glm53_index_scores_mma_4"), .score_mma_8 = func("tf_glm53_index_scores_mma_8"), .score_mma_16 = func("tf_glm53_index_scores_mma_16"), .score_qs_2 = func("tf_glm53_index_scores_qs_s2"), .score_qs_3 = func("tf_glm53_index_scores_qs_s3"), .score_qs2_k64_s2 = func("tf_glm53_index_scores_qs2_k64_s2"), .score_qs2_k32_s2 = func("tf_glm53_index_scores_qs2_k32_s2"), .score_qs2_k32_s3 = func("tf_glm53_index_scores_qs2_k32_s3"), .score_kernel = .scalar, .score_oracle = func("tf_glm53_index_scores_oracle"), .select = func("tf_glm53_topk"), .merge_fn = func("tf_glm53_merge"), .merge2_fn = func("tf_glm53_merge2") };
+    k.head = .{ .top1_fn = func("tf_glm53_top1_f32"), .mask_fn = func("tf_glm53_mask_f32"), .candidates_fill_fn = func("tf_glm53_cand_fill_f32"), .candidates_part_fn = func("tf_glm53_cand_part_f32"), .candidates_part_fast_fn = func("tf_glm53_cand_part_fast_f32"), .candidates_v2_fill_fn = func("tf_glm53_cand2_fill_f32"), .candidates_v2_hist_fn = func("tf_glm53_cand2_hist_f32"), .candidates_v2_select_fn = func("tf_glm53_cand2_select_f32"), .candidates_merge_fn = func("tf_glm53_cand_merge_f32"), .lse_fn = func("tf_glm53_lse_f32"), .gate_gather_fn = func("tf_glm53_gate_gather_f32"), .gate_mass_fn = func("tf_glm53_gate_mass_f32"), .fast = candFastFromEnv(), .v2 = candV2FromEnv() };
     k.lane = lane;
     k.experts = ex;
     k.w8a8 = null;
@@ -407,6 +460,8 @@ const Fixture = struct {
         @memcpy(fx.layer_store[0..2], &two);
         fx.model = .{ .allocator = gpa, .rank = 0, .world = 2, .layers = fx.layer_store[0..2], .embed = 0x8800_0000, .vocab = .{ .lo = 0, .hi = 77440 }, .norm = 0x8900_0000, .head = .{ .mode = .bf16, .codes = 0x8a00_0000, .scales = 0, .n = 77440, .k = 6144, .npad = 77440 } };
         const adm = try state.admitRank(g, context, .{}, 1 << 50, state.reserveFor(1 << 50, false, 0));
+        Rec.next_stream = 0x51de;
+        Rec.next_event = 0x700000;
         fx.st = try state.State.init(&driver, g, context, 0, 2, &adm, 1 << 50);
         Rec.positions_dst = fx.st.ws.positions;
         Rec.reset();
@@ -419,7 +474,7 @@ const Fixture = struct {
     }
 
     fn fwd(fx: *const Fixture, rank: usize) forward.Forward {
-        return .{ .gpa = gpa, .k = &fx.k, .w = &fx.model, .st = &fx.st, .stream = .{ .d = &driver, .handle = null }, .coll = .{ .ctx = @ptrCast(@constCast(fx)), .all_gather_fn = Rec.gather, .send_recv_fn = Rec.sendRecv }, .upload = .{ .upload_fn = Rec.upload }, .rank = rank, .decode_side = fx.st.side != null, .prompt_experts = false, .prompt_experts_wide = false, .smla_p = false, .shard_qkv_a = false, .smla_fp8 = false, .lowrank_decode = false };
+        return .{ .gpa = gpa, .k = &fx.k, .w = &fx.model, .st = &fx.st, .stream = .{ .d = &driver, .handle = null }, .coll = .{ .ctx = @ptrCast(@constCast(fx)), .all_gather_fn = Rec.gather, .send_recv_fn = Rec.sendRecv, .one_shot_gather_fn = Rec.oneShot }, .upload = .{ .upload_fn = Rec.upload }, .rank = rank, .decode_side = fx.st.side != null, .prompt_experts = false, .prompt_experts_wide = false, .smla_p = false, .shard_qkv_a = false, .smla_fp8 = false, .lowrank_decode = false };
     }
 };
 
@@ -456,6 +511,7 @@ const index_part = .{ "qmmf_bf16", "tf_glm53_index_key", "qmmf_bf16", "qmmf_bf16
 const score_block = .{ "tf_glm53_index_scores", "tf_glm53_topk", "tf_glm53_merge" };
 const dense_ffn = .{ "qmmf_bf16", "tf_glm53_swiglu_plain", "qmmf_f32", "tf_glm_residual_add" };
 const moe_ffn = .{ "tf_glm_router_tile", "tf_glm_slice_sum", "tf_glm_topk", "exl3_group", "exl3_rot_in", "exl3_grouped", "exl3_gateup", "exl3_grouped", "exl3_down_combine", "qmmf_bf16", "tf_glm53_swiglu_plain", "qmmf_f32", "tf_glm53_lowrank_partial", "tf_glm53_lowrank_reduce", "tf_glm53_lowrank_combine_bf16", "tf_glm53_moe_residual_add" };
+const moe_ffn_compact = .{ "tf_glm_router_tile", "tf_glm_slice_sum", "tf_glm_topk_compact", "exl3_group", "exl3_rot_in", "exl3_grouped", "exl3_gateup", "exl3_grouped", "exl3_down_combine", "qmmf_bf16", "tf_glm53_swiglu_plain", "qmmf_f32", "tf_glm53_lowrank_partial", "tf_glm53_lowrank_reduce", "tf_glm53_lowrank_combine_bf16", "tf_glm53_moe_residual_add" };
 const experts_run = .{ "exl3_group", "exl3_rot_in", "exl3_grouped", "exl3_gateup", "exl3_grouped", "exl3_down_combine" };
 const moe_route = .{ "tf_glm_router_tile", "tf_glm_slice_sum", "tf_glm_topk" };
 const moe_rest = .{ "qmmf_bf16", "tf_glm53_swiglu_plain", "qmmf_f32", "tf_glm53_lowrank_partial", "tf_glm53_lowrank_reduce", "tf_glm53_lowrank_combine_bf16", "tf_glm53_moe_residual_add" };
@@ -758,6 +814,119 @@ test "qkv-a sharding adds one packed gather and four assemble copies per attenti
     try std.testing.expectEqual(@as(usize, 2), Rec.copies);
 }
 
+test "QA_SHARD from the environment: one q_a gather per layer, halves norm, no copies, plan bytes match" {
+    const on = forward.qaShardSwitch();
+    var g = geometry();
+    g.qa_shard = on;
+    var fx: Fixture = undefined;
+    try fx.init(g, 16384);
+    defer fx.deinit();
+    try std.testing.expectEqual(@as(u64, @intCast(if (on) g.piece_rows * 2048 else 0)), fx.st.ws.sizes.sh_q);
+    fx.k.rmsnorm_2048_halves = func("tf_glm53_rmsnorm_2048_halves");
+    if (on) {
+        for (fx.layer_store[0..2]) |*l| {
+            l.attn.q_a.n = 1024;
+            l.attn.q_a.npad = 1024;
+        }
+    }
+    var f = fx.fwd(1);
+    f.qa_shard = on;
+    const positions = [_]usize{ 100, 101, 102, 103 };
+    try f.whole(.{ .positions = &positions, .tokens = &.{ 7, 8, 9, 10 } });
+    var q_gathers: usize = 0;
+    for (Rec.gathers.items) |gather| {
+        if (gather.phase == .shard_qkv_a) {
+            q_gathers += 1;
+            try std.testing.expectEqual(@as(usize, 4 * 2048), gather.bytes);
+            try std.testing.expectEqual(fx.st.ws.sh_q, gather.mine);
+            try std.testing.expectEqual(fx.st.ws.q_a, gather.all);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, if (on) 2 else 0), q_gathers);
+    var halves: usize = 0;
+    var full: usize = 0;
+    for (Rec.launches.items) |launch| {
+        if (launch.name == id("tf_glm53_rmsnorm_2048_halves")) {
+            try std.testing.expectEqual(fx.st.ws.q_a, launch.args[0]);
+            try std.testing.expectEqual(fx.st.ws.q_a + 4 * 2048, launch.args[1]);
+            try std.testing.expectEqual(fx.st.ws.q_resid, launch.args[4]);
+            halves += 1;
+        }
+        full += @intFromBool(launch.name == id("tf_glm_rmsnorm_2048"));
+    }
+    try std.testing.expectEqual(@as(usize, if (on) 2 else 0), halves);
+    try std.testing.expectEqual(@as(usize, if (on) 0 else 2), full);
+    try std.testing.expectEqual(@as(usize, 2), Rec.copies);
+    var plan_layers: [2]forward.Layer = undefined;
+    try expectPlan(try f.stepPlan(.decode, &positions, 4, &plan_layers));
+}
+
+test "QA_SHARD grouped pre-fuse writes its q_a half to sh_q" {
+    const on = forward.qaShardSwitch();
+    var g = geometry();
+    g.qa_shard = on;
+    var fx: Fixture = undefined;
+    try fx.init(g, 16384);
+    defer fx.deinit();
+    fx.k.rmsnorm_2048_halves = func("tf_glm53_rmsnorm_2048_halves");
+    if (on) {
+        for (fx.layer_store[0..2]) |*l| {
+            l.attn.q_a.n = 1024;
+            l.attn.q_a.npad = 1024;
+        }
+    }
+    groupLane(&fx);
+    var f = fx.fwd(0);
+    f.qa_shard = on;
+    f.pre_fuse = .on;
+    const positions = [_]usize{ 100, 101, 102, 103 };
+    try f.whole(.{ .positions = &positions, .tokens = &.{ 7, 8, 9, 10 } });
+    var grouped: usize = 0;
+    for (Rec.launches.items) |launch| {
+        if (launch.name == id("tf_qmmf_group_fp8b_16c") or launch.name == id("tf_qmmf_group_fp8b_32c") or launch.name == id("tf_qmmf_group_fp8b_64c") or launch.name == id("tf_qmmf_group_fp8b_64f")) {
+            try std.testing.expectEqual(if (on) fx.st.ws.sh_q else fx.st.ws.q_a, launch.group_outs[0]);
+            grouped += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), grouped);
+    var q_gathers: usize = 0;
+    for (Rec.gathers.items) |gather| {
+        if (gather.phase == .shard_qkv_a) q_gathers += 1;
+    }
+    try std.testing.expectEqual(@as(usize, if (on) 2 else 0), q_gathers);
+}
+
+test "QA_SHARD prefill gathers each layer's three-row q_a half" {
+    const on = forward.qaShardSwitch();
+    var g = geometry();
+    g.qa_shard = on;
+    var fx: Fixture = undefined;
+    try fx.init(g, 16384);
+    defer fx.deinit();
+    fx.k.rmsnorm_2048_halves = func("tf_glm53_rmsnorm_2048_halves");
+    if (on) {
+        for (fx.layer_store[0..2]) |*l| {
+            l.attn.q_a.n = 1024;
+            l.attn.q_a.npad = 1024;
+        }
+    }
+    var f = fx.fwd(0);
+    f.qa_shard = on;
+    const positions = [_]usize{ 100, 101, 102 };
+    try f.pieced(.{ .positions = &positions, .tokens = &.{ 7, 8, 9 } });
+    var q_gathers: usize = 0;
+    for (Rec.gathers.items) |gather| {
+        if (gather.phase == .shard_qkv_a) {
+            q_gathers += 1;
+            try std.testing.expectEqual(@as(usize, 3 * 2048), gather.bytes);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, if (on) 2 else 0), q_gathers);
+    var plan_layers: [2]forward.Layer = undefined;
+    // Prefill runs the head on its last row only: head_rows 1, as the other prefill plan test.
+    try expectPlan(try f.stepPlan(.prefill, &positions, 1, &plan_layers));
+}
+
 test "decode side stream splits key and shared expert launches and rejoins before main consumers" {
     var fx: Fixture = undefined;
     var g = geometry();
@@ -851,6 +1020,152 @@ test "decode side stream splits key and shared expert launches and rejoins befor
     try std.testing.expect(side_count < Rec.launches.items.len);
 }
 
+test "route compact switch dispatches the compact top-k kernel and skips route copies" {
+    var fx: Fixture = undefined;
+    var g = geometry();
+    g.decode_side = true;
+    try fx.init(g, 16384);
+    defer fx.deinit();
+    try std.testing.expect(!forward.routeCompactSelected(null));
+    try std.testing.expect(!forward.routeCompactSelected("0"));
+    try std.testing.expect(forward.routeCompactSelected("1"));
+    var f = fx.fwd(0);
+    f.decode_side = true;
+    f.route_compact = forward.routeCompactSelected("1");
+    try f.whole(.{ .positions = &.{ 100, 3000 }, .tokens = &.{ 7, 77441 } });
+    try expectSeq(concat(.{ embed_part, attn_head, index_part, decode_mla, dense_ffn, attn_head, decode_mla, moe_ffn_compact, head_part }));
+    try std.testing.expectEqual(@as(usize, 0), Rec.copies);
+    var compact_launches: usize = 0;
+    var legacy_launches: usize = 0;
+    for (Rec.launches.items) |launch| {
+        compact_launches += @intFromBool(launch.name == id("tf_glm_topk_compact"));
+        legacy_launches += @intFromBool(launch.name == id("tf_glm_topk"));
+    }
+    try std.testing.expectEqual(@as(usize, 1), compact_launches);
+    try std.testing.expectEqual(@as(usize, 0), legacy_launches);
+}
+
+test "L2PF forks at sites f and n of each decode layer and joins before the head" {
+    var fx: Fixture = undefined;
+    var g = geometry();
+    g.decode_side = true;
+    try fx.init(g, 16384);
+    defer fx.deinit();
+    var f = fx.fwd(0);
+    f.decode_side = true;
+    try f.whole(.{ .positions = &.{ 100, 3000 }, .tokens = &.{ 7, 77441 } });
+    const before = try gpa.dupe(Launch, Rec.launches.items);
+    defer gpa.free(before);
+    const gathers_before = try gpa.dupe(Gather, Rec.gathers.items);
+    defer gpa.free(gathers_before);
+    const copies_before = Rec.copies;
+    const copy_log_before = try gpa.dupe(CopyRecord, Rec.copy_log.items);
+    defer gpa.free(copy_log_before);
+
+    Rec.reset();
+    var table_rows: std.ArrayList([2]i64) = .empty;
+    defer table_rows.deinit(gpa);
+    const layers_slice = fx.model.layers;
+    var regions: std.ArrayList(forward.l2pf_mod.Region) = .empty;
+    defer regions.deinit(gpa);
+    const source_ptrs = [_]u64{ 0x8100_0100, 0x8100_0000, 0x9100_1100, 0x9100_1000, 0x9100_3100, 0x9100_3000, 0x9100_2100, 0x9100_2000, 0x8300_0000 };
+    for (source_ptrs) |ptr| try regions.append(gpa, .{ .ptr = ptr, .len = 16 << 20 });
+    const spans = try gpa.alloc(forward.l2pf_mod.Span, layers_slice.len * 2);
+    try forward.l2pf_mod.table(gpa, regions.items, layers_slice, 12 << 20, &table_rows, spans);
+    const side = try cuda.Stream.init(&driver, true);
+    const fork_ev = try cuda.Event.init(&driver, false);
+    const join_ev = try cuda.Event.init(&driver, false);
+    const row_buffer = try cuda.DeviceBuffer.alloc(&driver, table_rows.items.len * 16);
+    const pieces = try gpa.alloc(u64, spans.len);
+    @memset(pieces, 0);
+    for (spans, pieces) |span, *count| {
+        const first: usize = span.at;
+        for (table_rows.items[first .. first + @as(usize, span.rows)]) |row| count.* += (@as(u64, @intCast(row[1])) + 32767) / 32768;
+    }
+    var pf: forward.l2pf_mod.L2pf = .{ .gpa = gpa, .o = .{ .on = true }, .side = side, .fork_ev = fork_ev, .join_ev = join_ev, .mods = undefined, .mods_loaded = 0, .segments = func("l2pf_segments"), .paced = func("l2pf_paced"), .rows = row_buffer, .spans = spans, .pieces = pieces };
+    defer pf.deinit();
+    f.l2pf = &pf;
+    try f.whole(.{ .positions = &.{ 100, 3000 }, .tokens = &.{ 7, 77441 } });
+
+    var pf_count: usize = 0;
+    var launch_index: usize = 0;
+    var record_positions: std.ArrayList(usize) = .empty;
+    defer record_positions.deinit(gpa);
+    var attn_collectives: std.ArrayList(usize) = .empty;
+    defer attn_collectives.deinit(gpa);
+    var moe_collectives: std.ArrayList(usize) = .empty;
+    defer moe_collectives.deinit(gpa);
+    for (Rec.order.items, 0..) |step, order_index| switch (step.kind) {
+        .launch => {
+            if (step.stream == @intFromPtr(side.handle)) {
+                const launch = Rec.launches.items[launch_index];
+                try std.testing.expectEqual(id("l2pf_paced"), launch.name);
+                pf_count += 1;
+                try std.testing.expect(order_index >= 2);
+                const record = Rec.order.items[order_index - 2];
+                const wait = Rec.order.items[order_index - 1];
+                try std.testing.expectEqual(@as(@FieldType(Step, "kind"), .record), record.kind);
+                try std.testing.expectEqual(@as(usize, 0), record.stream);
+                try std.testing.expectEqual(@as(@FieldType(Step, "kind"), .wait), wait.kind);
+                try std.testing.expectEqual(@intFromPtr(side.handle), wait.stream);
+                try std.testing.expectEqual(record.what, wait.what);
+            }
+            launch_index += 1;
+        },
+        .record => if (step.what == @intFromPtr(fork_ev.handle)) try record_positions.append(gpa, order_index),
+        .collective => {
+            if (step.what == @backingInt(forward.Phase.attention_output)) try attn_collectives.append(gpa, order_index);
+            if (step.what == @backingInt(forward.Phase.moe_partial)) try moe_collectives.append(gpa, order_index);
+        },
+        .wait => {},
+    };
+    try std.testing.expectEqual(@as(usize, 3), pf_count);
+    const expected_spans = [_]usize{ 1, 0, 3 };
+    var expected_pf: usize = 0;
+    for (Rec.launches.items) |launch| if (launch.name == id("l2pf_paced")) {
+        try std.testing.expectEqual(row_buffer.ptr + @as(u64, pf.spans[expected_spans[expected_pf]].at) * 16, launch.args[0]);
+        expected_pf += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 3), record_positions.items.len);
+    try std.testing.expectEqual(@as(usize, 2), attn_collectives.items.len);
+    try std.testing.expectEqual(@as(usize, 2), moe_collectives.items.len);
+    try std.testing.expect(record_positions.items[0] < attn_collectives.items[0]);
+    try std.testing.expect(record_positions.items[1] < moe_collectives.items[0]);
+    try std.testing.expect(record_positions.items[2] < attn_collectives.items[1]);
+    const join_wait = for (Rec.order.items, 0..) |step, i| {
+        if (step.kind == .wait and step.what == @intFromPtr(join_ev.handle) and step.stream == 0) break i;
+    } else return error.MissingL2pfJoin;
+    const first_head = for (Rec.order.items, 0..) |step, i| {
+        if (step.kind == .launch and step.what == id("tf_glm53_top1_f32")) break i;
+    } else return error.MissingHeadLaunch;
+    try std.testing.expect(join_wait < first_head);
+    var kept: std.ArrayList(Launch) = .empty;
+    defer kept.deinit(gpa);
+    for (Rec.launches.items) |launch| if (launch.name != id("l2pf_paced") and launch.name != id("l2pf_segments")) {
+        try kept.append(gpa, launch);
+    };
+    try std.testing.expectEqualSlices(Launch, before, kept.items);
+    try std.testing.expectEqualSlices(Gather, gathers_before, Rec.gathers.items);
+    try std.testing.expectEqual(copies_before, Rec.copies);
+    try std.testing.expectEqualSlices(CopyRecord, copy_log_before, Rec.copy_log.items);
+
+    Rec.reset();
+    pf.o.pace_gbps = 0;
+    try f.whole(.{ .positions = &.{ 100, 3000 }, .tokens = &.{ 7, 77441 } });
+    var segments_count: usize = 0;
+    for (Rec.launches.items) |launch| if (launch.name == id("l2pf_segments")) {
+        const wanted = @min(pf.o.ctas, @max(@as(u32, 1), @as(u32, @intCast((pf.pieces[expected_spans[segments_count]] + 127) / 128))));
+        try std.testing.expectEqual(wanted, launch.grid[0]);
+        segments_count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 3), segments_count);
+
+    Rec.reset();
+    try f.pieced(.{ .positions = &.{ 100, 101 }, .tokens = &.{ 7, 8 } });
+    for (Rec.launches.items) |launch| try std.testing.expect(launch.name != id("l2pf_paced") and launch.name != id("l2pf_segments"));
+    for (Rec.order.items) |step| try std.testing.expect(step.kind != .record and step.kind != .wait);
+}
+
 test "dflash taps: decode window adds df_tap_glm after the tapped layer only" {
     var fx: Fixture = undefined;
     try fx.init(geometry(), 16384);
@@ -880,6 +1195,75 @@ test "dflash taps: decode window adds df_tap_glm after the tapped layer only" {
     try std.testing.expectEqual(@as(u32, 2), launch.grid[0]);
     try std.testing.expectEqual(fx.st.ws.x, launch.args[0]);
     try std.testing.expectEqual(@as(u64, 0x9b00_0000), launch.args[1]);
+}
+
+const IngestProbe = struct {
+    forks: usize = 0,
+    joins: usize = 0,
+    fork_at: usize = 0,
+    join_at: usize = 0,
+    positions: u64 = 0,
+    rows: usize = 0,
+
+    fn fork(ctx: *anyopaque, _: cuda.Stream, positions: u64, rows: usize) anyerror!void {
+        const probe: *IngestProbe = @ptrCast(@alignCast(ctx));
+        probe.forks += 1;
+        probe.fork_at = Rec.launches.items.len;
+        probe.positions = positions;
+        probe.rows = rows;
+    }
+
+    fn join(ctx: *anyopaque, _: cuda.Stream) anyerror!void {
+        const probe: *IngestProbe = @ptrCast(@alignCast(ctx));
+        probe.joins += 1;
+        probe.join_at = Rec.launches.items.len;
+    }
+};
+
+test "dflash taps: TF_GLM53_DRAFT_INGEST_SIDE forks after the last tap layer and joins after the head" {
+    const on = forward.draftIngestSideSwitch();
+    var fx: Fixture = undefined;
+    try fx.init(geometry(), 16384);
+    defer fx.deinit();
+    const positions = &.{ 100, 3000 };
+    const tokens = &.{ 7, 77441 };
+    var f = fx.fwd(0);
+    f.taps = .{ .f = func("df_tap_glm"), .out = 0x9b00_0000, .layers = &.{ 0, 1 }, .from = 100, .cap_rows = 32, .ingest = null };
+    try f.whole(.{ .positions = positions, .tokens = tokens });
+    const expected = try names_of();
+    defer gpa.free(expected);
+
+    Rec.reset();
+    var probe: IngestProbe = .{};
+    f.taps = .{ .f = func("df_tap_glm"), .out = 0x9b00_0000, .layers = &.{ 0, 1 }, .from = 100, .cap_rows = 32, .ingest = if (on) .{ .ctx = &probe, .fork_fn = IngestProbe.fork, .join_fn = IngestProbe.join } else null };
+    try f.whole(.{ .positions = positions, .tokens = tokens });
+    const actual = try names_of();
+    defer gpa.free(actual);
+    try std.testing.expectEqualSlices(usize, expected, actual);
+    if (on) {
+        var tap_count: usize = 0;
+        var second_tap_at: ?usize = null;
+        for (Rec.launches.items, 0..) |launch, i| if (launch.name == id("df_tap_glm")) {
+            if (tap_count == 1) second_tap_at = i;
+            tap_count += 1;
+        };
+        try std.testing.expectEqual(@as(usize, 2), tap_count);
+        try std.testing.expectEqual(@as(usize, 1), probe.forks);
+        try std.testing.expectEqual(@as(usize, 1), probe.joins);
+        try std.testing.expectEqual((second_tap_at orelse return error.MissingTap) + 1, probe.fork_at);
+        try std.testing.expectEqual(Rec.launches.items.len, probe.join_at);
+        try std.testing.expectEqual(fx.st.ws.positions, probe.positions);
+        try std.testing.expectEqual(@as(usize, 2), probe.rows);
+    } else {
+        try std.testing.expectEqual(@as(usize, 0), probe.forks);
+        try std.testing.expectEqual(@as(usize, 0), probe.joins);
+    }
+
+    Rec.reset();
+    probe = .{};
+    try f.pieced(.{ .positions = &.{ 100, 101, 102 }, .tokens = &.{ 7, 8, 9 } });
+    try std.testing.expectEqual(@as(usize, 0), probe.forks);
+    try std.testing.expectEqual(@as(usize, 0), probe.joins);
 }
 
 test "dflash taps: prefill taps only the last window rows" {
@@ -1277,6 +1661,8 @@ test "prompt MLA opt-in changes only prefill absorb and expand launches" {
     try std.testing.expectEqual(forward.PromptMlaMode.off, forward.promptMlaSelected("0"));
     try std.testing.expectEqual(forward.PromptMlaMode.tile16, forward.promptMlaSelected("1"));
     try std.testing.expectEqual(forward.PromptMlaMode.tile64, forward.promptMlaSelected("2"));
+    try std.testing.expectEqual(forward.PromptMlaMode.p2, forward.promptMlaSelected("3"));
+    try std.testing.expectEqual(forward.PromptMlaMode.p2n, forward.promptMlaSelected("4"));
     var fx: Fixture = undefined;
     try fx.init(geometry(), 16384);
     defer fx.deinit();
@@ -1309,6 +1695,28 @@ test "prompt MLA opt-in changes only prefill absorb and expand launches" {
     f.prompt_mla = .tile64;
     try f.pieced(.{ .positions = &pos, .tokens = &ids });
     try expectSeq(prompt_big_want);
+
+    const prompt_p2_want = try gpa.dupe(usize, baseline);
+    defer gpa.free(prompt_p2_want);
+    for (prompt_p2_want) |*kernel| {
+        if (kernel.* == id("tf_glm53_absorb")) kernel.* = id("tf_glm53_absorb_prompt_p2");
+        if (kernel.* == id("tf_glm53_expand_v")) kernel.* = id("tf_glm53_expand_v_prompt_p2");
+    }
+    Rec.reset();
+    f.prompt_mla = .p2;
+    try f.pieced(.{ .positions = &pos, .tokens = &ids });
+    try expectSeq(prompt_p2_want);
+
+    const prompt_p2n_want = try gpa.dupe(usize, baseline);
+    defer gpa.free(prompt_p2n_want);
+    for (prompt_p2n_want) |*kernel| {
+        if (kernel.* == id("tf_glm53_expand_v")) kernel.* = id("tf_glm53_expand_v_prompt_p2n");
+        if (kernel.* == id("tf_glm53_absorb")) kernel.* = id("tf_glm53_absorb_prompt_p2");
+    }
+    Rec.reset();
+    f.prompt_mla = .p2n;
+    try f.pieced(.{ .positions = &pos, .tokens = &ids });
+    try expectSeq(prompt_p2n_want);
 
     Rec.reset();
     f.prompt_mla = .off;
@@ -1406,6 +1814,81 @@ fn expectSameLaunches(want: []const Launch, got: []const Launch) !void {
     for (want, got) |a, b| try expectSameLaunch(a, b);
 }
 
+fn w8a8Launch(b: Launch, level2: bool) bool {
+    if (b.name != id("qmmf_bf16") and b.name != id("qmmf_f32")) return false;
+    const cols = b.args[7];
+    const k_dim = b.args[8];
+    const f32_out = b.name == id("qmmf_f32");
+    if (f32_out and cols == 6144 and k_dim == 8192) return true;
+    if (!level2) return false;
+    if (cols < cuda.w8a8.level2_min_n) return false; // narrow outputs stay on release (w8a8.servesFast)
+    const pairs = [_][3]u64{
+        .{ 2048, 6144, 0 },
+        .{ 8192, 2048, 0 },
+        .{ 576, 6144, 0 },
+        .{ 128, 6144, 0 },
+        .{ 4096, 2048, 0 },
+        .{ 12288, 6144, 0 },
+        .{ 6144, 6144, 1 },
+        .{ 6144, 1024, 1 },
+    };
+    const out_flag: u64 = @as(u64, if (f32_out) 1 else 0);
+    for (pairs) |pair| {
+        if (pair[0] == cols and pair[1] == k_dim and pair[2] == out_flag) return true;
+    }
+    return false;
+}
+
+fn expectW8a8Pair(b: Launch, quant: Launch, gemm: Launch, rows: usize, part: u64, scratch: u64) !void {
+    const cols_us: usize = @intCast(b.args[7]);
+    const k_us: usize = @intCast(b.args[8]);
+    const base: u64 = if (b.args[8] == 8192) part else scratch;
+    const at = cuda.w8a8.scratchAt(base, rows, k_us);
+    const grid_x: u32 = @intCast((k_us / cuda.w8a8.block_k + cuda.w8a8.quant_blocks - 1) / cuda.w8a8.quant_blocks);
+    try std.testing.expectEqual(id("tf_glm53_w8a8_quant"), quant.name);
+    try std.testing.expectEqual(b.args[0], quant.args[0]);
+    try std.testing.expectEqual(b.args[8], quant.args[1]);
+    try std.testing.expectEqual(@as(u64, rows), quant.args[2]);
+    try std.testing.expectEqual(b.args[8], quant.args[3]);
+    try std.testing.expectEqual(at.xq, quant.args[4]);
+    try std.testing.expectEqual(at.xs, quant.args[5]);
+    try std.testing.expectEqual([3]u32{ grid_x, @intCast(rows), 1 }, quant.grid);
+    try std.testing.expectEqual([3]u32{ 256, 1, 1 }, quant.block);
+    try std.testing.expectEqual(@as(u32, 0), quant.shared);
+    try std.testing.expectEqual(id("tf_glm53_w8a8_gemm"), gemm.name);
+    try std.testing.expectEqual(at.xq, gemm.args[0]);
+    try std.testing.expectEqual(at.xs, gemm.args[1]);
+    try std.testing.expectEqual(b.args[1], gemm.args[2]);
+    try std.testing.expectEqual(b.args[2], gemm.args[3]);
+    try std.testing.expectEqual(b.args[4], gemm.args[4]);
+    try std.testing.expectEqual(@as(u64, rows), gemm.args[5]);
+    try std.testing.expectEqual(b.args[7], gemm.args[6]);
+    try std.testing.expectEqual(b.args[8], gemm.args[7]);
+    try std.testing.expectEqual(@as(u64, if (b.name == id("qmmf_f32")) 1 else 0), gemm.args[8]);
+    try std.testing.expectEqual([3]u32{ @intCast(cuda.w8a8.gemmBlocks(rows, cols_us)), 1, 1 }, gemm.grid);
+    try std.testing.expectEqual([3]u32{ 256, 1, 1 }, gemm.block);
+    try std.testing.expectEqual(cuda.w8a8.shared_bytes, gemm.shared);
+}
+
+fn expectPrefillW8a8Launches(baseline: []const Launch, got: []const Launch, rows: usize, part: u64, scratch: u64, level2: bool) !void {
+    var gi: usize = 0;
+    var swapped: usize = 0;
+    for (baseline) |b| {
+        if (w8a8Launch(b, level2)) {
+            try std.testing.expect(gi + 1 < got.len);
+            try expectW8a8Pair(b, got[gi], got[gi + 1], rows, part, scratch);
+            gi += 2;
+            swapped += 1;
+        } else {
+            try std.testing.expect(gi < got.len);
+            try expectSameLaunch(b, got[gi]);
+            gi += 1;
+        }
+    }
+    try std.testing.expectEqual(got.len, gi);
+    if (level2) try std.testing.expect(swapped > 2 and swapped < 14) else try std.testing.expectEqual(@as(usize, 2), swapped);
+}
+
 test "TF_GLM53_PREFILL_W8A8 replaces only the prefill o_proj launch; off and decode launch exactly as before" {
     try std.testing.expect(!forward.prefillW8a8Selected(null));
     try std.testing.expect(!forward.prefillW8a8Selected("0"));
@@ -1495,6 +1978,73 @@ test "TF_GLM53_PREFILL_W8A8 replaces only the prefill o_proj launch; off and dec
     // Setup refuses the switch without its kernels.
     fx.k.w8a8 = null;
     try std.testing.expectError(error.MissingW8a8Kernels, f.validateSetup());
+}
+
+test "TF_GLM53_PREFILL_W8A8=2 adds the other served prefill projections; 0 and 1 stay on today's launches" {
+    try std.testing.expectEqual(@as(u8, 0), forward.prefillW8a8LevelSelected(null));
+    try std.testing.expectEqual(@as(u8, 0), forward.prefillW8a8LevelSelected("0"));
+    try std.testing.expectEqual(@as(u8, 0), forward.prefillW8a8LevelSelected("true"));
+    try std.testing.expectEqual(@as(u8, 0), forward.prefillW8a8LevelSelected("3"));
+    try std.testing.expectEqual(@as(u8, 1), forward.prefillW8a8LevelSelected("1"));
+    try std.testing.expectEqual(@as(u8, 2), forward.prefillW8a8LevelSelected("2"));
+    try std.testing.expect(forward.prefillW8a8Selected("1"));
+    try std.testing.expect(forward.prefillW8a8Selected("2"));
+    try std.testing.expect(!forward.prefillW8a8Selected("true"));
+    try std.testing.expect(!forward.prefillW8a8AllSelected("1"));
+    try std.testing.expect(forward.prefillW8a8AllSelected("2"));
+
+    var g = geometry();
+    g.prefill_w8a8_all = true;
+    var fx: Fixture = undefined;
+    try fx.init(g, 16384);
+    defer fx.deinit();
+    try std.testing.expectEqual(@as(usize, 1024), fx.st.ws.piece_rows);
+    try std.testing.expectEqual(@as(u64, 6_488_064), fx.st.ws.sizes.w8a8_scratch);
+    var f = fx.fwd(1);
+    const pos: [5]usize = .{ 4096, 4097, 4098, 4099, 4100 };
+    const ids: [5]u32 = .{ 7, 8, 9, 10, 11 };
+    const rows: usize = pos.len;
+    fx.k.w8a8 = fakeW8a8();
+
+    try f.pieced(.{ .positions = &pos, .tokens = &ids });
+    const baseline = try gpa.dupe(Launch, Rec.launches.items);
+    defer gpa.free(baseline);
+
+    Rec.reset();
+    f.prefill_w8a8 = true;
+    f.prefill_w8a8_all = false;
+    try f.validateSetup();
+    try f.pieced(.{ .positions = &pos, .tokens = &ids });
+    try expectPrefillW8a8Launches(baseline, Rec.launches.items, rows, fx.st.ws.part, fx.st.ws.w8a8_scratch, false);
+
+    Rec.reset();
+    f.prefill_w8a8_all = true;
+    try f.validateSetup();
+    try f.pieced(.{ .positions = &pos, .tokens = &ids });
+    try expectPrefillW8a8Launches(baseline, Rec.launches.items, rows, fx.st.ws.part, fx.st.ws.w8a8_scratch, true);
+
+    Rec.reset();
+    f.prefill_w8a8 = false;
+    f.prefill_w8a8_all = false;
+    try f.whole(.{ .positions = &.{100}, .tokens = &.{7} });
+    const decode_off = try gpa.dupe(Launch, Rec.launches.items);
+    defer gpa.free(decode_off);
+    Rec.reset();
+    f.prefill_w8a8 = true;
+    f.prefill_w8a8_all = true;
+    try f.whole(.{ .positions = &.{100}, .tokens = &.{7} });
+    try expectSameLaunches(decode_off, Rec.launches.items);
+    for (Rec.launches.items) |launch| try std.testing.expect(launch.name != id("tf_glm53_w8a8_quant") and launch.name != id("tf_glm53_w8a8_gemm"));
+
+    f.prefill_w8a8 = false;
+    f.prefill_w8a8_all = true;
+    try std.testing.expectError(error.W8a8Level, f.validateSetup());
+    f.prefill_w8a8 = true;
+    fx.k.w8a8 = null;
+    try std.testing.expectError(error.MissingW8a8Kernels, f.validateSetup());
+    fx.k.w8a8 = fakeW8a8();
+    fx.st.ws.sizes.w8a8_scratch = 0;
+    try std.testing.expectError(error.W8a8Scratch, f.validateSetup());
 }
 
 test "SMLA-P refuses scalar attend during setup" {
@@ -1641,6 +2191,76 @@ test "TF_GLM53_DECODE_UNION parsing" {
     try std.testing.expect(forward.decodeUnionSelected("1"));
 }
 
+test "OWN_ATTEND and Q_ONE_GATHER switches accept only exact opt-in" {
+    for ([_]?[]const u8{ null, "0", "true", "2" }) |value| {
+        try std.testing.expect(!forward.ownAttendSelected(value));
+        try std.testing.expect(!forward.qOneGatherSelected(value));
+    }
+    try std.testing.expect(forward.ownAttendSelected("1"));
+    try std.testing.expect(forward.qOneGatherSelected("1"));
+}
+
+test "own attend and one query gather dispatch two head groups with matching collectives" {
+    const cases = [_]struct { own: bool, one: bool }{ .{ .own = true, .one = false }, .{ .own = false, .one = true }, .{ .own = true, .one = true } };
+    for (cases) |case| {
+        var g = geometry();
+        g.decode_side = case.own;
+        g.own_attend = case.own;
+        g.q_one_gather = case.one;
+        g.decode_mla = case.one;
+        g.decode_mla_v2 = case.one;
+        g.decode_mla_v3 = case.one;
+        var fx: Fixture = undefined;
+        try fx.init(g, 16384);
+        defer fx.deinit();
+        fx.k.mla.attend_kernel = .mma;
+        fx.k.mla.attend_verify_fn = func("tf_glm53_attend_verify");
+        var f = fx.fwd(0);
+        f.own_attend = case.own;
+        f.q_one_gather = case.one;
+        f.decode_union = case.own;
+        try f.whole(.{ .positions = &.{ 100, 101 }, .tokens = &.{ 7, 8 } });
+        var query_gathers: usize = 0;
+        for (Rec.gathers.items) |gather| if (gather.phase == .absorbed_query) {
+            const qa_bytes = 2 * 32 * 512 * 2;
+            const qpe_bytes = 2 * 32 * 64 * 2;
+            query_gathers += 1;
+            if (case.one) {
+                try std.testing.expectEqual(qa_bytes + qpe_bytes, gather.bytes);
+            } else {
+                try std.testing.expect(gather.bytes == qa_bytes or gather.bytes == qpe_bytes);
+            }
+        };
+        try std.testing.expectEqual(if (case.one) @as(usize, 2) else @as(usize, 4), query_gathers);
+        var verify_launches: usize = 0;
+        for (Rec.launches.items) |launch| {
+            if (launch.name == id("tf_glm53_attend_verify")) verify_launches += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 4), verify_launches);
+        if (case.own) {
+            var side_attends: usize = 0;
+            var fork_records: usize = 0;
+            var fork_waits: usize = 0;
+            var done_records: usize = 0;
+            var done_waits: usize = 0;
+            const fork_handle = @intFromPtr(fx.st.attn_fork.?.handle.?);
+            const done_handle = @intFromPtr(fx.st.attn_done.?.handle.?);
+            for (Rec.order.items) |event| {
+                if (event.kind == .launch and event.what == id("tf_glm53_attend_verify") and event.stream == 0x51de) side_attends += 1;
+                if (event.what == fork_handle and event.kind == .record) fork_records += 1;
+                if (event.what == fork_handle and event.kind == .wait) fork_waits += 1;
+                if (event.what == done_handle and event.kind == .record) done_records += 1;
+                if (event.what == done_handle and event.kind == .wait) done_waits += 1;
+            }
+            try std.testing.expectEqual(@as(usize, 2), side_attends);
+            try std.testing.expectEqual(@as(usize, 2), fork_records);
+            try std.testing.expectEqual(@as(usize, 2), fork_waits);
+            try std.testing.expectEqual(@as(usize, 2), done_records);
+            try std.testing.expectEqual(@as(usize, 2), done_waits);
+        }
+    }
+}
+
 test "decode union off launches exactly attend_mma; on swaps decode attend in 1..8 rows" {
     var fx: Fixture = undefined;
     try fx.init(geometry(), 16384);
@@ -1731,8 +2351,18 @@ test "decode union setup refuses scalar attend and a missing kernel" {
     try std.testing.expectError(error.DecodeUnionWithScalarAttend, f.validateSetup());
     f.decode_union = false;
     try f.validateSetup();
+    f.q_one_gather = true;
+    try std.testing.expectError(error.QOneGatherNeedsDecodeMla3, f.validateSetup());
+    f.decode_mla_v3 = true;
+    fx.k.mla.attend_verify_fn = null;
+    try std.testing.expectError(error.MissingQOneGatherKernel, f.validateSetup());
+    fx.k.mla.attend_verify_fn = func("tf_glm53_attend_verify");
+    try f.validateSetup();
+    f.q_one_gather = false;
+    f.decode_mla_v3 = null;
     fx.k.mla.attend_kernel = .mma;
     f.decode_union = true;
+    fx.k.mla.attend_verify_fn = null;
     try std.testing.expectError(error.MissingDecodeUnionKernel, f.validateSetup());
     fx.k.mla.attend_verify_fn = func("tf_glm53_attend_verify");
     try f.validateSetup();
@@ -2030,13 +2660,108 @@ test "decode: every buffer has the kernel contract's size and exchange bytes equ
     var ls: [2]forward.Layer = undefined;
     try expectPlan(try f.stepPlan(.decode, &pos, pos.len, &ls));
     // DCP2 decode: 36,864 B per row of absorbed query, 32,896 B per peer partial/LSE block.
-    try std.testing.expectEqual([2]usize{ 2 * 8 * 36864, 4 }, recorded(.absorbed_query));
-    try std.testing.expectEqual([2]usize{ 2 * 8 * 32896, 2 }, recorded(.attention_partial));
+    const expected_absorbed_query = [2]usize{ 2 * 8 * 36864, 4 };
+    const actual_absorbed_query = recorded(.absorbed_query);
+    try std.testing.expectEqualSlices(usize, &expected_absorbed_query, &actual_absorbed_query);
+    const expected_attention_partial = [2]usize{ 2 * 8 * 32896, 2 };
+    const actual_attention_partial = recorded(.attention_partial);
+    try std.testing.expectEqualSlices(usize, &expected_attention_partial, &actual_attention_partial);
     for (Rec.gathers.items) |g| if (g.phase == .attention_partial) {
         try std.testing.expect(g.send_recv);
         try std.testing.expectEqual(@as(usize, 32896 * 8), g.bytes);
         try std.testing.expectEqual(g.bytes, g.recv_bytes);
     };
+}
+
+test "partial RoCE host dispatch follows TF_GLM53_PARTIAL_ROCE for attention partials" {
+    const enabled = forward.partialRoceSwitch();
+    var g = geometry();
+    g.partial_roce = enabled;
+    var fx: Fixture = undefined;
+    try fx.init(g, 16384);
+    defer fx.deinit();
+    var f = fx.fwd(0);
+    f.partial_roce = enabled;
+    const positions = [_]usize{ 100, 101, 102, 103, 104, 105, 106, 107 };
+    const tokens = [_]u32{ 7, 8, 9, 10, 11, 12, 13, 14 };
+    for (1..9) |rows| {
+        Rec.reset();
+        try f.whole(.{ .positions = positions[0..rows], .tokens = tokens[0..rows] });
+
+        var partial_calls: usize = 0;
+        for (Rec.gathers.items) |exchange| if (exchange.phase == .attention_partial) {
+            partial_calls += 1;
+            try std.testing.expectEqual(!enabled, exchange.send_recv);
+            try std.testing.expectEqual(rows * 32896, exchange.bytes);
+            if (!enabled) try std.testing.expectEqual(exchange.bytes, exchange.recv_bytes);
+        };
+        try std.testing.expectEqual(@as(usize, 2), partial_calls);
+
+        var merge_after_exchange = false;
+        for (Rec.order.items, 0..) |step, i| if (step.kind == .collective and step.what == @backingInt(forward.Phase.attention_partial)) {
+            if (i + 1 < Rec.order.items.len) {
+                const next = Rec.order.items[i + 1];
+                merge_after_exchange = next.kind == .launch and next.what == id("tf_glm53_mla_merge");
+            }
+        };
+        try std.testing.expect(merge_after_exchange);
+    }
+}
+
+test "decode levers from the environment launch the serving kernels (B0)" {
+    const route_compact = forward.routeCompactSelected(if (std.c.getenv("TF_GLM53_ROUTE_COMPACT")) |v| std.mem.span(v) else null);
+    const own = forward.ownAttendSwitch();
+    const one = forward.qOneGatherSwitch();
+    const partial = forward.partialRoceSwitch();
+    var g = geometry();
+    g.decode_side = true;
+    g.route_compact = route_compact;
+    g.own_attend = own;
+    g.q_one_gather = one;
+    g.partial_roce = partial;
+    g.decode_mla = one;
+    g.decode_mla_v2 = one;
+    g.decode_mla_v3 = one;
+    var fx: Fixture = undefined;
+    try fx.init(g, 16384);
+    defer fx.deinit();
+    fx.k.mla.attend_kernel = .mma;
+    fx.k.mla.attend_verify_fn = func("tf_glm53_attend_verify");
+    var f = fx.fwd(0);
+    f.decode_side = true;
+    f.decode_union = own or one;
+    f.route_compact = route_compact;
+    f.own_attend = own;
+    f.q_one_gather = one;
+    f.partial_roce = partial;
+    try f.whole(.{ .positions = &.{ 100, 101, 102, 103 }, .tokens = &.{ 7, 8, 9, 10 } });
+    var compact: usize = 0;
+    var legacy: usize = 0;
+    var verify: usize = 0;
+    var side_verify: usize = 0;
+    for (Rec.order.items) |rec_step| {
+        if (rec_step.kind == .launch) {
+            compact += @intFromBool(rec_step.what == id("tf_glm_topk_compact"));
+            legacy += @intFromBool(rec_step.what == id("tf_glm_topk"));
+            verify += @intFromBool(rec_step.what == id("tf_glm53_attend_verify"));
+            side_verify += @intFromBool(rec_step.what == id("tf_glm53_attend_verify") and rec_step.stream == 0x51de);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, @intFromBool(route_compact)), compact);
+    try std.testing.expectEqual(@as(usize, @intFromBool(!route_compact)), legacy);
+    try std.testing.expectEqual(@as(usize, if (own or one) 4 else 0), verify);
+    try std.testing.expectEqual(@as(usize, if (own) 2 else 0), side_verify);
+    var query_gathers: usize = 0;
+    var partials: usize = 0;
+    for (Rec.gathers.items) |exchange| {
+        if (exchange.phase == .absorbed_query) query_gathers += 1;
+        if (exchange.phase == .attention_partial) {
+            partials += 1;
+            try std.testing.expectEqual(!partial, exchange.send_recv);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, if (one) 2 else 4), query_gathers);
+    try std.testing.expectEqual(@as(usize, 2), partials);
 }
 
 test "prefill in 1024-row pieces: buffers fit, exchanges equal the plan per piece" {
@@ -2060,9 +2785,11 @@ test "prefill in 1024-row pieces: buffers fit, exchanges equal the plan per piec
     try std.testing.expectEqual(@as(usize, 4), recorded(.embed)[1]);
 }
 
-test "ATTN_PIPE moves only comm-stream gathers to the pipe communicator" {
+fn expectAttnPipeMoeRing(moe_ring: u8) !void {
     var fx: Fixture = undefined;
-    try fx.init(commPipeGeometry(), 16384);
+    var ring_geometry = commPipeGeometry();
+    ring_geometry.moe_ring = moe_ring;
+    try fx.init(ring_geometry, 16384);
     defer fx.deinit();
     var f = fx.fwd(0);
     f.piece_pipe = true;
@@ -2120,6 +2847,11 @@ test "ATTN_PIPE moves only comm-stream gathers to the pipe communicator" {
     for (decode_launches, Rec.launches.items) |want, got| try std.testing.expect(std.meta.eql(want, got));
     try std.testing.expectEqual(decode_gathers.len, Rec.gathers.items.len);
     for (decode_gathers, Rec.gathers.items) |want, got| try std.testing.expect(std.meta.eql(want, got));
+}
+
+test "ATTN_PIPE moves only comm-stream gathers to the pipe communicator for ring sizes two and eight" {
+    try expectAttnPipeMoeRing(2);
+    try expectAttnPipeMoeRing(8);
 }
 
 test "ATTN_PIPE setup refuses missing comm stream, shared communicators and TBO" {
@@ -2452,12 +3184,55 @@ test "candidate heads fill WP10's sentinels before each 64-row part/merge tile" 
     try f.pieced(.{ .positions = &pos, .tokens = &ids });
     var heads: std.ArrayList(usize) = .empty;
     defer heads.deinit(gpa);
-    for (Rec.launches.items) |l| if (l.name == id("tf_glm53_cand_fill_f32") or l.name == id("tf_glm53_cand_part_f32") or l.name == id("tf_glm53_cand_merge_f32")) try heads.append(gpa, l.name);
-    // 100 gate rows in head blocks of 64: two blocks, each fill -> part -> merge.
-    const tile = [_]usize{ id("tf_glm53_cand_fill_f32"), id("tf_glm53_cand_part_f32"), id("tf_glm53_cand_merge_f32") };
+    const part_name = if (candFastFromEnv()) id("tf_glm53_cand_part_fast_f32") else id("tf_glm53_cand_part_f32");
+    const v2 = candV2FromEnv();
+    for (Rec.launches.items) |l| {
+        if (v2) {
+            if (l.name == id("tf_glm53_cand2_fill_f32") or l.name == id("tf_glm53_cand2_hist_f32") or l.name == id("tf_glm53_cand2_select_f32")) try heads.append(gpa, l.name);
+        } else if (l.name == id("tf_glm53_cand_fill_f32") or l.name == part_name or l.name == id("tf_glm53_cand_merge_f32")) try heads.append(gpa, l.name);
+    }
+    // 100 gate rows in head blocks of 64: two candidate-kernel tiles.
+    const tile = if (v2) [_]usize{ id("tf_glm53_cand2_fill_f32"), id("tf_glm53_cand2_hist_f32"), id("tf_glm53_cand2_select_f32") } else [_]usize{ id("tf_glm53_cand_fill_f32"), part_name, id("tf_glm53_cand_merge_f32") };
     const want = tile ++ tile;
     try std.testing.expectEqualSlices(usize, &want, heads.items);
     try std.testing.expectEqual(@as(usize, 2), recorded(.head)[1]);
+}
+
+test "CAND_V2 from the environment: fill2, hist and select per tile where the scratch holds 16 KiB a row" {
+    const on = candV2FromEnv();
+    for ([_]usize{ 64, 32 }) |kc| {
+        var g = geometry();
+        g.head_rows = 64;
+        g.candidate_k = kc;
+        var fx: Fixture = undefined;
+        try fx.init(g, 16384);
+        defer fx.deinit();
+        var f = fx.fwd(0);
+        f.head = .{ .candidates = kc };
+        f.gate_mode = true;
+        var pos: [100]usize = undefined;
+        var ids: [100]u32 = undefined;
+        for (&pos, &ids, 0..) |*p, *t, i| {
+            p.* = i;
+            t.* = 1;
+        }
+        try f.pieced(.{ .positions = &pos, .tokens = &ids });
+        const v2_used = on and kc == 64;
+        var selects: usize = 0;
+        var merges: usize = 0;
+        for (Rec.launches.items) |l| {
+            if (l.name == id("tf_glm53_cand2_select_f32")) {
+                try std.testing.expectEqual(@as(u32, 1024), l.block[0]);
+                try std.testing.expectEqual(@as(u32, 35_880), l.shared);
+                try std.testing.expect(l.grid[0] == 64 or l.grid[0] == 36);
+                selects += 1;
+            }
+            if (l.name == id("tf_glm53_cand2_hist_f32")) try std.testing.expectEqual(@as(u32, 32), l.grid[1]);
+            merges += @intFromBool(l.name == id("tf_glm53_cand_merge_f32"));
+        }
+        try std.testing.expectEqual(@as(usize, if (v2_used) 2 else 0), selects);
+        try std.testing.expectEqual(@as(usize, if (v2_used) 0 else 2), merges);
+    }
 }
 
 const FakeHead = struct {
@@ -2505,6 +3280,9 @@ const HookProbe = struct {
         p.restart_from = from;
         p.record(.{ .kind = .restart, .a = from });
     }
+    fn rewind(ctx: *anyopaque, _: usize, from: usize) anyerror!void {
+        return restart(ctx, from);
+    }
     fn prompt(ctx: *anyopaque, start: usize, rows: usize) anyerror!void {
         const p: *HookProbe = @ptrCast(@alignCast(ctx));
         p.prompts += 1;
@@ -2519,7 +3297,7 @@ const HookProbe = struct {
         p.verify_pos = pos0;
         p.record(.{ .kind = .verify, .a = rows, .b = pos0 });
     }
-    fn draft(ctx: *anyopaque, pos: usize, n: usize, anchor: u32, _: ?[]u32, _: ?[]f64) anyerror!void {
+    fn draft(ctx: *anyopaque, pos: usize, n: usize, anchor: u32, _: ?[]u32, _: ?[]f64, _: u64, _: f64) anyerror!void {
         const p: *HookProbe = @ptrCast(@alignCast(ctx));
         p.drafts += 1;
         p.draft_pos = pos;
@@ -2542,6 +3320,7 @@ test "engine drafter hooks: restart, ingest, verify and draft bookkeeping" {
         .taps_prefill = .{ .f = func("df_tap_glm"), .out = 0x9b00_0000, .layers = &.{0}, .cap_rows = 2048 },
         .taps_step = .{ .f = func("df_tap_glm"), .out = 0x9b00_1000, .layers = &.{0}, .cap_rows = 8 },
         .restart_fn = HookProbe.restart,
+        .rewind_fn = HookProbe.rewind,
         .prompt_fn = HookProbe.prompt,
         .verify_fn = HookProbe.verify,
         .draft_fn = HookProbe.draft,
@@ -2679,6 +3458,36 @@ test "engine: verify draws greedy tokens across ranks with ties to the lower id;
     try std.testing.expectEqual(@as(usize, 4), e.pos);
     try std.testing.expect(e.keys.contains(try engine.decodeKey(3, 5)));
     try std.testing.expect(e.keys.contains(try engine.prefillKey(3)));
+}
+
+test "engine: TF_GLM53_LAZY_DRAW stops drawing at the first rejection" {
+    const lazy = if (std.c.getenv("TF_GLM53_LAZY_DRAW")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+    var fx: Fixture = undefined;
+    try fx.init(geometry(), 16384);
+    defer fx.deinit();
+    var e: engine.Engine = .{ .gpa = gpa, .f = fx.fwd(0), .download = .{ .download_fn = FakeHead.download }, .auto_graphs = false, .lazy_draw = lazy };
+    defer e.deinit();
+    FakeHead.rows[0][0] = .{ .v = 2.0, .id = 11 };
+    FakeHead.rows[1][0] = .{ .v = 2.0, .id = 77440 + 5 };
+    FakeHead.rows[0][1] = .{ .v = 1.0, .id = 3 };
+    FakeHead.rows[1][1] = .{ .v = 1.5, .id = 77440 + 9 };
+    FakeHead.rows[0][2] = .{ .v = std.math.nan(f32), .id = 4 };
+    FakeHead.rows[1][2] = .{ .v = -1.0, .id = 77440 + 1 };
+    _ = try e.prefill(&.{ 5, 6, 7 });
+    Rec.reset();
+    var out: [3]u32 = undefined;
+    try e.verify(&.{ 1, 11, 3 }, &out);
+    const expected: []const u32 = if (lazy) &.{ 11, 77440 + 9, engine.lazy_undrawn } else &.{ 11, 77440 + 9, 77440 + 1 };
+    try std.testing.expectEqualSlices(u32, expected, &out);
+    const launch_count = Rec.launches.items.len;
+    const launches = try gpa.dupe(Launch, Rec.launches.items);
+    defer gpa.free(launches);
+    e.full_draw = true;
+    try e.verify(&.{ 1, 11, 3 }, &out);
+    try std.testing.expectEqualSlices(u32, &.{ 11, 77440 + 9, 77440 + 1 }, &out);
+    try std.testing.expect(!e.full_draw);
+    try std.testing.expectEqual(launch_count * 2, Rec.launches.items.len);
+    try std.testing.expectEqualSlices(Launch, launches, Rec.launches.items[launch_count..]);
 }
 
 const FakeGraphs = struct {
@@ -3009,6 +3818,93 @@ test "bring-up: TP2 + DCP2 over layers 0-7 (dense 0-2, MoE 3-7, full indexers 0,
         fetched += 1;
     };
     try std.testing.expectEqual(@as(usize, 2 * 8), fetched); // chunk 2 only: latent + rope for each of 8 layers
+}
+
+test "ADD_NORM_FUSE from the environment: decode layers before the last also write the next input norm" {
+    const on = forward.addNormFuseSwitch();
+    var g = geometry();
+    g.layers = 8;
+    g.full_index_layers = 4;
+    var fx: Fixture = undefined;
+    try fx.init(g, 16384);
+    defer fx.deinit();
+    for (0..8) |i| fx.layer_store[i] = glmLayer(i, i < 3, i < 3 or i == 6);
+    fx.model.layers = fx.layer_store[0..8];
+    fx.k.moe_residual_rmsnorm_6144 = func("tf_glm53_moe_residual_rmsnorm_6144");
+    var f = fx.fwd(1);
+    f.add_norm_fuse = on;
+    try f.whole(.{ .positions = &.{ 100, 101, 102, 103 }, .tokens = &.{ 1, 2, 3, 4 } });
+    var moe_fused: usize = 0;
+    var moe_add: usize = 0;
+    var dense_add: usize = 0;
+    var post: usize = 0;
+    var in_norm: usize = 0;
+    var dense_fused: usize = 0;
+    for (Rec.launches.items) |l| {
+        if (l.name == id("tf_glm53_moe_residual_rmsnorm_6144")) {
+            try std.testing.expectEqual(fx.layer_store[4 + moe_fused].in_norm, l.args[2]);
+            try std.testing.expectEqual(fx.st.ws.xn, l.args[3]);
+            moe_fused += 1;
+        }
+        if (l.name == id("tf_glm53_moe_residual_add")) {
+            moe_add += 1;
+        }
+        if (l.name == id("tf_glm_residual_add")) {
+            dense_add += 1;
+        }
+        if (l.name == id("tf_glm53_residual_rmsnorm_6144")) {
+            post += 1;
+            for (fx.layer_store[1..4]) |next| {
+                dense_fused += @intFromBool(l.args[2] == next.in_norm);
+            }
+        }
+        if (l.name == id("tf_glm_rmsnorm_6144")) {
+            in_norm += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, if (on) 4 else 0), moe_fused);
+    try std.testing.expectEqual(@as(usize, if (on) 1 else 5), moe_add);
+    try std.testing.expectEqual(@as(usize, if (on) 0 else 3), dense_add);
+    try std.testing.expectEqual(@as(usize, if (on) 11 else 8), post);
+    try std.testing.expectEqual(@as(usize, if (on) 3 else 0), dense_fused);
+    try std.testing.expectEqual(@as(usize, if (on) 2 else 9), in_norm);
+    for (Rec.order.items, 0..) |st, i| if (st.kind == .launch and st.what == id("tf_glm53_moe_residual_rmsnorm_6144")) {
+        try std.testing.expect(i > 0 and Rec.order.items[i - 1].kind == .collective and Rec.order.items[i - 1].what == @backingInt(forward.Phase.moe_partial));
+    };
+    Rec.reset();
+    try f.pieced(.{ .positions = &.{ 0, 1, 2, 3 }, .tokens = &.{ 1, 2, 3, 4 } });
+    for (Rec.launches.items) |l| try std.testing.expect(l.name != id("tf_glm53_moe_residual_rmsnorm_6144"));
+}
+
+test "QPE_ABSORB_FUSE from the environment swaps q_pe pack + absorb v3 for one launch" {
+    const on = forward.qpeAbsorbFuseSwitch();
+    var g = geometry();
+    g.decode_mla = true;
+    g.decode_mla_v2 = true;
+    g.decode_mla_v3 = true;
+    var fx: Fixture = undefined;
+    try fx.init(g, 16384);
+    defer fx.deinit();
+    fx.k.mla.absorb_qpe_v3_fn = func("tf_glm53_absorb_qpe_decode_v3");
+    var f = fx.fwd(0);
+    f.qpe_absorb_fuse = on;
+    try f.whole(.{ .positions = &.{ 100, 101, 102, 103 }, .tokens = &.{ 7, 8, 9, 10 } });
+    var pack: usize = 0;
+    var v3: usize = 0;
+    var fused: usize = 0;
+    for (Rec.launches.items) |l| {
+        pack += @intFromBool(l.name == id("tf_glm53_qpe_pack"));
+        v3 += @intFromBool(l.name == id("tf_glm53_absorb_decode_v3"));
+        if (l.name == id("tf_glm53_absorb_qpe_decode_v3")) {
+            fused += 1;
+            try std.testing.expectEqual([3]u32{ 8, 32, 1 }, l.grid);
+            try std.testing.expectEqual(@as(u32, 128), l.block[0]);
+            try std.testing.expectEqual(@as(u64, 4), l.args[4]);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, if (on) 0 else 2), pack);
+    try std.testing.expectEqual(@as(usize, if (on) 0 else 2), v3);
+    try std.testing.expectEqual(@as(usize, if (on) 2 else 0), fused);
 }
 
 fn eventRecordIndex(handle: usize, start: usize) ?usize {

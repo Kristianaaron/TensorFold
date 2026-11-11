@@ -223,6 +223,168 @@ fn contextKv64(gpu: anytype, module: cuda.Module, s: cuda.Stream) !void {
     check.pass("DSpark context KV write at short and wrapped positions vs host", .{});
 }
 
+fn contextKvStage64(gpu: anytype, module: cuda.Module, s: cuda.Stream) !void {
+    const a = gpu.gpa;
+    const stage_fn = try module.function("df_ctx_kv_stage_glm");
+    const ring_fn = try module.function("df_ctx_kv_glm");
+    const R: usize = 8;
+    const KVW: usize = 4096;
+    const S: usize = 16;
+    const kv_h = try randomBf16(a, R * 2 * KVW, 0xd5a4_251);
+    defer a.free(kv_h);
+    const kn_h = try randomBf16(a, 64, 0xd5a4_252);
+    defer a.free(kn_h);
+    const pos_h = [_]i64{ 1, 39, 40, 2046, 2047, 2048, 3000, 3001 };
+    var kv = try upload(gpu, std.mem.sliceAsBytes(kv_h));
+    defer kv.free();
+    var kn = try upload(gpu, std.mem.sliceAsBytes(kn_h));
+    defer kn.free();
+    var pos = try upload(gpu, std.mem.sliceAsBytes(&pos_h));
+    defer pos.free();
+    var stage = try cuda.DeviceBuffer.alloc(gpu.d, 3 * 2 * S * KVW * @sizeOf(u16));
+    defer stage.free();
+    const ring_len = 3 * 2 * 2048 * KVW * @sizeOf(u16);
+    var ring = try cuda.DeviceBuffer.alloc(gpu.d, ring_len);
+    defer ring.free();
+    try ring.fill8(0, s.handle);
+    const ring_ptrs: [R]u64 = @splat(ring.ptr);
+    var rings = try upload(gpu, std.mem.sliceAsBytes(&ring_ptrs));
+    defer rings.free();
+    var side = try cuda.Stream.init(gpu.d, true);
+    defer side.deinit();
+    var shared_workspace = try cuda.DeviceBuffer.alloc(gpu.d, 64 * 1024);
+    defer shared_workspace.free();
+    try s.synchronize();
+
+    for ([_]i32{ 0, 2 }) |layer| {
+        var staged: cuda.Args = .{};
+        staged.add(kv.ptr);
+        staged.add(kn.ptr);
+        staged.add(pos.ptr);
+        staged.add(stage.ptr);
+        staged.add(layer);
+        staged.add(@as(f32, 1e-5));
+        staged.add(@as(f32, 8_000_000));
+        staged.add(@as(i32, 64));
+        staged.add(@as(i32, 64));
+        staged.add(@as(i32, KVW));
+        staged.add(@as(i32, S));
+        try cuda.launch.launch(stage_fn, .{ .grid = .{ .x = R, .y = 64 }, .block = .{ .x = 32 } }, side, &staged);
+        for (0..32) |_| try shared_workspace.fill8(0xa5, s.handle);
+        var ordinary: cuda.Args = .{};
+        ordinary.add(kv.ptr);
+        ordinary.add(kn.ptr);
+        ordinary.add(pos.ptr);
+        ordinary.add(rings.ptr);
+        ordinary.add(layer);
+        ordinary.add(@as(f32, 1e-5));
+        ordinary.add(@as(f32, 8_000_000));
+        ordinary.add(@as(i32, 64));
+        ordinary.add(@as(i32, 64));
+        ordinary.add(@as(i32, KVW));
+        ordinary.add(@as(i32, 2048));
+        try cuda.launch.launch(ring_fn, .{ .grid = .{ .x = R, .y = 64 }, .block = .{ .x = 32 } }, s, &ordinary);
+    }
+    try s.synchronize();
+    try side.synchronize();
+    const stage_h = try a.alloc(u16, 3 * 2 * S * KVW);
+    defer a.free(stage_h);
+    const ring_h = try a.alloc(u16, ring_len / @sizeOf(u16));
+    defer a.free(ring_h);
+    try stage.download(0, std.mem.sliceAsBytes(stage_h));
+    try ring.download(0, std.mem.sliceAsBytes(ring_h));
+    for ([_]usize{ 0, 2 }) |layer| for (0..R) |r| {
+        const slot: usize = @intCast(@mod(pos_h[r], 2048));
+        const stage_k = ((layer * 2) * S + r) * KVW;
+        const stage_v = ((layer * 2 + 1) * S + r) * KVW;
+        const ring_k = (layer * 2 * 2048 + slot) * KVW;
+        const ring_v = (layer * 2 * 2048 + 2048 + slot) * KVW;
+        try check.sameBytes("DSpark staged context K equals ring K", std.mem.sliceAsBytes(stage_h[stage_k..][0..KVW]), std.mem.sliceAsBytes(ring_h[ring_k..][0..KVW]));
+        try check.sameBytes("DSpark staged context V equals ring V", std.mem.sliceAsBytes(stage_h[stage_v..][0..KVW]), std.mem.sliceAsBytes(ring_h[ring_v..][0..KVW]));
+    };
+    check.pass("DSpark staged context KV matches ring rows byte for byte at layers 0 and 2", .{});
+}
+
+fn ringCommit64(gpu: anytype, module: cuda.Module, s: cuda.Stream) !void {
+    const a = gpu.gpa;
+    const stage_fn = try module.function("df_ctx_kv_stage_glm");
+    const ring_fn = try module.function("df_ctx_kv_glm");
+    const commit_fn = try module.function("df_ring_commit_glm");
+    const R: usize = 8;
+    const KVW: usize = 4096;
+    const S: usize = 16;
+    const rows_h = try randomBf16(a, R * 2 * KVW, 0xd5a4_261);
+    defer a.free(rows_h);
+    const kn_h = try randomBf16(a, 64, 0xd5a4_262);
+    defer a.free(kn_h);
+    const pos_h = [_]i64{ 2046, 2047, 2048, 2049, 2050, 2051, 2052, 2053 };
+    var rows = try upload(gpu, std.mem.sliceAsBytes(rows_h));
+    defer rows.free();
+    var kn = try upload(gpu, std.mem.sliceAsBytes(kn_h));
+    defer kn.free();
+    var pos = try upload(gpu, std.mem.sliceAsBytes(&pos_h));
+    defer pos.free();
+    var stage = try cuda.DeviceBuffer.alloc(gpu.d, 3 * 2 * S * KVW * @sizeOf(u16));
+    defer stage.free();
+    const ring_len = 3 * 2 * 2048 * KVW * @sizeOf(u16);
+    var committed = try cuda.DeviceBuffer.alloc(gpu.d, ring_len);
+    defer committed.free();
+    var expected = try cuda.DeviceBuffer.alloc(gpu.d, ring_len);
+    defer expected.free();
+    try committed.fill8(0, s.handle);
+    try expected.fill8(0, s.handle);
+    const ring_ptrs: [R]u64 = @splat(expected.ptr);
+    var rings = try upload(gpu, std.mem.sliceAsBytes(&ring_ptrs));
+    defer rings.free();
+
+    for (0..3) |layer| {
+        var staged: cuda.Args = .{};
+        staged.add(rows.ptr);
+        staged.add(kn.ptr);
+        staged.add(pos.ptr);
+        staged.add(stage.ptr);
+        staged.add(@as(i32, @intCast(layer)));
+        staged.add(@as(f32, 1e-5));
+        staged.add(@as(f32, 8_000_000));
+        staged.add(@as(i32, 64));
+        staged.add(@as(i32, 64));
+        staged.add(@as(i32, KVW));
+        staged.add(@as(i32, S));
+        try cuda.launch.launch(stage_fn, .{ .grid = .{ .x = R, .y = 64 }, .block = .{ .x = 32 } }, s, &staged);
+        var ordinary: cuda.Args = .{};
+        ordinary.add(rows.ptr);
+        ordinary.add(kn.ptr);
+        ordinary.add(pos.ptr);
+        ordinary.add(rings.ptr);
+        ordinary.add(@as(i32, @intCast(layer)));
+        ordinary.add(@as(f32, 1e-5));
+        ordinary.add(@as(f32, 8_000_000));
+        ordinary.add(@as(i32, 64));
+        ordinary.add(@as(i32, 64));
+        ordinary.add(@as(i32, KVW));
+        ordinary.add(@as(i32, 2048));
+        try cuda.launch.launch(ring_fn, .{ .grid = .{ .x = 5, .y = 64 }, .block = .{ .x = 32 } }, s, &ordinary);
+    }
+    var commit: cuda.Args = .{};
+    commit.add(stage.ptr);
+    commit.add(committed.ptr);
+    commit.add(@as(i64, 2046));
+    commit.add(@as(i32, 5));
+    commit.add(@as(i32, KVW));
+    commit.add(@as(i32, 2048));
+    commit.add(@as(i32, S));
+    try cuda.launch.launch(commit_fn, .{ .grid = .{ .x = 5, .y = 6 }, .block = .{ .x = 256 } }, s, &commit);
+    try s.synchronize();
+    const got = try a.alloc(u16, ring_len / @sizeOf(u16));
+    defer a.free(got);
+    const want = try a.alloc(u16, ring_len / @sizeOf(u16));
+    defer a.free(want);
+    try committed.download(0, std.mem.sliceAsBytes(got));
+    try expected.download(0, std.mem.sliceAsBytes(want));
+    try check.sameBytes("DSpark staged ring commit writes only the kept prefix", std.mem.sliceAsBytes(got), std.mem.sliceAsBytes(want));
+    check.pass("DSpark ring commit matches ordinary context ingest for five kept wrapped rows", .{});
+}
+
 fn attentionRowHost(q: []const u16, kb: []const u16, vb: []const u16, ring: []const u16, anchor: i64, from: i64, row: usize, head: usize, out: []u16) void {
     const qrow = row * 64 * 64 + head * 64;
     var lo = anchor + @as(i64, @intCast(row)) - 2048;
@@ -526,6 +688,8 @@ pub fn run(gpu: anytype) !void {
     try smallOps(gpu, module, s);
     try blockQkv64(gpu, module, s);
     try contextKv64(gpu, module, s);
+    try contextKvStage64(gpu, module, s);
+    try ringCommit64(gpu, module, s);
     try blockAttention64(gpu, module, s);
     try top64(gpu, module, s);
 }

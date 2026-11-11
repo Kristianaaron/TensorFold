@@ -99,6 +99,56 @@ pub fn run(gpu: Gpu, rank: usize) !void {
     try timing(gpu, &g, s, rank);
 }
 
+/// Compares the partial block selected by each DCP rank through RoCE gather and NCCL send/receive.
+pub fn runGlmPartial(gpu: Gpu, rank: usize) !void {
+    const rows = 16;
+    const block: usize = rows * 32896;
+    try check.expect(std.c.getenv("NCCL_COMM_ID") != null, "glm53-partial-roce: NCCL_COMM_ID names rank 0's address", .{});
+    var s = try cuda.Stream.init(gpu.d, false);
+    defer s.deinit();
+    var g = try cuda.tp_group.Group.open(rank, 2);
+    defer g.close();
+    try g.openRoce(gpu.gpa, gpu.io, gpu.d, s, 4 << 20, true);
+    try check.expect(g.fast != null, "glm53-partial-roce: RoCE gather did not come up on both ranks", .{});
+
+    var mine = try cuda.DeviceBuffer.alloc(gpu.d, 2 * block);
+    defer mine.free();
+    var by_roce = try cuda.DeviceBuffer.alloc(gpu.d, 5 * block);
+    defer by_roce.free();
+    var by_nccl = try cuda.DeviceBuffer.alloc(gpu.d, block);
+    defer by_nccl.free();
+    const local = try gpu.gpa.alloc(u8, 2 * block);
+    defer gpu.gpa.free(local);
+    const gathered = try gpu.gpa.alloc(u8, 2 * block);
+    defer gpu.gpa.free(gathered);
+    const received = try gpu.gpa.alloc(u8, block);
+    defer gpu.gpa.free(received);
+    for (0..2) |head_rank| {
+        for (0..block) |i| {
+            local[head_rank * block + i] = @truncate(rank * 113 + head_rank * 47 + i * 13);
+        }
+    }
+    try mine.upload(0, local);
+    const peer = 1 - rank;
+    const send = mine.ptr + peer * block;
+    const pair = by_roce.ptr + 3 * block;
+    try g.oneShotGather(s, send, pair, block);
+    try g.lib.check(g.lib.api.ncclGroupStart(), "ncclGroupStart(GLM partial reference)");
+    try g.lib.check(g.lib.api.ncclSend(send, block, .u8, @intCast(peer), g.comm, s.handle), "ncclSend(GLM partial reference)");
+    try g.lib.check(g.lib.api.ncclRecv(by_nccl.ptr, block, .u8, @intCast(peer), g.comm, s.handle), "ncclRecv(GLM partial reference)");
+    try g.lib.check(g.lib.api.ncclGroupEnd(), "ncclGroupEnd(GLM partial reference)");
+    try s.synchronize();
+    try g.check();
+    try by_roce.download(3 * block, gathered);
+    try by_nccl.download(0, received);
+    try check.sameBytes("GLM attention partial RoCE peer block against NCCL send/receive", gathered[peer * block ..][0..block], received);
+    for (0..block) |i| {
+        const expected: u8 = @truncate(peer * 113 + rank * 47 + i * 13);
+        try check.expect(gathered[peer * block + i] == expected, "glm53-partial-roce: peer partial byte {d} differs from the selected head block", .{i});
+    }
+    check.pass("glm53-partial-roce rank {d}: 16 x 32,896-byte partial gather matches NCCL send/receive", .{rank});
+}
+
 /// Prepared Spark comparison/equality target for the GLM hidden-width collectives (not run on Mac).
 pub fn runAllReduce(gpu: Gpu, rank: usize) !void {
     try check.expect(std.c.getenv("NCCL_COMM_ID") != null, "roce-allreduce: NCCL_COMM_ID names rank 0's address", .{});

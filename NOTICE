@@ -19,4 +19,7 @@ Parts of this fork follow MiaAI-Lab's GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold, whi
   GLM-5.3 EXL3 on 3x DGX Spark with TensorFold
   Copyright 2026 Mia's AI Lab (MiaAI-Lab)
 
+The no-L1-allocation EXL3 weight load helper in zig/kernels/cuda/exl3_decode.cuh is ported from ashhart/TensorFold PR #1534, Apache-2.0.
+The decode-window L2 prefetch in zig/src/families/glm_dsa/cuda/l2pf.zig follows zig/src/families/glm/cuda_l2pf.zig by Bizuayeu (ashhart/TensorFold PR #1580 and #2162), Apache-2.0.
+
 Third-party code and its licenses are listed in THIRD_PARTY_NOTICES.md.

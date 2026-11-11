@@ -201,6 +201,7 @@ const Trace = struct {
     kv: std.ArrayList(u8) = .empty,
     captured: u64 = 0,
     replayed: u64 = 0,
+    capture_mib: f64 = 0,
 
     fn deinit(t: *Trace, gpa: std.mem.Allocator) void {
         t.tokens.deinit(gpa);
@@ -210,7 +211,7 @@ const Trace = struct {
     }
 };
 
-const Scenario = struct { name: []const u8, prompt: usize, steps: usize, rank: usize = 0 };
+const Scenario = struct { name: []const u8, prompt: usize, steps: usize, rank: usize = 0, verify_rows: usize = 1 };
 
 fn record(t: *Trace, gpa: std.mem.Allocator, f: forward.Forward, st: *const state.State, row: []u8, e: *const engine.Engine, tok: u32) !void {
     try f.stream.synchronize();
@@ -298,16 +299,21 @@ fn traceRun(gpa: std.mem.Allocator, f: forward.Forward, st: *state.State, sc: Sc
         e.frontier = sc.prompt;
     }
     try t.tokens.append(gpa, tok);
+    const verify_ids = try gpa.alloc(u32, sc.verify_rows);
+    defer gpa.free(verify_ids);
+    const verify_out = try gpa.alloc(u32, sc.verify_rows);
+    defer gpa.free(verify_out);
     for (0..sc.steps) |_| {
-        var out: [1]u32 = undefined;
-        try e.verify(&.{tok}, &out);
-        try record(&t, gpa, f, st, row, &e, out[0]);
-        try e.keep(1);
-        tok = out[0];
+        @memset(verify_ids, tok);
+        try e.verify(verify_ids, verify_out);
+        try record(&t, gpa, f, st, row, &e, verify_out[verify_out.len - 1]);
+        try e.keep(verify_ids.len);
+        tok = verify_out[verify_out.len - 1];
     }
     if (e.graphs) |cache| {
         t.captured = cache.stats.captured;
         t.replayed = cache.stats.replayed;
+        t.capture_mib = cache.stats.capture_mib;
     }
     try f.stream.synchronize();
     const kv = try gpa.alloc(u8, st.kv_arena.len);
@@ -335,6 +341,9 @@ pub fn run(gpu: Gpu) !void {
         loaded += 1;
     }
     var k = try forward.Kernels.load(.{ .glm_glue = mods[0], .glm53_glue = mods[1], .glm53_mla = mods[2], .glm53_index = mods[3], .glm53_head = mods[4] }, &lane, &ex, 4);
+    try k.mla.loadAttendVerify(mods[2]);
+    try k.loadAddNormFuse(mods[1]);
+    try k.mla.loadAbsorbQpeV3(mods[2]);
     k.ablate = try mods[1].function("tf_glm53_ablate_6144");
 
     var synth: Synth = .{ .d = d, .gpa = gpa };
@@ -350,7 +359,7 @@ pub fn run(gpu: Gpu) !void {
         .norm = try synth.bf16s(hidden, 1, 0.1),
         .head = try synth.bf16w(vocab_local, hidden, 0.02),
     };
-    const g: state.Geometry = .{ .layers = 2, .full_index_layers = 1, .graphs_bytes = 0, .vocab_local = vocab_local, .decode_rows = 16, .head_rows = 16, .lane_clusters = lane.clusters, .decode_side = true, .piece_pipe = true, .expert_rows = 1024 };
+    const g: state.Geometry = .{ .layers = 2, .full_index_layers = 1, .graphs_bytes = 0, .vocab_local = vocab_local, .decode_rows = 16, .head_rows = 16, .lane_clusters = lane.clusters, .decode_side = true, .own_attend = true, .piece_pipe = true, .expert_rows = 1024 };
     const adm = try state.admitRank(g, context, .{}, 1 << 50, state.reserveFor(1 << 50, false, 0));
     var st = try state.State.init(d, g, context, 0, 2, &adm, 1 << 50);
     defer st.deinit();
@@ -404,6 +413,8 @@ pub fn run(gpu: Gpu) !void {
         defer side_snap.deinit();
         var side_f = f;
         side_f.decode_side = true;
+        side_f.decode_union = true;
+        side_f.own_attend = true;
         var side_eager = try traceRun(gpa, side_f, &st, sc, false, &side_snap, null);
         defer side_eager.deinit(gpa);
         var side_graph = try traceRun(gpa, side_f, &st, sc, true, &side_snap, null);
@@ -420,6 +431,142 @@ pub fn run(gpu: Gpu) !void {
             std.debug.print("PASS glm53 side graph replay parity: {s}\n", .{sc.name});
         } else {
             std.debug.print("FAIL glm53 side graph replay parity: {s}\n", .{sc.name});
+            failed = true;
+        }
+        if (sc.rank == 0 and sc.prompt == 35) {
+            var compact_snap = try Snapshot.init(d, &st);
+            defer compact_snap.deinit();
+            var compact_f = side_f;
+            compact_f.route_compact = true;
+            var compact_eager = try traceRun(gpa, compact_f, &st, sc, false, &compact_snap, null);
+            defer compact_eager.deinit(gpa);
+            var compact_graph = try traceRun(gpa, compact_f, &st, sc, true, &compact_snap, null);
+            defer compact_graph.deinit(gpa);
+            if (firstDiff(&side_eager, &compact_eager, sc, "compact side eager vs legacy side eager") != null) {
+                std.debug.print("FAIL glm53 compact route eager parity: {s}\n", .{sc.name});
+                failed = true;
+            }
+            if (firstDiff(&compact_eager, &compact_graph, sc, "compact side eager vs replayed graph") == null and compact_graph.captured >= 1 and compact_graph.replayed >= 1) {
+                std.debug.print("PASS glm53 compact side graph replay parity: {s}\n", .{sc.name});
+            } else {
+                std.debug.print("FAIL glm53 compact side graph replay parity: {s}\n", .{sc.name});
+                failed = true;
+            }
+            var add_norm_f = side_f;
+            add_norm_f.add_norm_fuse = true;
+            var add_norm_snap = try Snapshot.init(d, &st);
+            defer add_norm_snap.deinit();
+            var add_norm_eager = try traceRun(gpa, add_norm_f, &st, sc, false, &add_norm_snap, null);
+            defer add_norm_eager.deinit(gpa);
+            var add_norm_graph = try traceRun(gpa, add_norm_f, &st, sc, true, &add_norm_snap, null);
+            defer add_norm_graph.deinit(gpa);
+            if (firstDiff(&side_eager, &add_norm_eager, sc, "add norm fused eager vs unfused eager") == null and firstDiff(&add_norm_eager, &add_norm_graph, sc, "add norm fused eager vs replayed graph") == null and add_norm_graph.captured >= 1 and add_norm_graph.replayed >= 1) {
+                std.debug.print("PASS glm53 add norm fusion graph replay parity: {s}\n", .{sc.name});
+            } else {
+                std.debug.print("FAIL glm53 add norm fusion graph replay parity: {s}\n", .{sc.name});
+                failed = true;
+            }
+
+            var l2pf_regions: std.ArrayList(forward.l2pf_mod.Region) = .empty;
+            defer l2pf_regions.deinit(gpa);
+            for (synth.bufs.items) |buf| try l2pf_regions.append(gpa, .{ .ptr = buf.ptr, .len = @intCast(buf.len) });
+            const l2pf_arms = [_]struct { name: []const u8, options: forward.l2pf_mod.Options }{
+                .{ .name = "12 MiB paced", .options = .{ .on = true } },
+                .{ .name = "12 MiB unpaced", .options = .{ .on = true, .pace_gbps = 0 } },
+                .{ .name = "4 MiB paced", .options = .{ .on = true, .mb = 4 } },
+            };
+            for (l2pf_arms) |arm| {
+                {
+                    var pf = try forward.l2pf_mod.L2pf.init(gpa, d, l2pf_regions.items, model.layers, arm.options);
+                    defer pf.deinit();
+                    var l2pf_f = side_f;
+                    l2pf_f.l2pf = &pf;
+                    var l2pf_snap = try Snapshot.init(d, &st);
+                    defer l2pf_snap.deinit();
+                    var l2pf_eager = try traceRun(gpa, l2pf_f, &st, sc, false, &l2pf_snap, null);
+                    defer l2pf_eager.deinit(gpa);
+                    var l2pf_graph = try traceRun(gpa, l2pf_f, &st, sc, true, &l2pf_snap, null);
+                    defer l2pf_graph.deinit(gpa);
+                    const eager_diff = firstDiff(&side_eager, &l2pf_eager, sc, "side eager vs L2PF eager");
+                    const graph_diff = firstDiff(&l2pf_eager, &l2pf_graph, sc, "L2PF eager vs graph");
+                    if (eager_diff == null and graph_diff == null and l2pf_graph.captured >= 1 and l2pf_graph.replayed >= 1) {
+                        std.debug.print("PASS glm53 l2pf graph replay parity: {s}\n", .{arm.name});
+                    } else {
+                        std.debug.print("FAIL glm53 l2pf graph replay parity: {s}\n", .{arm.name});
+                        failed = true;
+                    }
+                }
+            }
+        }
+    }
+    for (1..9) |verify_rows| {
+        const side_shape: Scenario = .{ .name = "own attend side graph row width", .prompt = 35, .steps = 3, .verify_rows = verify_rows };
+        model.vocab = .{ .lo = 0, .hi = vocab_local };
+        st.rank = 0;
+        const own_f: forward.Forward = .{ .gpa = gpa, .k = &k, .w = &model, .st = &st, .stream = stream, .coll = loop.collective(), .rank = 0, .decode_side = true, .decode_union = true, .own_attend = true };
+        var own_snap = try Snapshot.init(d, &st);
+        defer own_snap.deinit();
+        var own_eager = try traceRun(gpa, own_f, &st, side_shape, false, &own_snap, null);
+        defer own_eager.deinit(gpa);
+        var own_graph = try traceRun(gpa, own_f, &st, side_shape, true, &own_snap, null);
+        defer own_graph.deinit(gpa);
+        const own_diff = firstDiff(&own_eager, &own_graph, side_shape, "own attend eager vs graph");
+        const graph_cap_mib = try state.graphMiBFromEnv();
+        if (own_diff == null and own_graph.captured >= 1 and own_graph.replayed >= 1 and own_graph.capture_mib <= @as(f64, @floatFromInt(graph_cap_mib))) {
+            std.debug.print("PASS glm53 own attend graph replay parity: rows {d}\n", .{verify_rows});
+        } else {
+            std.debug.print("FAIL glm53 own attend graph replay parity: rows {d} (first differing decode step {?d})\n", .{ verify_rows, own_diff });
+            failed = true;
+        }
+    }
+    var q_geometry = g;
+    q_geometry.q_one_gather = true;
+    q_geometry.decode_mla = true;
+    q_geometry.decode_mla_v2 = true;
+    q_geometry.decode_mla_v3 = true;
+    q_geometry.decode_side = false;
+    q_geometry.own_attend = false;
+    const q_adm = try state.admitRank(q_geometry, context, .{}, 1 << 50, state.reserveFor(1 << 50, false, 0));
+    var q_state = try state.State.init(d, q_geometry, context, 0, 2, &q_adm, 1 << 50);
+    defer q_state.deinit();
+    for (1..9) |verify_rows| {
+        const q_shape: Scenario = .{ .name = "one query gather graph row width", .prompt = 35, .steps = 3, .verify_rows = verify_rows };
+        model.vocab = .{ .lo = 0, .hi = vocab_local };
+        q_state.rank = 0;
+        const q_f: forward.Forward = .{ .gpa = gpa, .k = &k, .w = &model, .st = &q_state, .stream = stream, .coll = loop.collective(), .rank = 0, .decode_side = false, .q_one_gather = true };
+        var q_base_f = q_f;
+        q_base_f.q_one_gather = false;
+        var q_base_snap = try Snapshot.init(d, &q_state);
+        defer q_base_snap.deinit();
+        var q_base_eager = try traceRun(gpa, q_base_f, &q_state, q_shape, false, &q_base_snap, null);
+        defer q_base_eager.deinit(gpa);
+        var q_snap = try Snapshot.init(d, &q_state);
+        defer q_snap.deinit();
+        var q_eager = try traceRun(gpa, q_f, &q_state, q_shape, false, &q_snap, null);
+        defer q_eager.deinit(gpa);
+        var q_graph = try traceRun(gpa, q_f, &q_state, q_shape, true, &q_snap, null);
+        defer q_graph.deinit(gpa);
+        const q_path_diff = firstDiff(&q_base_eager, &q_eager, q_shape, "one query gather vs two query gathers");
+        const q_diff = firstDiff(&q_eager, &q_graph, q_shape, "one query gather eager vs graph");
+        const graph_cap_mib = try state.graphMiBFromEnv();
+        if (q_path_diff == null and q_diff == null and q_graph.captured >= 1 and q_graph.replayed >= 1 and q_graph.capture_mib <= @as(f64, @floatFromInt(graph_cap_mib))) {
+            std.debug.print("PASS glm53 one query gather graph replay parity: rows {d}\n", .{verify_rows});
+        } else {
+            std.debug.print("FAIL glm53 one query gather graph replay parity: rows {d} (first differing decode step {?d})\n", .{ verify_rows, q_diff });
+            failed = true;
+        }
+        var qpe_f = q_f;
+        qpe_f.qpe_absorb_fuse = true;
+        var qpe_snap = try Snapshot.init(d, &q_state);
+        defer qpe_snap.deinit();
+        var qpe_eager = try traceRun(gpa, qpe_f, &q_state, q_shape, false, &qpe_snap, null);
+        defer qpe_eager.deinit(gpa);
+        var qpe_graph = try traceRun(gpa, qpe_f, &q_state, q_shape, true, &qpe_snap, null);
+        defer qpe_graph.deinit(gpa);
+        if (firstDiff(&q_eager, &qpe_eager, q_shape, "qpe absorb fused eager vs unfused eager") == null and firstDiff(&qpe_eager, &qpe_graph, q_shape, "qpe absorb fused eager vs replayed graph") == null and qpe_graph.captured >= 1 and qpe_graph.replayed >= 1) {
+            std.debug.print("PASS glm53 q_pe absorb fusion graph replay parity: rows {d}\n", .{verify_rows});
+        } else {
+            std.debug.print("FAIL glm53 q_pe absorb fusion graph replay parity: rows {d}\n", .{verify_rows});
             failed = true;
         }
     }

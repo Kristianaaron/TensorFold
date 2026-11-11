@@ -58,6 +58,21 @@ fn linB(dr: *const Drafter, e: anytype, x: u64, w: mm.Tiled, out: u64, m: usize,
     try lin(dr, e, x, .{ .bf16 = w }, out, m, wide);
 }
 
+/// TF_GLM53_DRAFT_DOWN4: out fp32 [m][q.n] = x . w^T from 4 bits, 16 rows a launch (lin's group sums, then F32 tiles).
+fn linQ4Wide(dr: *const Drafter, e: anytype, x: u64, q: q4.Q4, out: u64, m: usize) !void {
+    var a: cuda.Args = .{};
+    a.add(x);
+    a.add(@as(i32, @intCast(q.k)));
+    a.add(@as(i32, @intCast(q.k)));
+    a.add(dr.gs);
+    try go(dr.k.gsum, .{ .x = @intCast(m) }, 128, e, &a);
+    var r0: usize = 0;
+    while (r0 < m) : (r0 += 16) {
+        const rows = @min(16, m - r0);
+        try q4.matmulF32(&e.m.q4, e.stream, x + r0 * q.k * 2, q.k, dr.gs + r0 * (q.k / 64) * 4, q, out + r0 * q.n * 4, rows);
+    }
+}
+
 pub fn copy(e: anytype, dst: u64, src: u64, bytes: usize) !void {
     try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(dst, src, bytes, e.stream.handle), "cuMemcpyDtoDAsync");
 }
@@ -109,6 +124,63 @@ pub fn ingestPass(dr: *Drafter, e: anytype, N: usize) !void {
     }
 }
 
+/// TF_GLM53_DRAFT_INGEST_SIDE: stage rows (a verify window at most).
+pub const stage_rows: usize = 16;
+
+pub const SideScratch = struct { c1: u64, ctx: u64, ckv: u64, gs: u64, part: u64 };
+
+pub fn stageBytes(g: df.Geometry) u64 {
+    return @as(u64, @intCast(g.layers)) * 2 * stage_rows * @as(u64, @intCast(g.kvWidth())) * 2;
+}
+
+/// `N` verify tap rows at `taps` (consecutive, tapRowBytes apart) through fc, the hidden norm and each layer's k, v,
+/// roped at the device positions `pos` (i64), into `stage`. ingestPass's math with no ring write.
+pub fn ingestStaged(dr: *Drafter, e: anytype, taps: u64, pos: u64, N: usize, scratch: SideScratch, stage: u64, stage_kv: cuda.Function) !void {
+    const g = dr.geometry;
+    const D = g.hidden;
+    if (N == 0 or N > stage_rows) return error.BadStagedIngest;
+    var sd = dr.*;
+    sd.c1 = scratch.c1;
+    sd.ctx = scratch.ctx;
+    sd.ckv = scratch.ckv;
+    sd.gs = scratch.gs;
+    sd.part = scratch.part;
+    try lin(&sd, e, taps, sd.fc, sd.c1, N, false);
+    try glue.rmsnorm(set(e), e.stream, sd.c1, D, sd.hnorm, sd.ctx, D, null, g.eps, N, D);
+    for (dr.layers, 0..) |l, li| {
+        try lin(&sd, e, sd.ctx, l.kv, sd.ckv, N, false);
+        var a: cuda.Args = .{};
+        a.add(sd.ckv);
+        a.add(l.kn);
+        a.add(pos);
+        a.add(stage);
+        a.add(@as(i32, @intCast(li)));
+        a.add(g.eps);
+        a.add(g.rope_theta);
+        a.add(@as(i32, @intCast(g.kv_heads)));
+        a.add(@as(i32, @intCast(g.head_dim)));
+        a.add(@as(i32, @intCast(g.kvWidth())));
+        a.add(@as(i32, @intCast(stage_rows)));
+        try go(stage_kv, .{ .x = @intCast(N), .y = @intCast(g.kv_heads) }, @intCast(g.head_dim / 2), e, &a);
+    }
+}
+
+/// Stage rows 0..n (the kept verify rows, positions pos0..) into `ring`, every layer's K and V.
+pub fn commitStaged(dr: *const Drafter, e: anytype, stage: u64, ring: u64, pos0: i64, n: usize, commit: cuda.Function) !void {
+    const g = dr.geometry;
+    if (n == 0) return;
+    if (n > stage_rows) return error.BadStagedIngest;
+    var a: cuda.Args = .{};
+    a.add(stage);
+    a.add(ring);
+    a.add(pos0);
+    a.add(@as(i32, @intCast(n)));
+    a.add(@as(i32, @intCast(g.kvWidth())));
+    a.add(@as(i32, @intCast(g.window)));
+    a.add(@as(i32, @intCast(stage_rows)));
+    try go(commit, .{ .x = @intCast(n), .y = @intCast(g.layers * 2) }, 256, e, &a);
+}
+
 fn conv(dr: *const Drafter, e: anytype, z: u64, which: i32, base: u64, out: u64, add: bool, M: usize) !void {
     const g = dr.geometry;
     var a: cuda.Args = .{};
@@ -139,8 +211,15 @@ pub fn embedTarget(dr: *Drafter, e: anytype, M: usize, D: usize) !void {
     }
 }
 
+/// TF_GLM53_DRAFT_GRAPH: the embed hook's device half only (its host half ran before the replay).
+pub fn embedTargetDevice(dr: *Drafter, e: anytype, M: usize, D: usize) !void {
+    if (comptime @hasDecl(@TypeOf(e.*), "embedDraftDevice")) {
+        try e.embedDraftDevice(dr.x, M, D);
+    } else return error.DraftGraphNeedsShardHook;
+}
+
 /// The block pass for `S` streams (tables uploaded): embed, 5 layers, norm, each rank's 16 best a row, gathered.
-pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
+fn passImpl(dr: *Drafter, e: anytype, S: usize, rank0: bool, comptime graph: bool) !void {
     const g = dr.geometry;
     const D = g.hidden;
     const KVW = g.kvWidth();
@@ -148,7 +227,7 @@ pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
     const shape = try Plan.init(g, S);
     const BLOCK = g.block_size;
     const M = shape.rows;
-    try embedTarget(dr, e, M, D);
+    if (graph) try embedTargetDevice(dr, e, M, D) else try embedTarget(dr, e, M, D);
     for (dr.layers, 0..) |l, li| {
         // attention, wrapped in the attention conv
         try glue.rmsnorm(set(e), e.stream, dr.x, D, l.in_norm, dr.y, D, null, g.eps, M, D);
@@ -229,7 +308,9 @@ pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
         }
         if (dr.split) { // each rank's half of down's K as fp32 partials, gathered and summed
             const bytes = M * D * 4;
-            try linB(dr, e, dr.act, l.down, dr.sums + e.share.rank * bytes, M, true);
+            if (l.down4) |q| {
+                try linQ4Wide(dr, e, dr.act, q, dr.sums + e.share.rank * bytes, M);
+            } else try linB(dr, e, dr.act, l.down, dr.sums + e.share.rank * bytes, M, true);
             try gather(e, dr.sums, bytes);
             var a: cuda.Args = .{};
             a.add(dr.sums);
@@ -251,7 +332,7 @@ pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
     }
     // every row through the drafts' 4-bit head (this rank's vocabulary), its 16 best, gathered; rank 0's projections
     try glue.rmsnorm(set(e), e.stream, dr.x, D, dr.norm, dr.hn, D, dr.xs, g.eps, M, D);
-    if (g.confidence and rank0) try download(dr, e, std.mem.sliceAsBytes(dr.hrows[0 .. M * D]), dr.hn);
+    if (!graph and g.confidence and rank0) try download(dr, e, std.mem.sliceAsBytes(dr.hrows[0 .. M * D]), dr.hn);
     const head = dr.head orelse (e.w.mtp orelse return error.DrafterNeedsDraftHead).draft;
     var r0: usize = 0;
     while (r0 < M) : (r0 += 16) {
@@ -279,6 +360,14 @@ pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
     }
     try gather(e, dr.gtk, nw * 4);
     if (rank0 and g.kind != .dspark) try linB(dr, e, dr.hn, dr.hproj, dr.g, M, true); // DSpark has no hidden projection
+}
+
+pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
+    return passImpl(dr, e, S, rank0, false);
+}
+
+pub fn passDevice(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
+    return passImpl(dr, e, S, rank0, true);
 }
 
 test {

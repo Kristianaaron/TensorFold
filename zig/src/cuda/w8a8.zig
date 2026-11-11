@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Kristian Aaron (Krishando)
-//! GLM-5.3 W8A8 prefill projection (kernels/cuda/glm_dsa/w8a8.cu), behind TF_GLM53_PREFILL_W8A8=1 for o_proj.
-//! Activations: bf16 rows -> e4m3 with one fp32 scale per (row, 128-K block), amax / 448, row-local.
+//! GLM-5.3 W8A8 prefill projection (kernels/cuda/glm_dsa/w8a8.cu).
+//! TF_GLM53_PREFILL_W8A8=1 runs o_proj. =2 reuses these two kernels for every other FP8B prefill
+//! projection `serves` accepts. Activations: bf16 rows -> e4m3 with one fp32 scale per (row, 128-K block), amax / 448, row-local.
 //! Weights: the checkpoint's FP8B projection exactly as qmmf reads it (cuda/fp8.zig packCodes + packBlockScales),
 //! with no repack. GEMM: mma.sync m16n8k32 e4m3, fp32 accumulators, one FP32 promotion per 64-K weight tile.
 //! Provenance: fp8_mma.cu (adapted from ashhart/TensorFold@d1018b31 ck_lane.cu, Apache-2.0) and qmmf.cu
@@ -29,6 +30,8 @@ pub const threads: u32 = 256;
 pub const shared_bytes: u32 = 4 * (128 * 64 + 128 * 64);
 /// 128-K blocks one quantizer CTA covers (one warp each).
 pub const quant_blocks: usize = 8;
+/// Largest K of a level-2 projection (hidden). o_proj's K is 8192 and keeps the attention-partial scratch.
+pub const level2_k: usize = 6144;
 
 pub const quant_symbol: [:0]const u8 = "tf_glm53_w8a8_quant";
 pub const gemm_symbol: [:0]const u8 = "tf_glm53_w8a8_gemm";
@@ -52,6 +55,21 @@ pub fn scratchAt(base: u64, m: usize, k: usize) Scratch {
 /// The projections this kernel reads: FP8B, whole 128-K blocks, an even output count, 128-row padding.
 pub fn supports(w: qmmf.Weight) bool {
     return w.mode == .fp8b and w.k > 0 and w.k % block_k == 0 and w.n > 0 and w.n % 2 == 0 and w.npad % tile_n == 0 and w.npad >= w.n;
+}
+
+/// Level 2 projections. The GEMM arguments are already runtime M, N, K and the fp32/bf16 flag, so no new
+/// entry point is required. K above `level2_k` (o_proj) stays on the attention-partial scratch.
+pub fn serves(w: qmmf.Weight) bool {
+    return supports(w) and @as(usize, @intCast(w.k)) <= level2_k;
+}
+
+/// Outputs below this stay on the release lane: measured on GB10 (glm53-w8a8-all, 512 rows), N 32..576 ran
+/// 0.77-0.99x of release and N 1024..12288 ran 1.29-1.86x.
+pub const level2_min_n: usize = 1024;
+
+/// The level-2 projections the engine routes to W8A8: `serves` minus the narrow outputs that measured slower.
+pub fn servesFast(w: qmmf.Weight) bool {
+    return serves(w) and @as(usize, @intCast(w.n)) >= level2_min_n;
 }
 
 /// GEMM blocks: row tiles x column tiles, one dimension (w8a8.cu takes bands of 8 row tiles).
@@ -249,4 +267,12 @@ test "launch geometry, scratch and the weights the kernel takes" {
     try std.testing.expect(supports(fp8.blockWeight(0x1000, 0x2000, 6144, 8192)));
     try std.testing.expect(!supports(fp8.weight(0x1000, 0x2000, 6144, 8192)));
     try std.testing.expect(!supports(fp8.blockWeight(0x1000, 0x2000, 6144, 8192 - 64)));
+    try std.testing.expect(!serves(fp8.blockWeight(0x1000, 0x2000, 6144, 8192)));
+    try std.testing.expect(serves(fp8.blockWeight(0x1000, 0x2000, 2048, 6144)));
+    try std.testing.expect(serves(fp8.blockWeight(0x1000, 0x2000, 32, 6144)));
+    try std.testing.expect(!servesFast(fp8.blockWeight(0x1000, 0x2000, 576, 6144)));
+    try std.testing.expect(servesFast(fp8.blockWeight(0x1000, 0x2000, 1024, 6144)));
+    try std.testing.expect(serves(fp8.blockWeight(0x1000, 0x2000, 6144, 1024)));
+    try std.testing.expect(!serves(fp8.blockWeight(0x1000, 0x2000, 2048, 6144 + 128)));
+    try std.testing.expectEqual(@as(usize, 3_244_032), scratchBytes(512, level2_k));
 }

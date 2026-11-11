@@ -139,6 +139,11 @@ pub const Experts = struct {
     plan_finish: Function = undefined,
 
     pub fn load(d: *const Driver) !Experts {
+        return loadWith(d, false);
+    }
+
+    /// `noalloc`: TF_GLM53_MOE_NOALLOC, the grouped kernels that read weights with no L1 allocate.
+    pub fn loadWith(d: *const Driver, noalloc: bool) !Experts {
         if (!kernels.available) return error.BuiltWithoutKernels;
         var e: Experts = .{
             .mod = try Module.load(d, kernels.exl3_experts),
@@ -160,7 +165,12 @@ pub const Experts = struct {
         e.group = try e.mod.function("tf_exl3_group");
         try e.group.allowDynamicShared(group_dynamic_shared_bytes);
         e.rot_in = try e.mod.function("tf_exl3_experts_rot_in");
-        e.grouped = .{
+        e.grouped = if (noalloc) .{
+            try e.mod.function("tf_exl3_grouped_noalloc_0"),
+            try e.mod.function("tf_exl3_grouped_noalloc_1"),
+            try e.mod.function("tf_exl3_grouped_noalloc_2"),
+            try e.mod.function("tf_exl3_grouped_noalloc_3"),
+        } else .{
             try e.mod.function("tf_exl3_grouped_0"),
             try e.mod.function("tf_exl3_grouped_1"),
             try e.mod.function("tf_exl3_grouped_2"),

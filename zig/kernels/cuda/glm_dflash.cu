@@ -645,3 +645,38 @@ extern "C" __global__ void df_add_glm(__nv_bfloat16* __restrict__ x, const __nv_
         x[at] = tobf(bf(x[at]) + bf(y[at]));
     }
 }
+
+// TF_GLM53_DRAFT_INGEST_SIDE: ctxKv's math for DSpark's 64-wide heads, written to a row-indexed stage
+// [layer][k | v][S][KVW] instead of the ring (rows past the first rejection must never reach the ring).
+template <int KVH_, int HD_>
+__device__ __forceinline__ void ctxKvStage(const __nv_bfloat16* __restrict__ kv, const __nv_bfloat16* __restrict__ kn,
+        const long long* __restrict__ pos, __nv_bfloat16* __restrict__ stage, int layer, float eps, float theta, int S) {
+    __shared__ float red[2];
+    const int r = blockIdx.x, kh = blockIdx.y;
+    const long long p = pos[r];
+    constexpr int KVW_ = KVH_ * HD_;
+    const __nv_bfloat16* row = kv + (long long)r * 2 * KVW_;
+    __nv_bfloat16* ko = stage + ((long long)(layer * 2) * S + r) * KVW_ + kh * HD_;
+    __nv_bfloat16* vo = stage + ((long long)(layer * 2 + 1) * S + r) * KVW_ + kh * HD_;
+    normRope64(row + kh * HD_, kn, eps, p, theta, ko, red);
+    if (threadIdx.x < 32) { vo[threadIdx.x] = row[KVW_ + kh * HD_ + threadIdx.x]; vo[threadIdx.x + 32] = row[KVW_ + kh * HD_ + threadIdx.x + 32]; }
+}
+
+extern "C" __global__ void df_ctx_kv_stage_glm(const __nv_bfloat16* __restrict__ kv, const __nv_bfloat16* __restrict__ kn,
+        const long long* __restrict__ pos, __nv_bfloat16* __restrict__ stage, int layer, float eps, float theta, int KVH,
+        int head_dim, int KVW, int S) {
+    if (head_dim == 64 && KVH == 64 && KVW == 4096) ctxKvStage<64, 64>(kv, kn, pos, stage, layer, eps, theta, S);
+}
+
+// Kept stage rows 0..n (the selected prefix of verify rows) into the ring at slots pos0+r.
+extern "C" __global__ void __launch_bounds__(256) df_ring_commit_glm(const __nv_bfloat16* __restrict__ stage, uint64_t ring,
+        long long pos0, int n, int KVW, int WIN, int S) {
+    const int r = blockIdx.x, lk = blockIdx.y;
+    if (r >= n) return;
+    const int layer = lk >> 1;
+    const long long slot = (pos0 + r) & (WIN - 1);
+    __nv_bfloat16* base = (lk & 1) ? ringV(ring, layer, WIN, KVW) : ringK(ring, layer, WIN, KVW);
+    const __nv_bfloat16* src = stage + ((long long)lk * S + r) * KVW;
+    __nv_bfloat16* dst = base + slot * KVW;
+    for (int c = threadIdx.x; c < KVW; c += blockDim.x) dst[c] = src[c];
+}

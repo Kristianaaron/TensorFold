@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Kristian Aaron (Krishando)
-//! GPU parity and row-invariance checks for opt-in GLM-5.3 prefill absorb/expand tensor cores.
+//! GPU bit-parity, resource and timing checks for pipelined GLM-5.3 prompt MLA kernels.
 const std = @import("std");
 const cuda = @import("cuda");
 const mla = @import("mla.zig");
 
-test "GLM-5.3 prompt MLA tensor-core declarations are analyzed" {
+test "GLM-5.3 pipelined prompt MLA declarations are analyzed" {
     std.testing.refAllDecls(@This());
 }
 
@@ -17,9 +17,11 @@ pub fn run(gpu: anytype) !void {
     const kernels = try mla.Mla.load(module);
     var stream = try cuda.Stream.init(gpu.d, false);
     defer stream.deinit();
-    const codes = try gpu.gpa.alloc(u8, mla.kvb_rows_per_head * mla.latent_dim);
+    const global_heads = 32;
+    const code_count = global_heads * mla.kvb_rows_per_head * mla.latent_dim;
+    const codes = try gpu.gpa.alloc(u8, code_count);
     defer gpu.gpa.free(codes);
-    const scales = try gpu.gpa.alloc(f32, 16);
+    const scales = try gpu.gpa.alloc(f32, (global_heads * mla.kvb_rows_per_head / 128) * 4);
     defer gpu.gpa.free(scales);
     var prng = std.Random.DefaultPrng.init(0x53_4d_4c_41);
     const random = prng.random();
@@ -33,7 +35,7 @@ pub fn run(gpu: anytype) !void {
     defer d_codes.free();
     var d_scales = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(scales));
     defer d_scales.free();
-
+    try promptMlaP2Resources(gpu, &kernels);
     const row_cases = [_]usize{ 1, 17, 512, 4096 };
     for (row_cases) |rows| {
         const c = try runCase(gpu, stream, &kernels, d_codes.ptr, d_scales.ptr, rows, random);
@@ -49,15 +51,200 @@ pub fn run(gpu: anytype) !void {
         try compareExact(c.expand, c.expand_big, rows, mla.value_dim, "expand_v");
         std.debug.print("RESULT glm53-prompt-mla rows={d}: absorb and expand_v parity checked\n", .{rows});
     }
-
     try runDeployedShape(gpu, stream, &kernels, random, 4096);
     try runDeployedShape(gpu, stream, &kernels, random, 4095);
     try runDeployedShape(gpu, stream, &kernels, random, 100);
-
     try invariance(gpu, stream, &kernels, d_codes.ptr, d_scales.ptr, random, false, .tile16);
     try invariance(gpu, stream, &kernels, d_codes.ptr, d_scales.ptr, random, true, .tile16);
     try invariance(gpu, stream, &kernels, d_codes.ptr, d_scales.ptr, random, false, .tile64);
     try invariance(gpu, stream, &kernels, d_codes.ptr, d_scales.ptr, random, true, .tile64);
+    var cases: usize = 0;
+    const rows_cases = [_]usize{ 1, 17, 64, 65, 500, 512, 4096 };
+    const z_cases = [_]u32{ 1, 2, 3, 8 };
+    for (rows_cases) |rows| {
+        for ([_]usize{ 0, 16 }) |head0| {
+            for (z_cases) |requested_z| {
+                const z = @min(requested_z, @as(u32, @intCast((rows + 63) / 64)));
+                try promptMlaP2ParityCase(gpu, stream, &kernels, d_codes.ptr, d_scales.ptr, random, rows, head0, z);
+                cases += 1;
+            }
+        }
+    }
+    try promptMlaP2Determinism(gpu, stream, &kernels, d_codes.ptr, d_scales.ptr, random);
+    try promptMlaP2BenchShape(gpu, stream, &kernels, d_codes.ptr, d_scales.ptr, random, 512);
+    try promptMlaP2BenchShape(gpu, stream, &kernels, d_codes.ptr, d_scales.ptr, random, 4096);
+    std.debug.print("PASS glm53-prompt-mla-p2: {d} cases, rows=1,17,64,65,500,512,4096 head0=0,16 z=1,2,3,8 clamped to row tiles; absorb p2, expand p2, expand p2n byte-match and repeat at 512 rows\n", .{cases});
+}
+
+fn promptMlaP2Resources(gpu: anytype, kernels: *const mla.Mla) !void {
+    const entries = [_]struct { name: []const u8, f: cuda.Function, shared: u32 }{
+        .{ .name = "absorb big", .f = kernels.absorb_prompt_big_fn, .shared = mla.prompt_mla_big_smem },
+        .{ .name = "expand big", .f = kernels.expand_prompt_big_fn, .shared = mla.prompt_mla_big_smem },
+        .{ .name = "absorb p2", .f = kernels.absorb_prompt_p2_fn, .shared = mla.prompt_mla_p2_absorb_smem },
+        .{ .name = "expand p2", .f = kernels.expand_prompt_p2_fn, .shared = mla.prompt_mla_p2_expand_smem },
+        .{ .name = "expand p2n", .f = kernels.expand_prompt_p2n_fn, .shared = mla.prompt_mla_p2n_expand_smem },
+    };
+    for (entries) |entry| {
+        const regs = try entry.f.attribute(.num_regs);
+        const local = try entry.f.attribute(.local_size_bytes);
+        const active = try entry.f.occupancy(256, entry.shared);
+        std.debug.print("INFO glm53-prompt-mla-p2 resource {s}: regs {d}, shared {d} B, {d} CTAs/SM, local {d} B\n", .{ entry.name, regs, entry.shared, active, local });
+        if (local != 0) return error.PromptMlaP2LocalMemory;
+    }
+    std.debug.print("PASS glm53-prompt-mla-p2 resources: big and p2 entries report zero local-memory bytes\n", .{});
+    _ = gpu;
+}
+
+fn promptMlaP2ParityCase(gpu: anytype, stream: cuda.Stream, kernels: *const mla.Mla, codes: u64, scales: u64, random: std.Random, rows: usize, head0: usize, z: u32) !void {
+    const local_heads = 16;
+    const q = try gpu.gpa.alloc(u16, rows * local_heads * 256);
+    defer gpu.gpa.free(q);
+    const ol = try gpu.gpa.alloc(u16, rows * local_heads * mla.latent_dim);
+    defer gpu.gpa.free(ol);
+    for (q) |*v| v.* = bf16Bits((random.float(f32) - 0.5) * 0.5);
+    for (ol) |*v| v.* = bf16Bits((random.float(f32) - 0.5) * 0.5);
+    var dq = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(q));
+    defer dq.free();
+    var dol = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(ol));
+    defer dol.free();
+    const absorb_bytes = rows * local_heads * mla.latent_dim * 2;
+    const expand_bytes = rows * local_heads * mla.value_dim * 2;
+    var absorb_big = try cuda.DeviceBuffer.alloc(gpu.d, absorb_bytes);
+    defer absorb_big.free();
+    var absorb_p2 = try cuda.DeviceBuffer.alloc(gpu.d, absorb_bytes);
+    defer absorb_p2.free();
+    var expand_big = try cuda.DeviceBuffer.alloc(gpu.d, expand_bytes);
+    defer expand_big.free();
+    var expand_p2 = try cuda.DeviceBuffer.alloc(gpu.d, expand_bytes);
+    defer expand_p2.free();
+    var expand_p2n = try cuda.DeviceBuffer.alloc(gpu.d, expand_bytes);
+    defer expand_p2n.free();
+    for ([_]*cuda.DeviceBuffer{ &absorb_big, &absorb_p2, &expand_big, &expand_p2, &expand_p2n }) |buf| try buf.fill8(0x7f, stream.handle);
+    try kernels.absorbPrompt(stream, dq.ptr, codes, scales, absorb_big.ptr, rows, local_heads, head0, .tile64);
+    try kernels.absorbPromptWithZ(stream, dq.ptr, codes, scales, absorb_p2.ptr, rows, local_heads, head0, .p2, z);
+    try kernels.expandVPrompt(stream, dol.ptr, codes, scales, expand_big.ptr, rows, local_heads, head0, .tile64);
+    try kernels.expandVPromptWithZ(stream, dol.ptr, codes, scales, expand_p2.ptr, rows, local_heads, head0, .p2, z);
+    try kernels.expandVPromptWithZ(stream, dol.ptr, codes, scales, expand_p2n.ptr, rows, local_heads, head0, .p2n, z);
+    try stream.synchronize();
+    const out_absorb_big = try download(gpu, absorb_big);
+    defer gpu.gpa.free(out_absorb_big);
+    const out_absorb_p2 = try download(gpu, absorb_p2);
+    defer gpu.gpa.free(out_absorb_p2);
+    const out_expand_big = try download(gpu, expand_big);
+    defer gpu.gpa.free(out_expand_big);
+    const out_expand_p2 = try download(gpu, expand_p2);
+    defer gpu.gpa.free(out_expand_p2);
+    const out_expand_p2n = try download(gpu, expand_p2n);
+    defer gpu.gpa.free(out_expand_p2n);
+    try promptMlaP2Same("absorb p2", rows, head0, z, out_absorb_p2, out_absorb_big);
+    try promptMlaP2Same("expand p2", rows, head0, z, out_expand_p2, out_expand_big);
+    try promptMlaP2Same("expand p2n", rows, head0, z, out_expand_p2n, out_expand_big);
+}
+
+fn promptMlaP2Same(label: []const u8, rows: usize, head0: usize, z: u32, got: []const u8, want: []const u8) !void {
+    if (!std.mem.eql(u8, got, want)) {
+        for (got, want, 0..) |a, b, i| if (a != b) {
+            std.debug.print("FAIL glm53-prompt-mla-p2 {s} rows={d} head0={d} z={d}: byte {d} got {x:0>2} want {x:0>2}\n", .{ label, rows, head0, z, i, a, b });
+            break;
+        };
+        return error.PromptMlaP2ByteMismatch;
+    }
+}
+
+fn promptMlaP2Determinism(gpu: anytype, stream: cuda.Stream, kernels: *const mla.Mla, codes: u64, scales: u64, random: std.Random) !void {
+    const rows = 512;
+    const local_heads = 16;
+    const z = mla.promptP2Z(rows);
+    const q = try gpu.gpa.alloc(u16, rows * local_heads * 256);
+    defer gpu.gpa.free(q);
+    const ol = try gpu.gpa.alloc(u16, rows * local_heads * mla.latent_dim);
+    defer gpu.gpa.free(ol);
+    for (q) |*v| v.* = bf16Bits((random.float(f32) - 0.5) * 0.5);
+    for (ol) |*v| v.* = bf16Bits((random.float(f32) - 0.5) * 0.5);
+    var dq = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(q));
+    defer dq.free();
+    var dol = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(ol));
+    defer dol.free();
+    const sizes = [_]usize{ rows * local_heads * mla.latent_dim * 2, rows * local_heads * mla.value_dim * 2, rows * local_heads * mla.value_dim * 2 };
+    var first: [3]cuda.DeviceBuffer = @splat(.{ .d = gpu.d, .ptr = 0, .len = 0 });
+    var second: [3]cuda.DeviceBuffer = @splat(.{ .d = gpu.d, .ptr = 0, .len = 0 });
+    for (&first, &second, sizes) |*a, *b, size| {
+        a.* = try cuda.DeviceBuffer.alloc(gpu.d, size);
+        b.* = try cuda.DeviceBuffer.alloc(gpu.d, size);
+    }
+    defer {
+        for (&first, &second) |*a, *b| {
+            a.free();
+            b.free();
+        }
+    }
+    try kernels.absorbPromptWithZ(stream, dq.ptr, codes, scales, first[0].ptr, rows, local_heads, 0, .p2, z);
+    try kernels.absorbPromptWithZ(stream, dq.ptr, codes, scales, second[0].ptr, rows, local_heads, 0, .p2, z);
+    try kernels.expandVPromptWithZ(stream, dol.ptr, codes, scales, first[1].ptr, rows, local_heads, 0, .p2, z);
+    try kernels.expandVPromptWithZ(stream, dol.ptr, codes, scales, second[1].ptr, rows, local_heads, 0, .p2, z);
+    try kernels.expandVPromptWithZ(stream, dol.ptr, codes, scales, first[2].ptr, rows, local_heads, 0, .p2n, z);
+    try kernels.expandVPromptWithZ(stream, dol.ptr, codes, scales, second[2].ptr, rows, local_heads, 0, .p2n, z);
+    try stream.synchronize();
+    for (first, second) |a, b| {
+        const out_a = try download(gpu, a);
+        defer gpu.gpa.free(out_a);
+        const out_b = try download(gpu, b);
+        defer gpu.gpa.free(out_b);
+        if (!std.mem.eql(u8, out_a, out_b)) return error.PromptMlaP2Nondeterministic;
+    }
+}
+
+fn promptMlaP2BenchShape(gpu: anytype, stream: cuda.Stream, kernels: *const mla.Mla, codes: u64, scales: u64, random: std.Random, rows: usize) !void {
+    const local_heads = 16;
+    const q = try gpu.gpa.alloc(u16, rows * local_heads * 256);
+    defer gpu.gpa.free(q);
+    const ol = try gpu.gpa.alloc(u16, rows * local_heads * mla.latent_dim);
+    defer gpu.gpa.free(ol);
+    for (q) |*v| v.* = bf16Bits((random.float(f32) - 0.5) * 0.5);
+    for (ol) |*v| v.* = bf16Bits((random.float(f32) - 0.5) * 0.5);
+    var dq = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(q));
+    defer dq.free();
+    var dol = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(ol));
+    defer dol.free();
+    var absorb_out = try cuda.DeviceBuffer.alloc(gpu.d, rows * local_heads * mla.latent_dim * 2);
+    defer absorb_out.free();
+    var expand_out = try cuda.DeviceBuffer.alloc(gpu.d, rows * local_heads * mla.value_dim * 2);
+    defer expand_out.free();
+    const z_cases = [_]u32{ 1, 2, 3, 4, 8 };
+    var best_saved: f64 = 0;
+    for (z_cases) |requested_z| {
+        const z = @min(requested_z, @as(u32, @intCast((rows + 63) / 64)));
+        const absorb_big = try benchPromptP2(gpu, stream, kernels, dq.ptr, codes, scales, absorb_out.ptr, rows, local_heads, false, .tile64, z);
+        const absorb_p2 = try benchPromptP2(gpu, stream, kernels, dq.ptr, codes, scales, absorb_out.ptr, rows, local_heads, false, .p2, z);
+        const expand_big = try benchPromptP2(gpu, stream, kernels, dol.ptr, codes, scales, expand_out.ptr, rows, local_heads, true, .tile64, z);
+        const expand_p2 = try benchPromptP2(gpu, stream, kernels, dol.ptr, codes, scales, expand_out.ptr, rows, local_heads, true, .p2, z);
+        const expand_p2n = try benchPromptP2(gpu, stream, kernels, dol.ptr, codes, scales, expand_out.ptr, rows, local_heads, true, .p2n, z);
+        const absorb_tflops = @as(f64, @floatFromInt(2 * rows * local_heads * mla.nope_dim * mla.latent_dim)) / 1_000_000.0;
+        const expand_tflops = @as(f64, @floatFromInt(2 * rows * local_heads * mla.latent_dim * mla.value_dim)) / 1_000_000.0;
+        std.debug.print("BENCH glm53-prompt-mla-p2 rows={d} z={d} | absorb big {d:.1} us ({d:.1} TFLOP/s) p2 {d:.1} ({d:.1}) | expand big {d:.1} ({d:.1}) p2 {d:.1} ({d:.1}) p2n {d:.1} ({d:.1})\n", .{ rows, z, absorb_big, absorb_tflops / absorb_big, absorb_p2, absorb_tflops / absorb_p2, expand_big, expand_tflops / expand_big, expand_p2, expand_tflops / expand_p2, expand_p2n, expand_tflops / expand_p2n });
+        const total_big = absorb_big + expand_big;
+        const total_p2 = absorb_p2 + @min(expand_p2, expand_p2n);
+        if (total_big > 0) best_saved = @max(best_saved, (total_big - total_p2) / total_big);
+    }
+    if (rows == 512 and best_saved < 0.25) return error.PromptMlaP2BelowTarget;
+}
+
+fn benchPromptP2(gpu: anytype, stream: cuda.Stream, kernels: *const mla.Mla, input: u64, codes: u64, scales: u64, output: u64, rows: usize, local_heads: usize, expand: bool, mode: mla.PromptMlaMode, z: u32) !f64 {
+    for (0..2) |_| {
+        if (expand) try kernels.expandVPromptWithZ(stream, input, codes, scales, output, rows, local_heads, 0, mode, z) else try kernels.absorbPromptWithZ(stream, input, codes, scales, output, rows, local_heads, 0, mode, z);
+    }
+    try stream.synchronize();
+    var start = try cuda.Event.init(gpu.d, true);
+    defer start.deinit();
+    var stop = try cuda.Event.init(gpu.d, true);
+    defer stop.deinit();
+    try start.record(stream);
+    for (0..10) |_| {
+        if (expand) try kernels.expandVPromptWithZ(stream, input, codes, scales, output, rows, local_heads, 0, mode, z) else try kernels.absorbPromptWithZ(stream, input, codes, scales, output, rows, local_heads, 0, mode, z);
+    }
+    try stop.record(stream);
+    try stream.synchronize();
+    return @as(f64, @floatCast(try start.elapsedMs(stop))) * 100.0;
 }
 
 fn runDeployedShape(gpu: anytype, stream: cuda.Stream, kernels: *const mla.Mla, random: std.Random, rows: usize) !void {

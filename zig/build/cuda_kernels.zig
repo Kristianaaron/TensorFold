@@ -80,6 +80,7 @@ pub const kernels = [_]Kernel{
     .{ .name = "gdn_prep", .flags = &.{"-O3"} }, // ours: Gated DeltaNet conv, norms, g and beta (cuda/gdn_prep.zig)
     .{ .name = "qk_rows", .flags = &.{"-O3"} }, // ours: QK norm, RoPE and the cache write (cuda/qk_rows.zig)
     .{ .name = "qmmf", .flags = &.{"-O3"} }, // nvfp4/qmmf.cu's device code (FP8G, FP4), tensorfold_nvfp4_v3
+    .{ .name = "qmmf2", .flags = &.{"-O3"} }, // bench-only qmmf2
     .{ .name = "prompt16", .flags = &.{"-O3"} }, // nvfp4/prompt.cu's FP4 and FP8 tile 4, tensorfold_nvfp4_prompt_v1
     .{ .name = "tree_attention", .flags = &.{"-O3"} }, // ours: committed keys and paths (cuda/tree_attention.zig)
     .{ .name = "block_attention", .flags = &.{"-O3"} }, // ours: a drafter's block over its context (cuda/block_attention.zig)
@@ -105,7 +106,7 @@ pub const kernels = [_]Kernel{
     .{ .name = "glm53_glue", .src = "glm_dsa/glue", .min_sm = 90, .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // GLM-5.3 MoE low-rank and embed glue
     .{ .name = "glm53_fp8_mma", .src = "glm_dsa/fp8_mma", .min_sm = 89, .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // GLM-5.3 W8A8 FP8 quantization and block-scaled GEMM
     .{ .name = "glm53_x3e4", .src = "glm_dsa/x3e4", .min_sm = 89, .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // GLM-5.3 X3E4 trellis fragments and MXFP8 expert prefill
-    .{ .name = "glm53_w8a8", .src = "glm_dsa/w8a8", .min_sm = 89, .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // GLM-5.3 TF_GLM53_PREFILL_W8A8 o_proj: e4m3 rows x FP8B weights, m16n8k32
+    .{ .name = "glm53_w8a8", .src = "glm_dsa/w8a8", .min_sm = 89, .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // GLM-5.3 TF_GLM53_PREFILL_W8A8: e4m3 rows x FP8B weights, m16n8k32. =1 o_proj, =2 the other FP8B prefill projections this kernel already accepts.
     .{ .name = "glm53_head", .src = "glm_dsa/head", .min_sm = 90, .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // GLM-5.3 fp32 logits, candidates, gate gather/mass and local LSE; candidate k<=2048
     .{ .name = "glm53_megakernel", .src = "glm_dsa/megakernel", .min_sm = 90, .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // GLM-5.3 persistent dependency scheduler and task interpreter
     .{ .name = "torch_argmax", .src = "torch_ops/argmax", .flags = torch_ops },
@@ -115,6 +116,8 @@ pub const kernels = [_]Kernel{
     .{ .name = "torch_movement", .src = "torch_ops/movement", .flags = torch_ops },
     .{ .name = "torch_nemotron_constants", .src = "torch_ops/nemotron_constants", .flags = torch_ops },
     .{ .name = "roce_gather", .src = "roce_gather", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // b12x one-shot RoCE all-gather and rank-order all-reduce
+    .{ .name = "l2pf", .src = "deepseek_v41/l2pf", .flags = &.{"-O3"} }, // TF_GLM53_L2PF: DeepSeek V4.1's L2 prefetch of a weight table (after ashhart/TensorFold PR #2162)
+    .{ .name = "l2pace", .src = "deepseek_v41/l2pace", .flags = &.{"-O3"} }, // and its paced form
     .{ .name = "drama3_staged_gemv", .flags = glue },
     .{ .name = "drama3", .flags = &.{"-O3"} },
     .{ .name = "drama3_fp8", .flags = &.{"-O3"} },

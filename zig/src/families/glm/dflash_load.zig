@@ -416,10 +416,12 @@ fn loadWithHeadChunkedSharedInner(gpa: std.mem.Allocator, io: std.Io, e: anytype
     defer used.deinit();
     const split = world == 2;
     const ff: usize = if (split) FF / 2 else FF;
+    if (geometry.down4 and (bits != 4 or world != 2)) return error.DraftDown4NeedsSplitFourBits;
+    const down_bytes: u64 = if (geometry.down4) D64 * @as(u64, @intCast(ff)) / 2 + D64 * @as(u64, @intCast(ff)) / 16 else D64 * @as(u64, @intCast(ff)) * 2;
     const small: u64 = (if (geometry.conv) @as(u64, 6) * D64 * 2 else @as(u64, 2) * D64 * 2) + 2 * @as(u64, @intCast(geometry.head_dim)) * 2 + (if (geometry.conv) @as(u64, 2) * @as(u64, @intCast(geometry.conv_kernel)) * 2 * D64 * 2 + @as(u64, @intCast(geometry.conv_group)) * 256 else @as(u64, 0));
     const per: u64 = if (bits == 4) 1 else 4; // quarter-bytes a weight: 4 bits (plus scales and biases below) or bf16
     const lin_elems: u64 = QKV64 * D64 + 2 * KVW64 * D64 + QW64 * D64 + 2 * @as(u64, @intCast(ff)) * D64 + (if (geometry.conv) @as(u64, 2) * @as(u64, @intCast(CONVW)) * D64 else @as(u64, 0)) + @as(u64, @intCast(geometry.taps.len)) * D64 * D64 / @as(u64, @intCast(geometry.layers));
-    const estimate: u64 = @as(u64, @intCast(geometry.layers)) * (lin_elems * per / 2 + lin_elems / 16 + D64 * @as(u64, @intCast(ff)) * 2 + small + 32 * 256) + (if (geometry.kind == .dspark) @as(u64, 0) else @as(u64, RANK) * D64 * 2) + 2 * D64 * 2 + 64 * 256;
+    const estimate: u64 = @as(u64, @intCast(geometry.layers)) * (lin_elems * per / 2 + lin_elems / 16 + down_bytes + small + 32 * 256) + (if (geometry.kind == .dspark) @as(u64, 0) else @as(u64, RANK) * D64 * 2) + 2 * D64 * 2 + 64 * 256;
     // 32 x 256 a layer and 64 x 256 overall are take()'s 256-byte alignment slack for every drafter (not a conv term).
     // DSpark adds 2% headroom.
     const total: u64 = if (geometry.kind == .dspark) estimate + estimate / 50 else estimate;
@@ -478,9 +480,13 @@ fn loadWithHeadChunkedSharedInner(gpa: std.mem.Allocator, io: std.Io, e: anytype
         const gate = try layerName(&nb[1], i, "mlp.gate_proj.weight");
         const up = try layerName(&nb[2], i, "mlp.up_proj.weight");
         const down = try layerName(&nb[3], i, "mlp.down_proj.weight");
+        lw.down4 = null;
         if (split) { // this rank's half of the MLP width: gate and up rows, down columns
             lw.gu = try l.linear(&.{ gate, up }, &.{ FF, FF }, D, .{ rank * ff, ff, 0, D });
-            lw.down = try l.linearB(&.{down}, &.{D}, FF, .{ 0, 0, rank * ff, ff });
+            if (geometry.down4) {
+                lw.down4 = (try l.linear(&.{down}, &.{D}, FF, .{ 0, 0, rank * ff, ff })).q4;
+                lw.down = .{ .w = 0, .n = D, .k = ff };
+            } else lw.down = try l.linearB(&.{down}, &.{D}, FF, .{ 0, 0, rank * ff, ff });
         } else {
             lw.gu = try l.linear(&.{ gate, up }, &.{ FF, FF }, D, null);
             lw.down = try l.linearB(&.{down}, &.{D}, FF, null);

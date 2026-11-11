@@ -10,6 +10,16 @@ const core = @import("core");
 pub const Codebook = ex.Codebook;
 pub const Experts = ex.Experts;
 pub const Scratch = ex.Scratch;
+
+pub const Placement = struct { rank: usize = 0, local: usize = 0 };
+
+pub fn placement(expert: usize) Placement {
+    return .{ .rank = expert % 2, .local = expert / 2 };
+}
+
+pub fn expertForLocal(rank: usize, local: usize) usize {
+    return local * 2 + rank;
+}
 const Projection = struct { ptrs: u64, k2_ptr: u64, suh_ptr: u64, svh_ptr: u64, uniform_k2: u32, widths_ok: bool, pmx_ok: bool };
 
 pub const Loaded = struct {
@@ -67,7 +77,7 @@ fn alignAppend(L: anytype, bytes: []const u8, alignment: usize) !void {
 
 /// Load a routed projection from the Python reader's canonical names. `lo..hi` is the rank's intermediate span.
 /// The trellis's last dimension gives K2 independently for every expert and every projection.
-fn projection(L: anytype, layer_index: usize, expert_count: usize, dims: usize, full_width: usize, lo: usize, hi: usize, routed_codebook: Codebook, comptime name: []const u8, down: bool) !Projection {
+fn projection(L: anytype, layer_index: usize, expert_count: usize, dims: usize, full_width: usize, lo: usize, hi: usize, routed_codebook: Codebook, comptime name: []const u8, down: bool, expert_ids: ?[]const usize) !Projection {
     if (lo >= hi or hi > full_width or dims % 128 != 0 or full_width % 128 != 0 or lo % 128 != 0 or hi % 128 != 0)
         return error.BadExpertSpan;
     try alignAppend(L, &.{}, 256);
@@ -82,15 +92,16 @@ fn projection(L: anytype, layer_index: usize, expert_count: usize, dims: usize, 
     defer ptrs.deinit(L.gpa);
 
     for (0..expert_count) |e| {
-        const t = try L.get("layers.{d}.mlp.experts.{d}." ++ name ++ ".trellis", .{ layer_index, e });
-        const s = if (L.has("layers.{d}.mlp.experts.{d}." ++ name ++ ".suh", .{ layer_index, e }))
-            try L.get("layers.{d}.mlp.experts.{d}." ++ name ++ ".suh", .{ layer_index, e })
+        const source_expert = if (expert_ids) |ids| ids[e] else e;
+        const t = try L.get("layers.{d}.mlp.experts.{d}." ++ name ++ ".trellis", .{ layer_index, source_expert });
+        const s = if (L.has("layers.{d}.mlp.experts.{d}." ++ name ++ ".suh", .{ layer_index, source_expert }))
+            try L.get("layers.{d}.mlp.experts.{d}." ++ name ++ ".suh", .{ layer_index, source_expert })
         else
-            try L.get("layers.{d}.mlp.experts.{d}." ++ name ++ ".su", .{ layer_index, e });
-        const v = if (L.has("layers.{d}.mlp.experts.{d}." ++ name ++ ".svh", .{ layer_index, e }))
-            try L.get("layers.{d}.mlp.experts.{d}." ++ name ++ ".svh", .{ layer_index, e })
+            try L.get("layers.{d}.mlp.experts.{d}." ++ name ++ ".su", .{ layer_index, source_expert });
+        const v = if (L.has("layers.{d}.mlp.experts.{d}." ++ name ++ ".svh", .{ layer_index, source_expert }))
+            try L.get("layers.{d}.mlp.experts.{d}." ++ name ++ ".svh", .{ layer_index, source_expert })
         else
-            try L.get("layers.{d}.mlp.experts.{d}." ++ name ++ ".sv", .{ layer_index, e });
+            try L.get("layers.{d}.mlp.experts.{d}." ++ name ++ ".sv", .{ layer_index, source_expert });
         if (t.dtype != .i16 or t.rank != 3 or s.dtype != .f16 or v.dtype != .f16) return error.BadExpertTensor;
         const k = t.dim(0) * 16;
         const n = t.dim(1) * 16;
@@ -103,11 +114,11 @@ fn projection(L: anytype, layer_index: usize, expert_count: usize, dims: usize, 
         var marked: ?Codebook = null;
         for (core.exl3_load.markers) |marker_part| {
             const marker = (if (std.mem.eql(u8, marker_part.name, "mcg"))
-                L.get("layers.{d}.mlp.experts.{d}." ++ name ++ ".mcg", .{ layer_index, e })
+                L.get("layers.{d}.mlp.experts.{d}." ++ name ++ ".mcg", .{ layer_index, source_expert })
             else if (std.mem.eql(u8, marker_part.name, "mcg_e4m3"))
-                L.get("layers.{d}.mlp.experts.{d}." ++ name ++ ".mcg_e4m3", .{ layer_index, e })
+                L.get("layers.{d}.mlp.experts.{d}." ++ name ++ ".mcg_e4m3", .{ layer_index, source_expert })
             else
-                L.get("layers.{d}.mlp.experts.{d}." ++ name ++ ".mul1", .{ layer_index, e })) catch |err| {
+                L.get("layers.{d}.mlp.experts.{d}." ++ name ++ ".mul1", .{ layer_index, source_expert })) catch |err| {
                 if (err == error.MissingTensor) continue;
                 return err;
             };
@@ -183,12 +194,28 @@ fn projection(L: anytype, layer_index: usize, expert_count: usize, dims: usize, 
 }
 
 /// Append the mixed-width EXL3 tensors for one expert layer. `routed_codebook` is explicit for packs marked `.mcg`.
-pub fn load(L: anytype, layer_index: usize, expert_count: usize, dims: usize, full_width: usize, lo: usize, hi: usize, routed_codebook: Codebook) !Loaded {
+pub fn load(L: anytype, layer_index: usize, expert_count: usize, dims: usize, full_width: usize, lo: usize, hi: usize, routed_codebook: Codebook, expert_ids: ?[]const usize) !Loaded {
     if (routed_codebook != .mcg and routed_codebook != .mcg_e4m3) return error.BadExpertCodebook;
-    const g = try projection(L, layer_index, expert_count, dims, full_width, lo, hi, routed_codebook, "gate_proj", false);
-    const u = try projection(L, layer_index, expert_count, dims, full_width, lo, hi, routed_codebook, "up_proj", false);
-    const d = try projection(L, layer_index, expert_count, dims, full_width, lo, hi, routed_codebook, "down_proj", true);
+    const g = try projection(L, layer_index, expert_count, dims, full_width, lo, hi, routed_codebook, "gate_proj", false, expert_ids);
+    const u = try projection(L, layer_index, expert_count, dims, full_width, lo, hi, routed_codebook, "up_proj", false, expert_ids);
+    const d = try projection(L, layer_index, expert_count, dims, full_width, lo, hi, routed_codebook, "down_proj", true, expert_ids);
     return .{ .gate = g.ptrs, .up = u.ptrs, .down = d.ptrs, .gate_k2 = g.k2_ptr, .up_k2 = u.k2_ptr, .down_k2 = d.k2_ptr, .suh_g = g.suh_ptr, .suh_u = u.suh_ptr, .svh_g = g.svh_ptr, .svh_u = u.svh_ptr, .suh_d = d.suh_ptr, .svh_d = d.svh_ptr, .codebook = routed_codebook, .uniform_k2 = if (g.uniform_k2 == 8 and u.uniform_k2 == 8 and d.uniform_k2 == 8) 8 else 0, .widths_ok = g.widths_ok and u.widths_ok and d.widths_ok, .pmx_ok = g.pmx_ok and u.pmx_ok and d.pmx_ok, .dims = dims, .width = hi - lo, .experts = expert_count };
+}
+
+test "expert parallel placement splits 256 experts into two bijective local tables" {
+    var counts: [2]usize = @splat(0);
+    var seen: [2][128]bool = .{ @splat(false), @splat(false) };
+    for (0..256) |expert| {
+        const selected = placement(expert);
+        try std.testing.expectEqual(expert, expertForLocal(selected.rank, selected.local));
+        counts[selected.rank] += 1;
+        try std.testing.expect(!seen[selected.rank][selected.local]);
+        seen[selected.rank][selected.local] = true;
+    }
+    try std.testing.expectEqual([_]usize{ 128, 128 }, counts);
+    for (seen) |rank_seen| {
+        for (rank_seen) |present| try std.testing.expect(present);
+    }
 }
 
 /// Decode path: run all routed slots and let the caller perform the ordered fp32 route reduction.
@@ -330,7 +357,7 @@ test "an mcg-marked pack loads as mcg_e4m3 when the config names that codebook" 
         mock.uploads.deinit(mock.gpa);
         mock.host.deinit(mock.gpa);
     }
-    const loaded = try load(&mock, 3, 2, 128, 256, 128, 256, .mcg_e4m3);
+    const loaded = try load(&mock, 3, 2, 128, 256, 128, 256, .mcg_e4m3, null);
     try std.testing.expectEqual(.mcg_e4m3, loaded.layer().codebook);
 }
 
@@ -343,7 +370,7 @@ test "synthetic routed pack keeps per-matrix mixed K2 through TP2 slicing" {
         mock.uploads.deinit(mock.gpa);
         mock.host.deinit(mock.gpa);
     }
-    const loaded = try load(&mock, 3, 2, 128, 256, 128, 256, .mcg_e4m3);
+    const loaded = try load(&mock, 3, 2, 128, 256, 128, 256, .mcg_e4m3, null);
     try std.testing.expectEqual(@as(usize, 128), loaded.width);
     try std.testing.expectEqual(.mcg_e4m3, loaded.layer().codebook);
     try std.testing.expectEqual(@as(usize, 15), mock.uploads.items.len);
@@ -374,7 +401,7 @@ test "expert loader accepts EXL3 su/sv scale aliases from the Python reference l
         mock.uploads.deinit(mock.gpa);
         mock.host.deinit(mock.gpa);
     }
-    const loaded = try load(&mock, 3, 2, 128, 256, 128, 256, .mcg_e4m3);
+    const loaded = try load(&mock, 3, 2, 128, 256, 128, 256, .mcg_e4m3, null);
     try std.testing.expectEqual(.mcg_e4m3, loaded.layer().codebook);
     try std.testing.expectEqual(@as(usize, 15), mock.uploads.items.len);
 }
@@ -382,7 +409,7 @@ test "expert loader accepts EXL3 su/sv scale aliases from the Python reference l
 test "expert loader rejects a tensor marker that differs from the configured routed codebook" {
     var mock: MockLoader = .{ .gpa = std.testing.allocator, .e4m3_marker = true };
     defer mock.host.deinit(mock.gpa);
-    try std.testing.expectError(error.BadExpertCodebook, load(&mock, 3, 2, 128, 256, 128, 256, .mcg));
+    try std.testing.expectError(error.BadExpertCodebook, load(&mock, 3, 2, 128, 256, 128, 256, .mcg, null));
 }
 
 test "multi-chunk expert outputs match the unchunked row order bit-for-bit" {

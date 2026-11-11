@@ -25,12 +25,26 @@ pub fn scoreMmaSmem(_: usize) u32 {
     return score_mma_tile_rows * heads * 136 * 2 + score_mma_keys * 136 * 2 + score_mma_tile_rows * heads * score_mma_keys * 4 + score_mma_tile_rows * heads * 4;
 }
 pub const score_mma_smem: u32 = scoreMmaSmem(4);
+pub fn scoreQsSmem(stages: usize, keys: usize) u32 {
+    return @intCast(stages * keys * 136 * 2 + heads * 4 * keys * 4 + heads * 4 * 4);
+}
 pub const ScoreKernel = enum { scalar, mma };
 
 pub fn parseScoreRows(raw: ?[]const u8) !usize {
     const rows = if (raw) |value| std.fmt.parseInt(usize, value, 10) catch return error.BadIndexRows else 4;
     if (rows != 4 and rows != 8 and rows != 16) return error.BadIndexRows;
     return rows;
+}
+
+pub fn parseIndexQs(raw: ?[]const u8) !u8 {
+    const value = raw orelse return 0;
+    if (std.mem.eql(u8, value, "0")) return 0;
+    if (std.mem.eql(u8, value, "2")) return 2;
+    if (std.mem.eql(u8, value, "3")) return 3;
+    if (std.mem.eql(u8, value, "4")) return 4;
+    if (std.mem.eql(u8, value, "5")) return 5;
+    if (std.mem.eql(u8, value, "6")) return 6;
+    return error.BadIndexQs;
 }
 
 fn scoreKernelFromEnv() !ScoreKernel {
@@ -49,6 +63,17 @@ pub const Plan = struct {
 };
 
 pub const ScoreMmaPlan = struct { rows: usize, grid_x: u32, grid_y: u32, dynamic_smem: u32 };
+
+pub const ScoreQsPlan = struct { grid_x: u32, grid_y: u32, tiles: u32, dynamic_smem: u32 };
+
+pub fn scoreQsPlan(rows: usize, nkeys: usize, stages: usize, keys: usize) !ScoreQsPlan {
+    if (stages != 2 and stages != 3) return error.BadIndexQs;
+    if (keys != 32 and keys != 64) return error.BadIndexQs;
+    const grid_y = (rows + 3) / 4;
+    const total_tiles = (nkeys + keys - 1) / keys;
+    const tiles = @min(@as(usize, 2048 / keys), @max(@as(usize, 1), (total_tiles * grid_y) / 192));
+    return .{ .grid_x = @intCast((total_tiles + tiles - 1) / tiles), .grid_y = @intCast(grid_y), .tiles = @intCast(tiles), .dynamic_smem = scoreQsSmem(stages, keys) };
+}
 
 pub fn scoreMmaPlan(rows: usize, keys: usize, mma_rows: usize) !ScoreMmaPlan {
     if (mma_rows != 4 and mma_rows != 8 and mma_rows != 16) return error.BadIndexRows;
@@ -399,7 +424,13 @@ pub const Index = struct {
     score_mma_4: cuda.Function,
     score_mma_8: cuda.Function,
     score_mma_16: cuda.Function,
+    score_qs_2: cuda.Function,
+    score_qs_3: cuda.Function,
+    score_qs2_k64_s2: cuda.Function,
+    score_qs2_k32_s2: cuda.Function,
+    score_qs2_k32_s3: cuda.Function,
     score_mma_rows: usize = 4,
+    score_qs: u8 = 0,
     /// TF_GLM53_INDEX=scalar|mma (default mma); same bits (the mma kernel keeps the scalar one's dot and sum order).
     score_kernel: ScoreKernel = .mma,
     score_oracle: cuda.Function,
@@ -416,6 +447,11 @@ pub const Index = struct {
             .score_mma_4 = try module.function("tf_glm53_index_scores_mma_4"),
             .score_mma_8 = try module.function("tf_glm53_index_scores_mma_8"),
             .score_mma_16 = try module.function("tf_glm53_index_scores_mma_16"),
+            .score_qs_2 = try module.function("tf_glm53_index_scores_qs_s2"),
+            .score_qs_3 = try module.function("tf_glm53_index_scores_qs_s3"),
+            .score_qs2_k64_s2 = try module.function("tf_glm53_index_scores_qs2_k64_s2"),
+            .score_qs2_k32_s2 = try module.function("tf_glm53_index_scores_qs2_k32_s2"),
+            .score_qs2_k32_s3 = try module.function("tf_glm53_index_scores_qs2_k32_s3"),
             .score_mma_rows = score_mma_rows,
             .score_kernel = try scoreKernelFromEnv(),
             .score_oracle = try module.function("tf_glm53_index_scores_oracle"),
@@ -427,6 +463,11 @@ pub const Index = struct {
         try result.score_mma_4.allowDynamicShared(score_mma_smem);
         try result.score_mma_8.allowDynamicShared(score_mma_smem);
         try result.score_mma_16.allowDynamicShared(score_mma_smem);
+        try result.score_qs_2.allowDynamicShared(scoreQsSmem(2, 64));
+        try result.score_qs_3.allowDynamicShared(scoreQsSmem(3, 64));
+        try result.score_qs2_k64_s2.allowDynamicShared(scoreQsSmem(2, 64));
+        try result.score_qs2_k32_s2.allowDynamicShared(scoreQsSmem(2, 32));
+        try result.score_qs2_k32_s3.allowDynamicShared(scoreQsSmem(3, 32));
         return result;
     }
 
@@ -480,6 +521,24 @@ pub const Index = struct {
         a.add(@as(i32, @intCast(world)));
         if (k.score_kernel == .mma) {
             a.add(@as(i32, @intCast(rows)));
+            if (k.score_qs != 0) {
+                if (k.score_qs < 2 or k.score_qs > 6) return error.BadIndexQs;
+                const stages: usize = if (k.score_qs == 3 or k.score_qs == 6) 3 else 2;
+                const tile_keys: usize = if (k.score_qs == 5 or k.score_qs == 6) 32 else 64;
+                const p = try scoreQsPlan(rows, nkeys, stages, tile_keys);
+                a.add(@as(i32, @intCast(k.score_mma_rows)));
+                a.add(@as(i32, @intCast(p.tiles)));
+                const kernel = switch (k.score_qs) {
+                    2 => k.score_qs_2,
+                    3 => k.score_qs_3,
+                    4 => k.score_qs2_k64_s2,
+                    5 => k.score_qs2_k32_s2,
+                    6 => k.score_qs2_k32_s3,
+                    else => return error.BadIndexQs,
+                };
+                try cuda.launch.launch(kernel, .{ .grid = .{ .x = p.grid_x, .y = p.grid_y, .z = 1 }, .block = .{ .x = 256 }, .shared = p.dynamic_smem }, stream, &a);
+                return;
+            }
             const p = try scoreMmaPlan(rows, nkeys, k.score_mma_rows);
             const kernel = switch (p.rows) { 4 => k.score_mma_4, 8 => k.score_mma_8, 16 => k.score_mma_16, else => unreachable };
             try cuda.launch.launch(kernel, .{ .grid = .{ .x = p.grid_x, .y = p.grid_y, .z = 1 }, .block = .{ .x = 256 }, .shared = p.dynamic_smem }, stream, &a);

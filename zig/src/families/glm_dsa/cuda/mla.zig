@@ -17,6 +17,7 @@ pub const value_dim = 256;
 pub const max_decode_rows = 8;
 /// Row limit for attend_verify only; decode absorb/expand kernels remain capped at max_decode_rows.
 pub const verify_max_rows = 16;
+pub const decode_mla16_rows = 16;
 pub const decode_mla_v2_threads = 128;
 pub const kvb_rows_per_head = nope_dim + value_dim;
 pub const heads = 64;
@@ -31,7 +32,18 @@ pub const prompt_mla_rows: usize = 16;
 pub const prompt_mla_big_rows: usize = 64;
 pub const prompt_mla_big_threads: u32 = 256;
 pub const prompt_mla_big_smem: u32 = (64 * 16 + 64 * (16 + 2)) * @sizeOf(u16);
-pub const PromptMlaMode = enum { off, tile16, tile64 };
+pub const prompt_mla_p2_absorb_smem: u32 = 64 * 200 * @sizeOf(u16) + 3 * 8192;
+pub const prompt_mla_p2_expand_smem: u32 = 64 * 520 * @sizeOf(u16) + 3 * 8192;
+pub const prompt_mla_p2n_expand_smem: u32 = 32 * 520 * @sizeOf(u16) + 2 * 8192;
+pub const PromptMlaMode = enum { off, tile16, tile64, p2, p2n };
+
+pub fn promptP2Z(rows: usize) u32 {
+    // Measured (GB10, glm53-prompt-mla bench, 2026-11-09): at 512 rows z = 1 is fastest for all three kernels (absorb p2
+    // 84.5 us at z 1, 121.9 at z 3); at 4096 rows z = 3 (expand p2 623.8 us vs 743.1 at z 1). Bits do not depend on z.
+    const row_tiles = (rows + prompt_mla_big_rows - 1) / prompt_mla_big_rows;
+    if (row_tiles <= 8) return @intCast(@min(@as(usize, 1), row_tiles));
+    return 3;
+}
 
 pub const Plan = struct { grid: [3]u32, block: u32, dynamic_smem: u32 };
 
@@ -520,13 +532,19 @@ pub const Mla = struct {
     smla_fp8_fn: cuda.Function,
     absorb_prompt_big_fn: cuda.Function,
     expand_prompt_big_fn: cuda.Function,
+    absorb_prompt_p2_fn: cuda.Function,
+    expand_prompt_p2_fn: cuda.Function,
+    expand_prompt_p2n_fn: cuda.Function,
     expand_decode_fn: cuda.Function,
     expand_decode_v2_fn: cuda.Function,
+    expand_decode_v2_16_fn: cuda.Function,
     /// TF_GLM53_SMLA_P3=1 only (loadSmlaP3 at setup): tf_glm53_smla_union and tf_glm53_smla_p3; null otherwise.
     smla_union_fn: ?cuda.Function = null,
     smla_p3_fn: ?cuda.Function = null,
     /// TF_GLM53_DECODE_UNION=1 only (loadAttendVerify at setup).
     attend_verify_fn: ?cuda.Function = null,
+    /// TF_GLM53_QPE_ABSORB_FUSE=1 only (loadAbsorbQpeV3 at setup).
+    absorb_qpe_v3_fn: ?cuda.Function = null,
 
 
     pub fn load(module: cuda.Module) !Mla {
@@ -551,7 +569,14 @@ pub const Mla = struct {
         const expand_prompt_big_fn = try module.function("tf_glm53_expand_v_prompt_mma_big");
         try absorb_prompt_big_fn.allowDynamicShared(prompt_mla_big_smem);
         try expand_prompt_big_fn.allowDynamicShared(prompt_mla_big_smem);
-        return .{ .prep_fn = try module.function("tf_glm53_kv_write"), .qpe_fn = try module.function("tf_glm53_qpe_pack"), .absorb_fn = try module.function("tf_glm53_absorb"), .absorb_decode_fn = try module.function("tf_glm53_absorb_decode"), .absorb_decode_v2_fn = try module.function("tf_glm53_absorb_decode_v2"), .absorb_decode_v3_fn = try module.function("tf_glm53_absorb_decode_v3"), .attend_fn = try module.function("tf_glm53_attend"), .attend_mma_fn = attend_mma_fn, .attend_split_merge_fn = try module.function("tf_glm53_attend_split_merge"), .attend_kernel = selected, .merge_fn = try module.function("tf_glm53_mla_merge"), .expand_fn = try module.function("tf_glm53_expand_v"), .expand_decode_fn = try module.function("tf_glm53_expand_v_decode"), .expand_decode_v2_fn = try module.function("tf_glm53_expand_v_decode_v2"), .absorb_prompt_fn = absorb_prompt_fn, .expand_prompt_fn = expand_prompt_fn, .smla_p_fn = smla_p_fn, .smla_fp8_fn = smla_fp8_fn, .absorb_prompt_big_fn = absorb_prompt_big_fn, .expand_prompt_big_fn = expand_prompt_big_fn };
+        const absorb_prompt_p2_fn = try module.function("tf_glm53_absorb_prompt_p2");
+        const expand_prompt_p2_fn = try module.function("tf_glm53_expand_v_prompt_p2");
+        const expand_prompt_p2n_fn = try module.function("tf_glm53_expand_v_prompt_p2n");
+        try absorb_prompt_p2_fn.allowDynamicShared(prompt_mla_p2_absorb_smem);
+        try expand_prompt_p2_fn.allowDynamicShared(prompt_mla_p2_expand_smem);
+        try expand_prompt_p2n_fn.allowDynamicShared(prompt_mla_p2n_expand_smem);
+        const expand_decode_v2_16_fn = try module.function("tf_glm53_expand_v_decode_v2_16");
+        return .{ .prep_fn = try module.function("tf_glm53_kv_write"), .qpe_fn = try module.function("tf_glm53_qpe_pack"), .absorb_fn = try module.function("tf_glm53_absorb"), .absorb_decode_fn = try module.function("tf_glm53_absorb_decode"), .absorb_decode_v2_fn = try module.function("tf_glm53_absorb_decode_v2"), .absorb_decode_v3_fn = try module.function("tf_glm53_absorb_decode_v3"), .attend_fn = try module.function("tf_glm53_attend"), .attend_mma_fn = attend_mma_fn, .attend_split_merge_fn = try module.function("tf_glm53_attend_split_merge"), .attend_kernel = selected, .merge_fn = try module.function("tf_glm53_mla_merge"), .expand_fn = try module.function("tf_glm53_expand_v"), .expand_decode_fn = try module.function("tf_glm53_expand_v_decode"), .expand_decode_v2_fn = try module.function("tf_glm53_expand_v_decode_v2"), .expand_decode_v2_16_fn = expand_decode_v2_16_fn, .absorb_prompt_fn = absorb_prompt_fn, .expand_prompt_fn = expand_prompt_fn, .smla_p_fn = smla_p_fn, .smla_fp8_fn = smla_fp8_fn, .absorb_prompt_big_fn = absorb_prompt_big_fn, .expand_prompt_big_fn = expand_prompt_big_fn, .absorb_prompt_p2_fn = absorb_prompt_p2_fn, .expand_prompt_p2_fn = expand_prompt_p2_fn, .expand_prompt_p2n_fn = expand_prompt_p2n_fn };
 
     }
 
@@ -570,6 +595,11 @@ pub const Mla = struct {
         const verify_fn = module.function("tf_glm53_attend_verify") catch return error.MissingDecodeUnionKernel;
         try verify_fn.allowDynamicShared(attend_verify_smem);
         m.attend_verify_fn = verify_fn;
+    }
+
+    /// Resolve the fused q_pe pack and v3 absorb kernel when selected at setup.
+    pub fn loadAbsorbQpeV3(m: *Mla, module: cuda.Module) !void {
+        m.absorb_qpe_v3_fn = module.function("tf_glm53_absorb_qpe_decode_v3") catch return error.MissingQpeAbsorbFuseKernel;
     }
 
     pub fn prep(m: *const Mla, stream: cuda.Stream, proj: u64, norm: u64, cos: u64, sin: u64, positions: u64, latent: u64, rope: u64, stage: ?types.StagePlanePair, rows: usize, stride: usize, rank: usize, world: usize, prefill: bool) !void {
@@ -613,15 +643,32 @@ pub const Mla = struct {
         try cuda.launch.launch(m.absorb_decode_v3_fn, .{ .grid = .{ .x = @intCast(latent_dim / 64), .y = @intCast(local_heads), .z = 1 }, .block = .{ .x = decode_mla_v2_threads } }, stream, &a);
     }
 
+    /// TF_GLM53_QPE_ABSORB_FUSE=1: pack q_pe and absorb with the v3 grid and block.
+    pub fn absorbQpeV3(m: *const Mla, stream: cuda.Stream, q: u64, cos: u64, sin: u64, qpe: u64, kvb: u64, scales: u64, qa: u64, rows: usize, local_heads: usize, global_head0: usize) !void {
+        if (rows == 0) return;
+        if (rows > max_decode_rows) return error.DecodeMlaRows;
+        const fused = m.absorb_qpe_v3_fn orelse return error.MissingQpeAbsorbFuseKernel;
+        var a: cuda.Args = .{};
+        inline for (.{ q, kvb, scales, qa, @as(i32, @intCast(rows)), @as(i32, @intCast(local_heads)), @as(i32, @intCast(global_head0)), cos, sin, qpe }) |v| a.add(v);
+        try cuda.launch.launch(fused, .{ .grid = .{ .x = @intCast(latent_dim / 64), .y = @intCast(local_heads), .z = 1 }, .block = .{ .x = decode_mla_v2_threads } }, stream, &a);
+    }
+
     pub fn absorbPrompt(m: *const Mla, stream: cuda.Stream, q: u64, kvb: u64, scales: u64, qa: u64, rows: usize, local_heads: usize, global_head0: usize, mode: PromptMlaMode) !void {
+        try m.absorbPromptWithZ(stream, q, kvb, scales, qa, rows, local_heads, global_head0, mode, promptP2Z(rows));
+    }
+
+    pub fn absorbPromptWithZ(m: *const Mla, stream: cuda.Stream, q: u64, kvb: u64, scales: u64, qa: u64, rows: usize, local_heads: usize, global_head0: usize, mode: PromptMlaMode, z: u32) !void {
         if (rows == 0) return;
         if (mode == .off) return error.PromptMlaDisabled;
         var a: cuda.Args = .{};
         inline for (.{ q, kvb, scales, qa, @as(i32, @intCast(rows)), @as(i32, @intCast(local_heads)), @as(i32, @intCast(global_head0)) }) |v| a.add(v);
         if (mode == .tile16) {
             try cuda.launch.launch(m.absorb_prompt_fn, .{ .grid = .{ .x = @intCast(latent_dim / 8), .y = @intCast(local_heads), .z = @intCast((rows + prompt_mla_rows - 1) / prompt_mla_rows) }, .block = .{ .x = 32 }, .shared = prompt_mla_smem }, stream, &a);
-        } else {
+        } else if (mode == .tile64) {
             try cuda.launch.launch(m.absorb_prompt_big_fn, .{ .grid = .{ .x = @intCast(latent_dim / 64), .y = @intCast(local_heads), .z = @intCast((rows + prompt_mla_big_rows - 1) / prompt_mla_big_rows) }, .block = .{ .x = prompt_mla_big_threads }, .shared = prompt_mla_big_smem }, stream, &a);
+        } else {
+            if (z == 0) return error.PromptMlaGrid;
+            try cuda.launch.launch(m.absorb_prompt_p2_fn, .{ .grid = .{ .x = @intCast(latent_dim / 64), .y = @intCast(local_heads), .z = @intCast(z) }, .block = .{ .x = 256 }, .shared = prompt_mla_p2_absorb_smem }, stream, &a);
         }
     }
 
@@ -664,6 +711,11 @@ pub const Mla = struct {
         var b: cuda.Args = .{};
         inline for (.{ split_ws, partial_block, @as(i32, @intCast(rows)), @as(i32, @intCast(local_heads)), @as(i32, decode_splits) }) |v| b.add(v);
         try cuda.launch.launch(m.attend_split_merge_fn, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(local_heads) }, .block = .{ .x = 256 } }, stream, &b);
+    }
+
+    /// One head group: 32 heads over this rank's keys. Caller passes that group's bases.
+    pub fn attendVerifyGroup(m: *const Mla, stream: cuda.Stream, qa_g: u64, qpe_g: u64, latent: u64, rope: u64, positions: u64, local_slots: u64, local_counts: u64, partial_g: u64, rows: usize, rank: usize, world: usize, split_g: u64) !void {
+        try m.attendVerify(stream, qa_g, qpe_g, latent, rope, positions, local_slots, local_counts, partial_g, rows, 32, rank, world, split_g);
     }
 
     /// SMLA-P: the gather-on-prefill attend (`attend` with prefill = true) with query blocking. Same arguments,
@@ -737,15 +789,33 @@ pub const Mla = struct {
         try cuda.launch.launch(m.expand_decode_v2_fn, .{ .grid = .{ .x = 1, .y = @intCast(local_heads), .z = @intCast(value_dim / decode_mla_v2_threads) }, .block = .{ .x = decode_mla_v2_threads } }, stream, &a);
     }
 
+    pub fn expandVV2Wide(m: *const Mla, stream: cuda.Stream, ol: u64, kvb: u64, scales: u64, out: u64, rows: usize, local_heads: usize, global_head0: usize) !void {
+        if (rows == 0) return;
+        if (rows > decode_mla16_rows) return error.DecodeMlaRows;
+        var a: cuda.Args = .{};
+        inline for (.{ ol, kvb, scales, out, @as(i32, @intCast(rows)), @as(i32, @intCast(local_heads)), @as(i32, @intCast(global_head0)) }) |v| a.add(v);
+        try cuda.launch.launch(m.expand_decode_v2_16_fn, .{ .grid = .{ .x = 1, .y = @intCast(local_heads), .z = @intCast(value_dim / decode_mla_v2_threads) }, .block = .{ .x = decode_mla_v2_threads } }, stream, &a);
+    }
+
     pub fn expandVPrompt(m: *const Mla, stream: cuda.Stream, ol: u64, kvb: u64, scales: u64, out: u64, rows: usize, local_heads: usize, global_head0: usize, mode: PromptMlaMode) !void {
+        try m.expandVPromptWithZ(stream, ol, kvb, scales, out, rows, local_heads, global_head0, mode, promptP2Z(rows));
+    }
+
+    pub fn expandVPromptWithZ(m: *const Mla, stream: cuda.Stream, ol: u64, kvb: u64, scales: u64, out: u64, rows: usize, local_heads: usize, global_head0: usize, mode: PromptMlaMode, z: u32) !void {
         if (rows == 0) return;
         if (mode == .off) return error.PromptMlaDisabled;
         var a: cuda.Args = .{};
         inline for (.{ ol, kvb, scales, out, @as(i32, @intCast(rows)), @as(i32, @intCast(local_heads)), @as(i32, @intCast(global_head0)) }) |v| a.add(v);
         if (mode == .tile16) {
             try cuda.launch.launch(m.expand_prompt_fn, .{ .grid = .{ .x = @intCast(value_dim / 8), .y = @intCast(local_heads), .z = @intCast((rows + prompt_mla_rows - 1) / prompt_mla_rows) }, .block = .{ .x = 32 }, .shared = prompt_mla_smem }, stream, &a);
-        } else {
+        } else if (mode == .tile64) {
             try cuda.launch.launch(m.expand_prompt_big_fn, .{ .grid = .{ .x = @intCast(value_dim / 64), .y = @intCast(local_heads), .z = @intCast((rows + prompt_mla_big_rows - 1) / prompt_mla_big_rows) }, .block = .{ .x = prompt_mla_big_threads }, .shared = prompt_mla_big_smem }, stream, &a);
+        } else {
+            if (z == 0) return error.PromptMlaGrid;
+            const expand_fn = if (mode == .p2) m.expand_prompt_p2_fn else m.expand_prompt_p2n_fn;
+            const tile_n: usize = if (mode == .p2) 64 else 32;
+            const shared = if (mode == .p2) prompt_mla_p2_expand_smem else prompt_mla_p2n_expand_smem;
+            try cuda.launch.launch(expand_fn, .{ .grid = .{ .x = @intCast(value_dim / tile_n), .y = @intCast(local_heads), .z = @intCast(z) }, .block = .{ .x = 256 }, .shared = shared }, stream, &a);
         }
     }
 };
@@ -797,6 +867,19 @@ test "MLA launch plans stay under the sm_121 shared-memory budget" {
     try std.testing.expectEqual(@as(usize, 5), try globalPosition(2, 1, 2));
     try std.testing.expect(useMaskedMha(5119, prefill_masked_mha_switch_default));
     try std.testing.expect(!useMaskedMha(5120, prefill_masked_mha_switch_default));
+}
+
+test "prompt p2 z: one group up to 512 rows, three above" {
+    try std.testing.expectEqual(@as(u32, 50_176), prompt_mla_p2_absorb_smem);
+    try std.testing.expectEqual(@as(u32, 91_136), prompt_mla_p2_expand_smem);
+    try std.testing.expectEqual(@as(u32, 49_664), prompt_mla_p2n_expand_smem);
+    try std.testing.expectEqual(@as(u32, 0), promptP2Z(0));
+    try std.testing.expectEqual(@as(u32, 1), promptP2Z(1));
+    try std.testing.expectEqual(@as(u32, 1), promptP2Z(64));
+    try std.testing.expectEqual(@as(u32, 1), promptP2Z(65));
+    try std.testing.expectEqual(@as(u32, 1), promptP2Z(512));
+    try std.testing.expectEqual(@as(u32, 3), promptP2Z(513));
+    try std.testing.expectEqual(@as(u32, 3), promptP2Z(4096));
 }
 
 test "kv write row and slot addressing is applied exactly once for decode and prefill batches" {

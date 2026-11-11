@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Kristian Aaron (Krishando)
-// GLM-5.3 W8A8 prefill projection (TF_GLM53_PREFILL_W8A8=1, attention o_proj): e4m3 activations times the
-// checkpoint's FP8B e4m3 weights on mma.sync m16n8k32, fp32 accumulators.
+// GLM-5.3 W8A8 prefill projection: e4m3 activations times the checkpoint's FP8B e4m3 weights on
+// mma.sync m16n8k32, fp32 accumulators. TF_GLM53_PREFILL_W8A8=1 launches this for o_proj.
+// =2 reuses the same quant and GEMM for every other FP8B prefill projection whose K fits the level-2 scratch.
 //
 // Provenance:
 // - The e4m3 m16n8k32 MMA, the per-(row, 128-K) activation scale with amax / 448 and the FP32 promotion of block

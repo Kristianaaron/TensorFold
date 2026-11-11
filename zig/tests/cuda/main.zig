@@ -78,6 +78,7 @@ const glm53_moe_tests = @import("glm53_moe_tests");
 const glm53_adapt_tests = @import("glm53_adapt_tests.zig");
 const glm53_fuse_tests = @import("glm53_fuse_tests");
 const glm53_pre_group_tests = @import("glm53_pre_group_tests");
+const qmmf2_tests = @import("qmmf2_tests.zig");
 const glm53_x3e4_tests = @import("glm53_x3e4_tests");
 const glm53_pmx_tests = @import("glm53_pmx_tests.zig");
 const glm53_prompt_experts_tests = @import("glm53_prompt_experts_tests.zig");
@@ -154,6 +155,7 @@ const usage =
     \\  nccl                      one-rank NCCL all-reduce and all-gather
     \\  rank-scatter <rank> <n> [id]  rank-order reduce-scatter (NCCL_COMM_ID or an id file) against an all-gather
     \\  roce-gather <rank>        two ranks (NCCL_COMM_ID): the RoCE all-gather against NCCL's, graph replays, time a call
+    \\  glm53-partial-roce <rank>  16-row GLM attention partial bytes through RoCE against NCCL send/receive
     \\  roce-allreduce <rank>     GLM sizes R=1..8: RoCE vs NCCL bit equality, graph replay, median/p99 latency
     \\  rank-sum                  the reduce-scatter's sum kernel alone, 2 to 5 ranks as each rank (one GPU, no NCCL)
     \\  nccl-pair <rank> <world> <idfile>  one rank of a multi-host communicator: send/recv with every peer, all-reduce, all-gather
@@ -237,6 +239,7 @@ const usage =
     \\  glm53-lowrank            GLM-5.3 decode low-rank coalescing, reference and determinism checks
     \\  glm53-fuse              GLM-5.3 MoE BF16 combine and post-attention residual/RMSNorm parity
     \\  glm53-pre-group         GLM-5.3 grouped q_a | kv_a | wk qmmf launch byte-equal to separate launches; split plan; prefetch
+    \\  qmmf2                   fused FP8B schedule variants: same-byte parity and resource checks
     \\  glm53-x3e4              GLM-5.3 MCG-E4M3 trellis tile decode widths 2, 3, and 4 vs host oracle
     \\  glm53-pmx               GLM-5.3 width-specialised prompt experts
     \\  glm53-prompt-experts   GLM-5.3 routed prompt experts vs decode rows and row-window invariance
@@ -247,6 +250,7 @@ const usage =
     \\  glm53-prefill            GLM-5.3 CUTLASS FP8 prefill shapes vs MMA, seeded and row-tiled
     \\  glm53-prefill-bf16       GLM-5.3 BF16 dequant/cuBLASLt prefill vs MMA and fixed-row chunk invariance
     \\  glm53-w8a8               GLM-5.3 TF_GLM53_PREFILL_W8A8 o_proj vs default qmmf: KLD-gate metrics, layout, row invariance, bench
+    \\  glm53-w8a8-all           GLM-5.3 TF_GLM53_PREFILL_W8A8=2 shapes vs default qmmf: max abs, max rel, mean abs, bench
     \\  exl3 [dir]                EXL3 decode-row linear: float64 checks, row invariance, the Python engine's fixture (dir none skips it)
     \\  exl3-tp2 <rank> <host:port> [dir]  EXL3 tensor parallel: rank shards vs the Python engine's, all-gathered (dir none skips them)
     \\  exl3-tiles [DIR]          EXL3's tile candidate: codebooks and tiles bit-equal, FP64, rows through qlinear and Dense
@@ -336,6 +340,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
         return rank_scatter_tests.run(gpu, rank, world, if (rest.len > 2) rest[2] else null);
     }
     if (std.mem.eql(u8, cmd, "roce-gather")) return roce_gather_tests.run(gpu, try std.fmt.parseInt(usize, try arg(rest, 0), 10));
+    if (std.mem.eql(u8, cmd, "glm53-partial-roce")) return roce_gather_tests.runGlmPartial(gpu, try std.fmt.parseInt(usize, try arg(rest, 0), 10));
     if (std.mem.eql(u8, cmd, "roce-allreduce")) return roce_gather_tests.runAllReduce(gpu, try std.fmt.parseInt(usize, try arg(rest, 0), 10));
     if (std.mem.eql(u8, cmd, "rank-sum")) return rank_scatter_tests.sum(gpu);
     if (std.mem.eql(u8, cmd, "nccl-pair")) return libs_tests.ncclPair(gpu, try std.fmt.parseInt(c_int, try arg(rest, 0), 10), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try arg(rest, 2));
@@ -448,6 +453,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "glm53-lowrank")) return glm53_moe_tests.runLowRank(gpu);
     if (std.mem.eql(u8, cmd, "glm53-fuse")) return glm53_fuse_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm53-pre-group")) return glm53_pre_group_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "qmmf2")) return qmmf2_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm53-x3e4")) return glm53_x3e4_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm53-pmx")) return glm53_pmx_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm53-prompt-experts")) return glm53_prompt_experts_tests.run(gpu);
@@ -458,6 +464,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "glm53-prefill")) return glm53_fp8_backend_probe.runPrefill(gpu);
     if (std.mem.eql(u8, cmd, "glm53-prefill-bf16")) return glm53_prefill_bf16_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm53-w8a8")) return glm53_w8a8_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "glm53-w8a8-all")) return glm53_w8a8_tests.runAll(gpu);
     if (std.mem.eql(u8, cmd, "glm53-mk")) return glm53_mk_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm53-mk-moe")) return glm53_mk_moe_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm53-mk-attn")) return glm53_mk_attn_tests.run(gpu);

@@ -66,6 +66,15 @@ extern "C" __global__ void tf_glm53_moe_post(const float* y, const float* weight
   tf_glm53_moe_post_task(p, TF_VBID.x, TF_VNBLK.x, smem);
 }
 
+extern "C" __global__ void tf_glm53_moe_post_ep(const float* y, const float* weights, const int* picks, const float* shared,
+                                                  const float* b, const float* mid, __nv_bfloat16* out,
+                                                  int rows, int hidden, int rank, int b_stride) {
+  TF_VBLOCK_ENTER();
+  extern __shared__ char smem[];
+  const tf_glm53_moe_post_ep_params p{y, weights, picks, shared, b, mid, out, rows, hidden, rank, b_stride};
+  tf_glm53_moe_post_ep_task(p, TF_VBID.x, TF_VNBLK.x, smem);
+}
+
 extern "C" __global__ void __launch_bounds__(256)
 tf_glm53_residual_rmsnorm_6144(__nv_bfloat16* x, const float* parts, const __nv_bfloat16* w,
     __nv_bfloat16* normed, int rows, float eps) {
@@ -92,6 +101,24 @@ extern "C" __global__ void tf_glm53_moe_residual_add(const __nv_bfloat16* x, __n
   tf_glm53_moe_residual_add_task(p, TF_VBID.x, TF_VNBLK.x, smem);
 }
 
+// TF_GLM53_ADD_NORM_FUSE=1: tf_glm53_moe_residual_add on one row, then the next layer's input norm on the stored
+// bf16 row, in one launch. Each element's add uses the same arithmetic; the norm uses glm_glue's RMSNorm template.
+extern "C" __global__ void __launch_bounds__(256)
+tf_glm53_moe_residual_rmsnorm_6144(__nv_bfloat16* x, const __nv_bfloat16* parts, const __nv_bfloat16* w,
+    __nv_bfloat16* normed, int rows, float eps) {
+  TF_VBLOCK_ENTER();
+  const int row = TF_VBID.x;
+  const int count = rows * 6144;
+  for (int j = threadIdx.x; j < 6144; j += TF_VBDIM.x) {
+    const int i = row * 6144 + j;
+    const float rank_sum = __fadd_rn(__bfloat162float(parts[i]), __bfloat162float(parts[count + i]));
+    const float residual = __fadd_rn(__bfloat162float(x[i]), __bfloat162float(__float2bfloat16_rn(rank_sum)));
+    x[i] = __float2bfloat16_rn(residual);
+  }
+  TF_TASK_SYNC();
+  glm_glue::rmsnorm<6144, 8192, 8, 8>(x, 6144, w, normed, 6144, nullptr, eps, 0, row);
+}
+
 extern "C" __global__ void tf_glm53_lowrank_finish(const float* b, const float* mid, float* acc,
     int rows, int hidden, int rank, int b_stride) {
     TF_VBLOCK_ENTER();
@@ -115,4 +142,39 @@ extern "C" __global__ void __launch_bounds__(256) tf_glm53_unpack_bf16_rows(cons
   long long lane = (rr % 8) * 4 + rest / 2, e = (q / 8) * 2 + rest % 2;
   long long tg = (row / 64) * (k / 64) + c / 64;
   out[idx] = packed[tg * 4096 + (rr / 8) * 512 + (cc / 16) * 128 + lane * 4 + e];
+}
+
+// TF_GLM53_QA_SHARD=1: q_a_norm over the two ranks' gathered 1024-column halves, bit-identical to
+// tf_glm_rmsnorm_2048 on the assembled [rows][2048] row: glm_glue::rmsnorm<2048, 2048, 4, 8> with rep 0 (columns
+// 0..1023) read from x0 and rep 1 (columns 1024..2047) from x1; the same values a thread holds and the same sum order.
+extern "C" __global__ void __launch_bounds__(128)
+tf_glm53_rmsnorm_2048_halves(const __nv_bfloat16* x0, const __nv_bfloat16* x1, int64_t half_stride,
+    const __nv_bfloat16* w, __nv_bfloat16* out, int64_t o_stride, float eps) {
+  TF_VBLOCK_ENTER();
+  constexpr int D = 2048, NW = 4, S = 8, T = NW * 32, TILE = S * T, REPS = D / TILE;
+  static_assert(REPS == 2 && TILE == 1024, "one rep per rank half");
+  __shared__ float smem[NW];
+  const int64_t r = TF_VBID.x;
+  const int t = threadIdx.x;
+  const bool xv0 = glm_glue::packed<S>(x0, half_stride), xv1 = glm_glue::packed<S>(x1, half_stride);
+  const bool wv = glm_glue::packed<S>(w, 0), ov = glm_glue::packed<S>(out, o_stride);
+  float v[REPS * S];
+  glm_glue::load_s<S>(x0 + r * half_stride + t * S, v, xv0);
+  glm_glue::load_s<S>(x1 + r * half_stride + t * S, v + S, xv1);
+  float acc = __fmul_rn(v[1], v[1]);
+  acc = __fmaf_rn(v[0], v[0], acc);
+#pragma unroll
+  for (int k = 2; k < REPS * S; ++k) acc = __fmaf_rn(v[k], v[k], acc);
+  const float total = glm_triton::block_sum<NW>(acc, smem);
+  const float rinv = glm_triton::div_full(1.0f, glm_triton::sqrt_approx(eps + glm_triton::div_full(total, (float)D)));
+#pragma unroll
+  for (int rep = 0; rep < REPS; ++rep) {
+    const int d = rep * TILE + t * S;
+    float wf[S];
+    __nv_bfloat16 o[S];
+    glm_glue::load_s<S>(w + d, wf, wv);
+#pragma unroll
+    for (int j = 0; j < S; ++j) o[j] = __float2bfloat16_rn(__fmul_rn(wf[j], glm_triton::rbf(__fmul_rn(rinv, v[rep * S + j]))));
+    glm_glue::store_s<S>(out + r * o_stride + d, o, ov);
+  }
 }

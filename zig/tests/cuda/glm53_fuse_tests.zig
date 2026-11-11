@@ -53,6 +53,61 @@ pub fn run(gpu: anytype) !void {
     defer stream.deinit();
     try moeCombine(gpu, stream, fused);
     try attentionEpilogue(gpu, stream, base, fused);
+    try moeAddNormEpilogue(gpu, stream, base, fused);
+    try qaShardNorm(gpu, stream, base, fused);
+}
+
+fn qaShardNorm(gpu: anytype, stream: cuda.Stream, base: cuda.Module, fused: cuda.Module) !void {
+    const full_norm = try base.function("tf_glm_rmsnorm_2048");
+    const halves_norm = try fused.function("tf_glm53_rmsnorm_2048_halves");
+    var prng = std.Random.DefaultPrng.init(0x5a4d_2048);
+    const random = prng.random();
+    for ([_]usize{ 1, 2, 3, 4, 8, 16, 512 }) |rows| {
+        const full = try gpu.gpa.alloc(u16, rows * 2048);
+        defer gpu.gpa.free(full);
+        const x0 = try gpu.gpa.alloc(u16, rows * 1024);
+        defer gpu.gpa.free(x0);
+        const x1 = try gpu.gpa.alloc(u16, rows * 1024);
+        defer gpu.gpa.free(x1);
+        const weight = try gpu.gpa.alloc(u16, 2048);
+        defer gpu.gpa.free(weight);
+        for (0..rows) |r| {
+            for (0..2048) |c| {
+                const i = r * 2048 + c;
+                const value: f32 = if (rows > 1 and r == 0) 0 else if (rows > 1 and r == 1) signed(i, 31) * 8192 else signed(random.int(usize), 127) / 32;
+                full[i] = bf16Bits(value);
+                if (c < 1024) x0[r * 1024 + c] = full[i] else x1[r * 1024 + c - 1024] = full[i];
+            }
+        }
+        for (weight) |*v| v.* = bf16Bits(0.5 + @as(f32, @floatFromInt(random.intRangeAtMost(i16, -256, 256))) / 512);
+        var dx = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(full));
+        defer dx.free();
+        var d0 = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(x0));
+        defer d0.free();
+        var d1 = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(x1));
+        defer d1.free();
+        var dw = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(weight));
+        defer dw.free();
+        var out_full = try cuda.DeviceBuffer.alloc(gpu.d, rows * 2048 * 2);
+        defer out_full.free();
+        var out_halves = try cuda.DeviceBuffer.alloc(gpu.d, rows * 2048 * 2);
+        defer out_halves.free();
+        var full_args: cuda.Args = .{};
+        inline for (.{ dx.ptr, @as(i64, 2048), dw.ptr, out_full.ptr, @as(i64, 2048), @as(u64, 0), @as(f32, 1e-5), @as(c_int, 0) }) |v| full_args.add(v);
+        try cuda.launch.launch(full_norm, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 128 } }, stream, &full_args);
+        var halves_args: cuda.Args = .{};
+        inline for (.{ d0.ptr, d1.ptr, @as(i64, 1024), dw.ptr, out_halves.ptr, @as(i64, 2048), @as(f32, 1e-5) }) |v| halves_args.add(v);
+        try cuda.launch.launch(halves_norm, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 128 } }, stream, &halves_args);
+        try stream.synchronize();
+        const expected = try gpu.gpa.alloc(u8, out_full.len);
+        defer gpu.gpa.free(expected);
+        const actual = try gpu.gpa.alloc(u8, out_halves.len);
+        defer gpu.gpa.free(actual);
+        try out_full.download(0, expected);
+        try out_halves.download(0, actual);
+        try std.testing.expectEqualSlices(u8, expected, actual);
+        pass("glm53-fuse: q_a halves RMSNorm rows={d}", .{rows});
+    }
 }
 
 fn moeCombine(gpu: anytype, stream: cuda.Stream, module: cuda.Module) !void {
@@ -163,6 +218,64 @@ fn attentionEpilogue(gpu: anytype, stream: cuda.Stream, base: cuda.Module, fused
         try std.testing.expectEqualSlices(u8, residual0, residual1);
         try std.testing.expectEqualSlices(u8, norm0, norm1);
         pass("glm53-fuse: rank-sum residual and post-attention RMSNorm rows={d}", .{rows});
+    }
+}
+
+fn moeAddNormEpilogue(gpu: anytype, stream: cuda.Stream, base: cuda.Module, fused: cuda.Module) !void {
+    const separate_add = try fused.function("tf_glm53_moe_residual_add");
+    const separate_norm = try base.function("tf_glm_rmsnorm_6144");
+    const fused_epilogue = try fused.function("tf_glm53_moe_residual_rmsnorm_6144");
+    for ([_]usize{ 1, 2, 3, 4, 8, 64 }) |rows| {
+        const count = rows * 6144;
+        const x = try gpu.gpa.alloc(u16, count);
+        defer gpu.gpa.free(x);
+        const parts = try gpu.gpa.alloc(u16, count * 2);
+        defer gpu.gpa.free(parts);
+        const weight = try gpu.gpa.alloc(u16, 6144);
+        defer gpu.gpa.free(weight);
+        for (x, 0..) |*v, i| {
+            const row = i / 6144;
+            v.* = if (row == 0) 0 else if (row == 1) bf16Bits(if (i % 2 == 0) 3.0e38 else -3.0e38) else if (row == 2) (if (i % 2 == 0) 0x0001 else 0x8001) else bf16Bits(signed(i, 37) / 64);
+        }
+        for (parts, 0..) |*v, i| {
+            const row = i % count / 6144;
+            v.* = if (row < 2) 0 else if (row == 2) (if (i % 2 == 0) 0x0001 else 0x8001) else bf16Bits(signed(i, 53) / 512);
+        }
+        for (weight, 0..) |*v, i| v.* = bf16Bits(1 + signed(i, 29) / 2048);
+        var dx0 = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(x));
+        defer dx0.free();
+        var dx1 = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(x));
+        defer dx1.free();
+        var dp = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(parts));
+        defer dp.free();
+        var dw = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(weight));
+        defer dw.free();
+        var dn0 = try cuda.DeviceBuffer.alloc(gpu.d, count * 2);
+        defer dn0.free();
+        var dn1 = try cuda.DeviceBuffer.alloc(gpu.d, count * 2);
+        defer dn1.free();
+
+        var add: cuda.Args = .{};
+        inline for (.{ dx0.ptr, dx0.ptr, dp.ptr, @as(c_int, @intCast(count)) }) |v| add.add(v);
+        try cuda.launch.launch(separate_add, .{ .grid = .{ .x = @intCast((count + 255) / 256) }, .block = .{ .x = 256 } }, stream, &add);
+        var norm: cuda.Args = .{};
+        inline for (.{ dx0.ptr, @as(i64, 6144), dw.ptr, dn0.ptr, @as(i64, 6144), @as(u64, 0), @as(f32, 1e-5), @as(c_int, 0) }) |v| norm.add(v);
+        try cuda.launch.launch(separate_norm, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &norm);
+        var epilogue: cuda.Args = .{};
+        inline for (.{ dx1.ptr, dp.ptr, dw.ptr, dn1.ptr, @as(c_int, @intCast(rows)), @as(f32, 1e-5) }) |v| epilogue.add(v);
+        try cuda.launch.launch(fused_epilogue, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &epilogue);
+        try stream.synchronize();
+        const residual0 = try download(gpu, dx0);
+        defer gpu.gpa.free(residual0);
+        const residual1 = try download(gpu, dx1);
+        defer gpu.gpa.free(residual1);
+        const norm0 = try download(gpu, dn0);
+        defer gpu.gpa.free(norm0);
+        const norm1 = try download(gpu, dn1);
+        defer gpu.gpa.free(norm1);
+        try std.testing.expectEqualSlices(u8, residual0, residual1);
+        try std.testing.expectEqualSlices(u8, norm0, norm1);
+        pass("glm53-fuse: MoE residual and next-layer RMSNorm rows={d}", .{rows});
     }
 }
 

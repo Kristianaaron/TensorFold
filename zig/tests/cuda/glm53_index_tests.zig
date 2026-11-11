@@ -13,10 +13,12 @@ pub fn run(gpu: anytype) !void {
     var module = try cuda.Module.load(gpu.d, cuda.kernels.glm53_index);
     defer module.unload();
     const kernels = try index.Index.load(module, 4);
+    try qsResources(kernels);
     var stream = try cuda.Stream.init(gpu.d, false);
     defer stream.deinit();
     try scoresCase(gpu, stream, &kernels);
     try scoresMmaLargeRowTiles(gpu, stream, &kernels);
+    try scoresQsParityCases(gpu, stream, &kernels);
     try tileSkipCases(gpu, stream, &kernels);
     try topkCases(gpu, stream, &kernels);
     try mergeCase(gpu, stream, &kernels);
@@ -25,6 +27,24 @@ pub fn run(gpu: anytype) !void {
     try merge2BlockRowsCase(gpu, stream, &kernels, 513, 64); // INDEX_PIPE schedule with a 513-row prompt tail.
     try topkMerge2RandomCase(gpu, stream, &kernels);
     try merge2EdgeCases(gpu, stream, &kernels);
+}
+
+fn qsResources(kernels: index.Index) !void {
+    const Variant = struct { name: []const u8, function: cuda.Function, shared: u32 };
+    const variants = [_]Variant{
+        .{ .name = "qs_s2", .function = kernels.score_qs_2, .shared = index.scoreQsSmem(2, 64) },
+        .{ .name = "qs_s3", .function = kernels.score_qs_3, .shared = index.scoreQsSmem(3, 64) },
+        .{ .name = "qs2_k64_s2", .function = kernels.score_qs2_k64_s2, .shared = index.scoreQsSmem(2, 64) },
+        .{ .name = "qs2_k32_s2", .function = kernels.score_qs2_k32_s2, .shared = index.scoreQsSmem(2, 32) },
+        .{ .name = "qs2_k32_s3", .function = kernels.score_qs2_k32_s3, .shared = index.scoreQsSmem(3, 32) },
+    };
+    for (variants) |variant| {
+        const regs = try variant.function.attribute(.num_regs);
+        const static_shared = try variant.function.attribute(.shared_size_bytes);
+        const active = try variant.function.occupancy(256, @intCast(variant.shared));
+        std.debug.print("INFO glm53-index resources {s}: {d} registers, {d} B static + {d} B dynamic shared, {d} CTAs/SM\n", .{ variant.name, regs, static_shared, variant.shared, active });
+    }
+    pass("glm53-index: query-stationary kernel registers, shared memory, and active CTAs/SM reported", .{});
 }
 
 fn scoresCase(gpu: anytype, stream: cuda.Stream, kernels_in: *const index.Index) !void {
@@ -737,6 +757,106 @@ fn scoresMmaLargeRowTiles(gpu: anytype, stream: cuda.Stream, kernels: *const ind
     pass("glm53-index: 8/16-row CTA scores and top-k bit-exact vs 4 rows (rows 1/7/64/512, contexts 2k/16k, both ranks)", .{});
 }
 
+fn scoresQsParityCases(gpu: anytype, stream: cuda.Stream, kernels: *const index.Index) !void {
+    const Case = struct { rows: usize, keys: usize, causal: bool };
+    const cases = [_]Case{
+        .{ .rows = 1, .keys = 64, .causal = false },
+        .{ .rows = 7, .keys = 1000, .causal = false },
+        .{ .rows = 64, .keys = 8192, .causal = true },
+        .{ .rows = 100, .keys = 4097, .causal = true },
+        .{ .rows = 512, .keys = 16384, .causal = true },
+        .{ .rows = 512, .keys = 65536, .causal = true },
+    };
+    var prng = std.Random.DefaultPrng.init(0x51535);
+    const rnd = prng.random();
+    for ([_]usize{ 4, 8, 16 }) |rows_per_cta| {
+        var release = kernels.*;
+        release.score_kernel = .mma;
+        release.score_mma_rows = rows_per_cta;
+        release.score_qs = 0;
+        for ([_]u8{ 2, 3, 4, 5, 6 }) |mode| {
+            var qs = kernels.*;
+            qs.score_kernel = .mma;
+            qs.score_mma_rows = rows_per_cta;
+            qs.score_qs = mode;
+            for (cases) |case| for ([_]usize{ 0, 1 }) |rank| {
+                const q = try gpu.gpa.alloc(u16, case.rows * index.heads * index.dim);
+                defer gpu.gpa.free(q);
+                const iw = try gpu.gpa.alloc(u16, case.rows * index.heads);
+                defer gpu.gpa.free(iw);
+                const key_data = try gpu.gpa.alloc(u16, case.keys * index.dim);
+                defer gpu.gpa.free(key_data);
+                for (q) |*value| value.* = bf16Bits(rnd.float(f32) * 2 - 1);
+                for (iw) |*value| value.* = bf16Bits(rnd.float(f32) * 2 - 1);
+                for (key_data) |*value| value.* = bf16Bits(rnd.float(f32) * 2 - 1);
+                const positions = try gpu.gpa.alloc(i64, case.rows);
+                defer gpu.gpa.free(positions);
+                if (case.causal) {
+                    const p0 = 2 * case.keys - case.rows;
+                    for (positions, 0..) |*position, row| position.* = @intCast(p0 + row);
+                } else {
+                    @memset(positions, @intCast(2 * case.keys));
+                }
+                var dqi = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(q));
+                defer dqi.free();
+                var diw = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(iw));
+                defer diw.free();
+                var dkeys = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(key_data));
+                defer dkeys.free();
+                var dpos = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(positions));
+                defer dpos.free();
+                const score_bytes = case.rows * case.keys * 4;
+                var release_scores = try cuda.DeviceBuffer.alloc(gpu.d, score_bytes);
+                defer release_scores.free();
+                var qs_scores = try cuda.DeviceBuffer.alloc(gpu.d, score_bytes);
+                defer qs_scores.free();
+                var release_tokens = try cuda.DeviceBuffer.alloc(gpu.d, case.rows * index.top_k * 4);
+                defer release_tokens.free();
+                var qs_tokens = try cuda.DeviceBuffer.alloc(gpu.d, case.rows * index.top_k * 4);
+                defer qs_tokens.free();
+                var release_counts = try cuda.DeviceBuffer.alloc(gpu.d, case.rows * 4);
+                defer release_counts.free();
+                var qs_counts = try cuda.DeviceBuffer.alloc(gpu.d, case.rows * 4);
+                defer qs_counts.free();
+                var release_records = try cuda.DeviceBuffer.alloc(gpu.d, case.rows * index.top_k * 8);
+                defer release_records.free();
+                var qs_records = try cuda.DeviceBuffer.alloc(gpu.d, case.rows * index.top_k * 8);
+                defer qs_records.free();
+                try gpu.d.check(gpu.d.api.cuMemsetD8_v2(release_scores.ptr, 0x7f, release_scores.len), "cuMemsetD8");
+                try gpu.d.check(gpu.d.api.cuMemsetD8_v2(qs_scores.ptr, 0x7f, qs_scores.len), "cuMemsetD8");
+                try release.scores(stream, dqi.ptr, diw.ptr, index.heads, 0, dkeys.ptr, dpos.ptr, release_scores.ptr, case.rows, case.keys, case.keys, rank, 2);
+                try release.topk(stream, release_scores.ptr, case.keys, release_tokens.ptr, release_counts.ptr, release_records.ptr, dpos.ptr, case.rows, case.keys, index.top_k, rank, 2);
+                try qs.scores(stream, dqi.ptr, diw.ptr, index.heads, 0, dkeys.ptr, dpos.ptr, qs_scores.ptr, case.rows, case.keys, case.keys, rank, 2);
+                try qs.topk(stream, qs_scores.ptr, case.keys, qs_tokens.ptr, qs_counts.ptr, qs_records.ptr, dpos.ptr, case.rows, case.keys, index.top_k, rank, 2);
+                try stream.synchronize();
+                const release_score_bytes = try download(gpu, release_scores);
+                defer gpu.gpa.free(release_score_bytes);
+                const qs_score_bytes = try download(gpu, qs_scores);
+                defer gpu.gpa.free(qs_score_bytes);
+                const release_token_bytes = try download(gpu, release_tokens);
+                defer gpu.gpa.free(release_token_bytes);
+                const qs_token_bytes = try download(gpu, qs_tokens);
+                defer gpu.gpa.free(qs_token_bytes);
+                const release_count_bytes = try download(gpu, release_counts);
+                defer gpu.gpa.free(release_count_bytes);
+                const qs_count_bytes = try download(gpu, qs_counts);
+                defer gpu.gpa.free(qs_count_bytes);
+                try expect(std.mem.eql(u8, release_score_bytes, qs_score_bytes), "index QS scores rows={d} keys={d} R={d} mode={d} rank={d}", .{ case.rows, case.keys, rows_per_cta, mode, rank });
+                try expect(std.mem.eql(u8, release_token_bytes, qs_token_bytes) and std.mem.eql(u8, release_count_bytes, qs_count_bytes), "index QS top-k rows={d} keys={d} R={d} mode={d} rank={d}", .{ case.rows, case.keys, rows_per_cta, mode, rank });
+                if (case.rows == 512 and case.keys == 65536 and mode == 5) {
+                    try gpu.d.check(gpu.d.api.cuMemsetD8_v2(qs_scores.ptr, 0x7f, qs_scores.len), "cuMemsetD8");
+                    try qs.scores(stream, dqi.ptr, diw.ptr, index.heads, 0, dkeys.ptr, dpos.ptr, qs_scores.ptr, case.rows, case.keys, case.keys, rank, 2);
+                    try stream.synchronize();
+                    const repeated_score_bytes = try download(gpu, qs_scores);
+                    defer gpu.gpa.free(repeated_score_bytes);
+                    try expect(std.mem.eql(u8, qs_score_bytes, repeated_score_bytes), "index QS repeated scores rows=512 keys=65536 R={d} mode=5 rank={d}", .{ rows_per_cta, rank });
+                }
+            };
+        }
+    }
+    pass("glm53-index: QS modes 2/3/4/5/6 scores, top-k tokens/counts, sentinels, and mode-5 repeat parity for (1,64), (7,1000), (64,8192), (100,4097), (512,16384), (512,65536), both ranks and R=4/8/16", .{});
+}
+
 /// `tf-cuda-test glm53-index-bench`: scalar vs tiled scores and the radix top-k; decode at 262k (131072 rank-local
 /// keys, rows 1 and 8) and a prefill piece at 32k (16384 keys, 256 rows).
 pub fn bench(gpu: anytype) !void {
@@ -832,5 +952,58 @@ pub fn bench(gpu: anytype) !void {
         try e1.record(stream);
         try stream.synchronize();
         std.debug.print("BENCH index scores rows=512 context={d} mma_rows={d}: {d:.1} us\n", .{ keys * 2, rows_per_cta, (try e0.elapsedMs(e1)) * 1000.0 / 5.0 });
+    };
+    for ([_]usize{ 64, 512 }) |rows| for ([_]usize{ 8192, 32768, 65536 }) |keys| {
+        const q = try gpu.gpa.alloc(u16, rows * index.heads * index.dim);
+        defer gpu.gpa.free(q);
+        const iw = try gpu.gpa.alloc(u16, rows * index.heads);
+        defer gpu.gpa.free(iw);
+        const key_data = try gpu.gpa.alloc(u16, keys * index.dim);
+        defer gpu.gpa.free(key_data);
+        for (q) |*value| value.* = bf16Bits(rnd.float(f32) * 2 - 1);
+        for (iw) |*value| value.* = bf16Bits(rnd.float(f32) * 2 - 1);
+        for (key_data) |*value| value.* = bf16Bits(rnd.float(f32) * 2 - 1);
+        const positions = try gpu.gpa.alloc(i64, rows);
+        defer gpu.gpa.free(positions);
+        @memset(positions, @intCast(2 * keys));
+        var dqi = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(q));
+        defer dqi.free();
+        var diw = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(iw));
+        defer diw.free();
+        var dkeys = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(key_data));
+        defer dkeys.free();
+        var dpos = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(positions));
+        defer dpos.free();
+        var out = try cuda.DeviceBuffer.alloc(gpu.d, rows * keys * 4);
+        defer out.free();
+        var us: [6]f64 = @splat(0.0);
+        for (0..6) |variant| {
+            var k = base;
+            k.score_kernel = .mma;
+            k.score_mma_rows = 16;
+            k.score_qs = switch (variant) {
+                0 => 0,
+                1 => 2,
+                2 => 3,
+                3 => 4,
+                4 => 5,
+                else => 6,
+            };
+            for (0..2) |_| try k.scores(stream, dqi.ptr, diw.ptr, index.heads, 0, dkeys.ptr, dpos.ptr, out.ptr, rows, keys, keys, 0, 2);
+            try e0.record(stream);
+            for (0..10) |_| try k.scores(stream, dqi.ptr, diw.ptr, index.heads, 0, dkeys.ptr, dpos.ptr, out.ptr, rows, keys, keys, 0, 2);
+            try e1.record(stream);
+            try stream.synchronize();
+            us[variant] = @as(f64, @floatCast((try e0.elapsedMs(e1)) * 100.0));
+        }
+        const flops: f64 = @floatFromInt(rows * keys * index.heads * index.dim * 2);
+        const rate0 = flops / (us[0] * 1.0e-6) / 1.0e12;
+        const rate1 = flops / (us[1] * 1.0e-6) / 1.0e12;
+        const rate2 = flops / (us[2] * 1.0e-6) / 1.0e12;
+        const rate3 = flops / (us[3] * 1.0e-6) / 1.0e12;
+        const rate4 = flops / (us[4] * 1.0e-6) / 1.0e12;
+        const rate5 = flops / (us[5] * 1.0e-6) / 1.0e12;
+        std.debug.print("BENCH glm53-index-qs rows={d} keys={d} | mma16 {d:.1} us ({d:.1} TFLOP/s) | qs2 {d:.1} ({d:.1}) | qs3 {d:.1} ({d:.1})\n", .{ rows, keys, us[0], rate0, us[1], rate1, us[2], rate2 });
+        std.debug.print("BENCH glm53-index-qs2 rows={d} keys={d} | qs3 {d:.1} us ({d:.1} TFLOP/s) | k64s2 {d:.1} ({d:.1}) | k32s2 {d:.1} ({d:.1}) | k32s3 {d:.1} ({d:.1})\n", .{ rows, keys, us[2], rate2, us[3], rate3, us[4], rate4, us[5], rate5 });
     };
 }

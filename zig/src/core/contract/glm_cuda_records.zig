@@ -52,6 +52,8 @@ pub const cuda = [_]registry.CudaRecord{
     .{ .launch = .{ .name = "df_top16_merge_glm", .symbol = "df_top16_merge_glm", .image = "glm_dflash", .threads = 256, .min_sm = 80 }, .usage = registry.none, .geometry_pending = true },
     .{ .launch = .{ .name = "df_ctx_kv_h8_glm", .symbol = "df_ctx_kv_h8_glm", .image = "glm_dflash", .threads = 64, .min_sm = 80 }, .usage = registry.none, .geometry_pending = true },
     .{ .launch = .{ .name = "df_add_glm", .symbol = "df_add_glm", .image = "glm_dflash", .threads = 256, .min_sm = 80 }, .usage = registry.none, .geometry_pending = true },
+    .{ .launch = .{ .name = "df_ctx_kv_stage_glm", .symbol = "df_ctx_kv_stage_glm", .image = "glm_dflash", .threads = 32, .min_sm = 80 }, .usage = registry.none, .geometry_pending = true },
+    .{ .launch = .{ .name = "df_ring_commit_glm", .symbol = "df_ring_commit_glm", .image = "glm_dflash", .threads = 256, .min_sm = 80 }, .usage = registry.none, .geometry_pending = true },
     .{ .launch = .{ .name = "df_gsum", .symbol = "df_gsum", .image = "glm_dflash", .threads = 128, .min_sm = 80 }, .usage = .{ .{ .regs = 30, .static = 0, .bound = 0 }, .{ .regs = 38, .static = 0, .bound = 0 }, .{ .regs = 38, .static = 0, .bound = 0 }, .{ .regs = 38, .static = 0, .bound = 0 }, .{ .regs = 38, .static = 0, .bound = 0 } } },
 };
 

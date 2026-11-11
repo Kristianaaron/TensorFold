@@ -6,6 +6,7 @@
 //! Hard checks: the device quantizer equals the host quantizer bit for bit; sampled outputs equal an FP64 sum of the
 //! same e4m3 products and scales (operand layout); a row alone equals that row inside 512 / 2048 rows bit for bit.
 //! BENCH: default vs W8A8 (quantize + GEMM, and each alone), microseconds and TFLOP/s, CUDA event timing.
+//! `tf-cuda-test glm53-w8a8-all` checks every other dense prefill shape level 2 serves, at 512 rows.
 const std = @import("std");
 const cuda = @import("cuda");
 const check = @import("check.zig");
@@ -309,8 +310,213 @@ fn bf16Float(value: u16) f32 {
     return @bitCast(@as(u32, value) << 16);
 }
 
+const Level2Shape = struct {
+    label: []const u8,
+    cols: usize,
+    k_dim: usize,
+    f32_out: bool,
+};
+
+/// Per-rank dense prefill projections level 2 serves. o_proj (K 8192) stays on the level-1 test.
+const level2_shapes = [_]Level2Shape{
+    .{ .label = "q_a 2048x6144 bf16", .cols = 2048, .k_dim = 6144, .f32_out = false },
+    .{ .label = "q_b 8192x2048 bf16", .cols = 8192, .k_dim = 2048, .f32_out = false },
+    .{ .label = "kv_a 576x6144 bf16", .cols = 576, .k_dim = 6144, .f32_out = false },
+    .{ .label = "wk 128x6144 bf16", .cols = 128, .k_dim = 6144, .f32_out = false },
+    .{ .label = "weights_proj 32x6144 bf16", .cols = 32, .k_dim = 6144, .f32_out = false },
+    .{ .label = "wq_b 4096x2048 bf16", .cols = 4096, .k_dim = 2048, .f32_out = false },
+    .{ .label = "dense_gate_up 12288x6144 bf16", .cols = 12288, .k_dim = 6144, .f32_out = false },
+    .{ .label = "dense_down 6144x6144 f32", .cols = 6144, .k_dim = 6144, .f32_out = true },
+    .{ .label = "shared_gate_up 2048x6144 bf16", .cols = 2048, .k_dim = 6144, .f32_out = false },
+    .{ .label = "shared_down 6144x1024 f32", .cols = 6144, .k_dim = 1024, .f32_out = true },
+    .{ .label = "qa_shard 1024x6144 bf16", .cols = 1024, .k_dim = 6144, .f32_out = false },
+    .{ .label = "kv_a_r0 256x6144 bf16", .cols = 256, .k_dim = 6144, .f32_out = false },
+    .{ .label = "kv_a_r1 320x6144 bf16", .cols = 320, .k_dim = 6144, .f32_out = false },
+};
+
+const level2_rows: usize = 512;
+
+pub fn runAll(gpu: check.Gpu) !void {
+    const gpa = gpu.gpa;
+    var lane = try cuda.qmmf.Lane.load(gpu.d, (try gpu.ctx.capability()) / 10);
+    defer lane.unload();
+    var kern = try w8a8.Kernels.load(gpu.d, cuda.kernels.glm53_w8a8);
+    defer kern.unload();
+    var stream = try cuda.Stream.init(gpu.d, true);
+    defer stream.deinit();
+    var start = try cuda.Event.init(gpu.d, true);
+    defer start.deinit();
+    var stop = try cuda.Event.init(gpu.d, true);
+    defer stop.deinit();
+    const table = try gpa.alloc(u8, 1 << 16);
+    defer gpa.free(table);
+    for (table, 0..) |*code, bits| code.* = w8a8.e4m3Nearest(bf16Float(@intCast(bits)));
+    var rng = std.Random.DefaultPrng.init(0x53_a8_a11);
+    const random = rng.random();
+    for (level2_shapes) |shape| try runLevel2Shape(gpu, &lane, kern.fns, stream, start, stop, table, shape, random);
+}
+
+fn runLevel2Shape(
+    gpu: check.Gpu,
+    lane: *const cuda.qmmf.Lane,
+    fns: w8a8.Fns,
+    stream: cuda.Stream,
+    start: cuda.Event,
+    stop: cuda.Event,
+    table: []const u8,
+    shape: Level2Shape,
+    random: std.Random,
+) !void {
+    const gpa = gpu.gpa;
+    const cols = shape.cols;
+    const k_dim = shape.k_dim;
+    const npad = fp8.padded(cols);
+    const raw = try gpa.alloc(u8, cols * k_dim);
+    defer gpa.free(raw);
+    for (raw) |*code| code.* = table[bf16Bits(random.floatNorm(f32) * 96)];
+    const scale_rows = (cols + fp8.block - 1) / fp8.block;
+    const scale_cols = (k_dim + fp8.block - 1) / fp8.block;
+    const block_scales = try gpa.alloc(f32, scale_rows * scale_cols);
+    defer gpa.free(block_scales);
+    for (block_scales) |*scale| scale.* = std.math.scalbn(@as(f32, 1), random.intRangeAtMost(i32, -14, -8));
+    const codes = try gpa.alloc(u8, npad * k_dim);
+    defer gpa.free(codes);
+    fp8.packCodes(codes, raw, cols, k_dim);
+    const scales = try gpa.alloc(f32, (npad / fp8.group) * (k_dim / fp8.group));
+    defer gpa.free(scales);
+    try fp8.packBlockScales(scales, block_scales, cols, k_dim, 0, 0, cols, k_dim);
+    var dw = try cuda.DeviceBuffer.fromHost(gpu.d, codes);
+    defer dw.free();
+    var ds = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(scales));
+    defer ds.free();
+    const weight = fp8.blockWeight(dw.ptr, ds.ptr, cols, k_dim);
+    try check.expect(w8a8.serves(weight), "glm53-w8a8-all {s}: weight is not a level-2 shape", .{shape.label});
+
+    const x = try gpa.alloc(u16, level2_rows * k_dim);
+    defer gpa.free(x);
+    for (0..level2_rows) |row| {
+        var col: usize = 0;
+        while (col < k_dim) {
+            const span = @min(@as(usize, 256), k_dim - col);
+            const gain = std.math.scalbn(@as(f32, 1), random.intRangeAtMost(i32, -3, 3));
+            for (0..span) |d| {
+                const idx = row * k_dim + col + d;
+                x[idx] = bf16Bits(random.floatNorm(f32) * gain);
+            }
+            col += span;
+        }
+    }
+    var dx = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(x));
+    defer dx.free();
+    const out_kind: cuda.qmmf.Out = if (shape.f32_out) .f32 else .bf16;
+    const byte_count = level2_rows * cols * @as(usize, if (shape.f32_out) 4 else 2);
+    var ref_out = try cuda.DeviceBuffer.alloc(gpu.d, byte_count);
+    defer ref_out.free();
+    var got_out = try cuda.DeviceBuffer.alloc(gpu.d, byte_count);
+    defer got_out.free();
+    var part = try cuda.DeviceBuffer.alloc(gpu.d, @max(lane.partBytes(level2_rows, weight), 4));
+    defer part.free();
+    var scratch = try cuda.DeviceBuffer.alloc(gpu.d, w8a8.scratchBytes(level2_rows, k_dim));
+    defer scratch.free();
+    try lane.matmulOut(stream, dx.ptr, k_dim, level2_rows, weight, ref_out.ptr, out_kind, part.ptr);
+    try fns.run(stream, dx.ptr, k_dim, level2_rows, weight, got_out.ptr, out_kind, scratch.ptr, @as(u64, @intCast(scratch.len)));
+    try stream.synchronize();
+    const ref_bytes = try check.download(gpu, ref_out);
+    defer gpa.free(ref_bytes);
+    const got_bytes = try check.download(gpu, got_out);
+    defer gpa.free(got_bytes);
+    const ref = try copyFloats(gpa, ref_bytes, shape.f32_out);
+    defer gpa.free(ref);
+    const got = try copyFloats(gpa, got_bytes, shape.f32_out);
+    defer gpa.free(got);
+    const err = level2Error(got, ref);
+    std.debug.print("INFO glm53-w8a8-all shape={s} max_abs={e:.4} max_rel={e:.4} mean_abs={e:.4}\n", .{ shape.label, err.max_abs, err.max_rel, err.mean_abs });
+
+    const release_us = try timeShape(lane, fns, stream, start, stop, .release, dx.ptr, k_dim, level2_rows, weight, ref_out.ptr, out_kind, part.ptr, scratch.ptr, scratch.len);
+    const w8a8_us = try timeShape(lane, fns, stream, start, stop, .w8a8, dx.ptr, k_dim, level2_rows, weight, got_out.ptr, out_kind, part.ptr, scratch.ptr, scratch.len);
+    std.debug.print("BENCH glm53-w8a8-all shape={s} | release {d:.1} us | w8a8 {d:.1} us ({d:.2}x)\n", .{ shape.label, release_us, w8a8_us, release_us / w8a8_us });
+}
+
+const Level2Err = struct { max_abs: f64, max_rel: f64, mean_abs: f64 };
+
+/// max_rel is the largest |got-ref|/|ref| among elements with |ref| >= rms(ref). A zero rms leaves max_rel at 0.
+fn level2Error(got: []const f32, ref: []const f32) Level2Err {
+    var ref_sq: f64 = 0;
+    var max_abs: f64 = 0;
+    var sum_abs: f64 = 0;
+    for (got, ref) |gv, rv| {
+        const gvf: f64 = gv;
+        const rvf: f64 = rv;
+        const diff = @abs(gvf - rvf);
+        max_abs = @max(max_abs, diff);
+        sum_abs += diff;
+        ref_sq += rvf * rvf;
+    }
+    const mean_abs = sum_abs / @as(f64, @floatFromInt(got.len));
+    const rms = @sqrt(ref_sq / @as(f64, @floatFromInt(ref.len)));
+    var max_rel: f64 = 0;
+    if (rms > 0) {
+        for (got, ref) |gv, rv| {
+            const gvf: f64 = gv;
+            const rvf: f64 = rv;
+            if (@abs(rvf) >= rms) max_rel = @max(max_rel, @abs(gvf - rvf) / @abs(rvf));
+        }
+    }
+    return .{ .max_abs = max_abs, .max_rel = max_rel, .mean_abs = mean_abs };
+}
+
+fn copyFloats(gpa: std.mem.Allocator, bytes: []const u8, f32_out: bool) ![]f32 {
+    if (f32_out) {
+        const n_f32 = bytes.len / 4;
+        const f32s = try gpa.alloc(f32, n_f32);
+        @memcpy(std.mem.sliceAsBytes(f32s), bytes[0 .. n_f32 * 4]);
+        return f32s;
+    }
+    const n_bf = bytes.len / 2;
+    const bits = try gpa.alloc(u16, n_bf);
+    defer gpa.free(bits);
+    @memcpy(std.mem.sliceAsBytes(bits), bytes[0 .. n_bf * 2]);
+    const floats = try gpa.alloc(f32, n_bf);
+    for (bits, 0..) |bits_i, i| floats[i] = bf16Float(bits_i);
+    return floats;
+}
+
+const TimeWhich = enum { release, w8a8 };
+
+fn timeShape(
+    lane: *const cuda.qmmf.Lane,
+    fns: w8a8.Fns,
+    stream: cuda.Stream,
+    start: cuda.Event,
+    stop: cuda.Event,
+    which: TimeWhich,
+    x: u64,
+    ldx: usize,
+    rows: usize,
+    weight: cuda.qmmf.Weight,
+    y: u64,
+    out: cuda.qmmf.Out,
+    part: u64,
+    scratch: u64,
+    scratch_len: usize,
+) !f64 {
+    var times: [rounds]f64 = undefined;
+    for (0..warmup + rounds) |i| {
+        try start.record(stream);
+        switch (which) {
+            .release => try lane.matmulOut(stream, x, ldx, rows, weight, y, out, part),
+            .w8a8 => try fns.run(stream, x, ldx, rows, weight, y, out, scratch, @as(u64, @intCast(scratch_len))),
+        }
+        try stop.record(stream);
+        try stop.synchronize();
+        if (i >= warmup) times[i - warmup] = @as(f64, try cuda.Event.elapsedMs(start, stop)) * 1000.0;
+    }
+    return check.median(&times);
+}
+
 test "test references the GLM-5.3 W8A8 gate report" {
     _ = &run;
+    _ = &runAll;
     _ = &runRows;
     _ = &compare;
 }

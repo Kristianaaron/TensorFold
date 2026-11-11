@@ -19,17 +19,75 @@ pub fn run(gpu: anytype) !void {
         .router_part = try glue_module.function("tf_glm_router_part"),
         .router_tile = try glue_module.function("tf_glm_router_tile"),
         .topk = try glue_module.function("tf_glm_topk"),
+        .topk_compact = try glue_module.function("tf_glm_topk_compact"),
         .slice_sum = try glue_module.function("tf_glm_slice_sum"),
     };
     var stream = try cuda.Stream.init(gpu.d, false);
     defer stream.deinit();
     try routerInvariant(gpu, stream, router);
+    try routerCompactParity(gpu, stream, router);
     const swiglu = try local_module.function("tf_glm53_swiglu_plain");
     try swigluCase(gpu, stream, swiglu);
     const kernels = try moe.Kernels.load(local_module);
     try lowRankCase(gpu, stream, kernels.lowrank);
     try moePostCase(gpu, stream, kernels);
     try moePostShortRingCase(gpu, stream, kernels);
+}
+
+fn routerCompactParity(gpu: anytype, stream: cuda.Stream, kernels: moe.RouterKernels) !void {
+    const bias = try gpu.gpa.alloc(f32, moe.experts);
+    defer gpu.gpa.free(bias);
+    @memset(bias, 0);
+    var db = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(bias));
+    defer db.free();
+
+    for ([_]usize{ 1, 2, 4, 8 }) |rows| {
+        const x = try gpu.gpa.alloc(u16, rows * moe.hidden);
+        defer gpu.gpa.free(x);
+        const router_weights = try gpu.gpa.alloc(u16, moe.experts * moe.hidden);
+        defer gpu.gpa.free(router_weights);
+        @memset(x, 0);
+        @memset(router_weights, 0);
+        var dx = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(x));
+        defer dx.free();
+        var dw = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(router_weights));
+        defer dw.free();
+        var logits = try cuda.DeviceBuffer.alloc(gpu.d, rows * moe.experts * @sizeOf(f32));
+        defer logits.free();
+        var parts = try cuda.DeviceBuffer.alloc(gpu.d, rows * moe.experts * 8 * @sizeOf(f32));
+        defer parts.free();
+        var picks = try cuda.DeviceBuffer.alloc(gpu.d, rows * moe.slots * @sizeOf(i32));
+        defer picks.free();
+        var weights = try cuda.DeviceBuffer.alloc(gpu.d, rows * moe.slots * @sizeOf(f32));
+        defer weights.free();
+        var compact_picks = try cuda.DeviceBuffer.alloc(gpu.d, rows * moe.top_k * @sizeOf(i32));
+        defer compact_picks.free();
+        var compact_weights = try cuda.DeviceBuffer.alloc(gpu.d, rows * moe.top_k * @sizeOf(f32));
+        defer compact_weights.free();
+
+        try moe.route(kernels, stream, dx.ptr, moe.hidden, dw.ptr, db.ptr, logits.ptr, parts.ptr, picks.ptr, weights.ptr, rows);
+        try moe.routeCompact(kernels, stream, dx.ptr, moe.hidden, dw.ptr, db.ptr, logits.ptr, parts.ptr, compact_picks.ptr, compact_weights.ptr, rows);
+        try stream.synchronize();
+        const full_picks = try download(gpu, picks);
+        defer gpu.gpa.free(full_picks);
+        const full_weights = try download(gpu, weights);
+        defer gpu.gpa.free(full_weights);
+        const short_picks = try download(gpu, compact_picks);
+        defer gpu.gpa.free(short_picks);
+        const short_weights = try download(gpu, compact_weights);
+        defer gpu.gpa.free(short_weights);
+        const all_picks = std.mem.bytesAsSlice(i32, @as([]align(1) const u8, full_picks));
+        const all_weights = std.mem.bytesAsSlice(f32, @as([]align(1) const u8, full_weights));
+        const got_picks = std.mem.bytesAsSlice(i32, @as([]align(1) const u8, short_picks));
+        const got_weights = std.mem.bytesAsSlice(f32, @as([]align(1) const u8, short_weights));
+        for (0..rows) |row| {
+            for (0..moe.top_k) |slot| {
+                try expect(all_picks[row * moe.slots + slot] == got_picks[row * moe.top_k + slot], "compact router picks row={d} slot={d}", .{ row, slot });
+                try expect(@as(u32, @bitCast(all_weights[row * moe.slots + slot])) == @as(u32, @bitCast(got_weights[row * moe.top_k + slot])), "compact router weight bits row={d} slot={d}", .{ row, slot });
+                try expect(got_picks[row * moe.top_k + slot] == @as(i32, @intCast(slot)), "tied router picks use lower expert id row={d} slot={d}", .{ row, slot });
+            }
+        }
+    }
 }
 
 pub fn runLowRank(gpu: anytype) !void {

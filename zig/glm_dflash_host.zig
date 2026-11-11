@@ -247,7 +247,7 @@ test "glm dflash: every launch record resolves to an exported Flash or GLM symbo
     t.refAllDecls(registry);
     const symbols = [_][]const u8{
         "df_tap",     "df_block_qkv",     "df_ctx_kv",     "df_conv",          "df_swiglu",   "df_attn_part",     "df_attn_merge",       "df_sum2",           "df_top16_part", "df_top16_merge",    "df_gsum",
-        "df_tap_glm", "df_block_qkv_glm", "df_ctx_kv_glm", "df_ctx_kv_h8_glm", "df_conv_glm", "df_attn_part_glm", "df_attn_part_h8_glm", "df_attn_merge_glm", "df_sum2_glm",   "df_top16_part_glm", "df_top16_merge_glm", "df_add_glm",
+        "df_tap_glm", "df_block_qkv_glm", "df_ctx_kv_glm", "df_ctx_kv_h8_glm", "df_conv_glm", "df_attn_part_glm", "df_attn_part_h8_glm", "df_attn_merge_glm", "df_sum2_glm",   "df_top16_part_glm", "df_top16_merge_glm", "df_add_glm", "df_ctx_kv_stage_glm", "df_ring_commit_glm",
     };
     var checked: usize = 0;
     for (registry.all_cuda) |record| {
@@ -258,7 +258,7 @@ test "glm dflash: every launch record resolves to an exported Flash or GLM symbo
         for (symbols) |symbol| found = found or std.mem.eql(u8, symbol, record.launch.symbol);
         try t.expect(found);
     }
-    try t.expectEqual(@as(usize, 23), checked);
+    try t.expectEqual(@as(usize, 25), checked);
     const flash: glm.dflash.Geometry = .{};
     const dsa: glm.dflash.Geometry = .{ .hidden = 6144, .layers = 6, .heads = 64, .kv_heads = 8, .head_dim = 128, .ff = 12288, .rope_theta = 1e6, .taps = &.{ 5, 19, 33, 47, 61, 75 }, .window = 2048, .tap_streams = 1 };
     for (@typeInfo(glm.dflash.Kernels).@"struct".field_names) |field| {
@@ -305,11 +305,24 @@ test "glm dflash: draft embed hook path typechecks against a vocab-sharded mock"
             _ = width;
             self.calls += 1;
         }
+        pub fn embedDraftUpload(self: *@This(), rows: usize) !void {
+            _ = rows;
+            self.calls += 1;
+        }
+        pub fn embedDraftDevice(self: *@This(), out: u64, rows: usize, width: usize) !void {
+            _ = out;
+            _ = rows;
+            _ = width;
+            self.calls += 1;
+        }
     };
     var dr: glm.dflash.Drafter = undefined;
-    dr.geometry = .{ .hidden = 6144, .layers = 6, .heads = 64, .kv_heads = 8, .head_dim = 128, .ff = 12288, .rope_theta = 1e6, .taps = &.{ 5, 19, 33, 47, 61, 75 }, .window = 2048, .tap_streams = 1 };
+    dr.geometry = .{ .hidden = 6144, .layers = 6, .heads = 64, .kv_heads = 8, .head_dim = 128, .ff = 12288, .rope_theta = 1e6, .taps = &.{ 5, 19, 33, 47, 61, 75 }, .window = 2048, .tap_streams = 1, .down4 = true };
     dr.ids = 154856;
     dr.x = 1;
+    var layer_weights: [1]glm.dflash.LayerW = undefined;
+    layer_weights[0].down4 = .{ .w = 0, .s = 0, .b = 0, .n = 6144, .k = 6144, .npad = 6144 };
+    dr.layers = &layer_weights;
     var hook: Hook = .{};
     var instantiate = false;
     @atomicStore(bool, &instantiate, false, .monotonic);
@@ -317,7 +330,22 @@ test "glm dflash: draft embed hook path typechecks against a vocab-sharded mock"
 
     var engine: Engine = undefined;
     if (instantiate) try glm.dflash_block.pass(&dr, &engine, 1, false);
+    if (instantiate) try glm.dflash_block.passDevice(&dr, &engine, 1, false);
     if (instantiate) try glm.dflash_block.ingestPass(&dr, &engine, 1);
+}
+
+test "glm dflash: device embed fails closed without the device hook" {
+    const Engine = struct {
+        stream: cuda.Stream,
+        m: struct { glue: glm.glue.Kernels, mm: glm.mm.Kernels },
+        w: struct { embed: u64 },
+    };
+    var dr: glm.dflash.Drafter = undefined;
+    dr.geometry = .{ .hidden = 6144, .layers = 6, .heads = 64, .kv_heads = 8, .head_dim = 128, .ff = 12288, .rope_theta = 1e6, .taps = &.{ 5, 19, 33, 47, 61, 75 }, .window = 2048, .tap_streams = 1 };
+    dr.ids = 154856;
+    dr.x = 1;
+    var engine: Engine = undefined;
+    try t.expectError(error.DraftGraphNeedsShardHook, glm.dflash_block.embedTargetDevice(&dr, &engine, 2, 6144));
 }
 
 test "glm dflash: vocab-sharded target fails closed without the embed hook" {

@@ -43,6 +43,17 @@ test "glm dsa dflash target head and loader call typecheck without a GPU" {
     if (instantiate) _ = try drafts.Drafter.load(std.testing.allocator, undefined, &host, ".", 0, 2, 4, fixture, false);
 }
 
+test "TF_GLM53_DRAFT_GRAPH: Host embed split and capture typecheck" {
+    var h: drafts.Host = undefined;
+    var instantiate = false;
+    @atomicStore(bool, &instantiate, false, .monotonic);
+    if (instantiate) {
+        try h.embedDraftUpload(8);
+        try h.embedDraftDevice(0, 8, 6144);
+        try h.captureDraftGraph();
+    }
+}
+
 test "glm dsa dflash: packed index inverts packBf16" {
     const a = std.testing.allocator;
     for ([_][2]usize{ .{ 70, 128 }, .{ 448, 6144 } }) |shape| {

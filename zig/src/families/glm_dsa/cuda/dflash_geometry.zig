@@ -25,6 +25,8 @@ pub const Geometry = struct {
     conv_kernel_size: usize = 2,
     rope_theta: f32 = 1e6,
     rms_norm_eps: f32 = 1e-5,
+    /// TF_GLM53_DRAFT_DOWN4: each rank's down K-half in 4 bits (fp32-out tf_qmm_group).
+    down4: bool = false,
 
     pub fn kvWidth(g: Geometry) usize {
         return g.kv_heads * g.head_dim;

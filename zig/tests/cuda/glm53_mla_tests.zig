@@ -13,13 +13,15 @@ test "GLM-5.3 MLA declarations are analyzed" {
 pub fn run(gpu: anytype) !void {
     var module = try cuda.Module.load(gpu.d, cuda.kernels.glm53_mla);
     defer module.unload();
-    const kernels = try mla.Mla.load(module);
+    var kernels = try mla.Mla.load(module);
+    try kernels.loadAbsorbQpeV3(module);
     var stream = try cuda.Stream.init(gpu.d, false);
     defer stream.deinit();
     try qpeCase(gpu, stream, &kernels);
     try kvWriteCase(gpu, stream, &kernels);
     try absorbExpandCases(gpu, stream, &kernels);
     try decodeAbsorbExpandCases(gpu, stream, &kernels);
+    try qpeAbsorbFuseCase(gpu, stream, &kernels);
     try mergeCase(gpu, stream, &kernels);
     try attendCases(gpu, stream, &kernels);
 }
@@ -123,6 +125,24 @@ pub fn runDecodeUnion(gpu: anytype) !void {
         const partial_bytes = (heads / 32) * rows * (32 * mla.latent_dim * 2 + 32 * 4);
         var pa = try cuda.DeviceBuffer.alloc(gpu.d, partial_bytes); defer pa.free();
         var pb = try cuda.DeviceBuffer.alloc(gpu.d, partial_bytes); defer pb.free();
+        var grouped = try cuda.DeviceBuffer.alloc(gpu.d, partial_bytes); defer grouped.free();
+        const group_count = heads / 32;
+        const group_qa_bytes = rows * 32 * mla.latent_dim * 2;
+        const group_qpe_bytes = rows * 32 * mla.rope_dim * 2;
+        const query_rank_bytes = group_qa_bytes + group_qpe_bytes;
+        const packed_query_host = try gpu.gpa.alloc(u16, group_count * rows * 32 * (mla.latent_dim + mla.rope_dim));
+        defer gpu.gpa.free(packed_query_host);
+        for (0..group_count) |group| for (0..rows) |r| for (0..32) |h| {
+            const source_head = r * heads + group * 32 + h;
+            const group_base_words = group * rows * 32 * (mla.latent_dim + mla.rope_dim);
+            const packed_qa = group_base_words + (r * 32 + h) * mla.latent_dim;
+            const source_qa = source_head * mla.latent_dim;
+            @memcpy(packed_query_host[packed_qa..][0..mla.latent_dim], qa_host[source_qa..][0..mla.latent_dim]);
+            const packed_qpe = group_base_words + rows * 32 * mla.latent_dim + (r * 32 + h) * mla.rope_dim;
+            const source_qpe = source_head * mla.rope_dim;
+            @memcpy(packed_query_host[packed_qpe..][0..mla.rope_dim], qp_host[source_qpe..][0..mla.rope_dim]);
+        };
+        var packed_queries = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(packed_query_host)); defer packed_queries.free();
         const ws_bytes = mla.splitWorkspaceBytes(rows, heads);
         var wa = try cuda.DeviceBuffer.alloc(gpu.d, ws_bytes); defer wa.free();
         var wb = try cuda.DeviceBuffer.alloc(gpu.d, ws_bytes); defer wb.free();
@@ -130,9 +150,17 @@ pub fn runDecodeUnion(gpu: anytype) !void {
             try wb.fill8(0xff, stream.handle);
             try kernels.attend(stream, qa.ptr, qp.ptr, latent.ptr, rope.ptr, null, positions.ptr, tokens.ptr, slots.ptr, global_counts.ptr, counts.ptr, dense.ptr, pa.ptr, rows, heads, rank, 2, false, wa.ptr);
             try kernels.attendVerify(stream, qa.ptr, qp.ptr, latent.ptr, rope.ptr, positions.ptr, slots.ptr, counts.ptr, pb.ptr, rows, heads, rank, 2, wb.ptr);
+            const group_partial_bytes = rows * (32 * mla.latent_dim * 2 + 32 * 4);
+            const group_split_bytes = mla.splitWorkspaceBytes(rows, 32);
+            for (0..heads / 32) |group| {
+                const query_base = packed_queries.ptr + group * query_rank_bytes;
+                try kernels.attendVerifyGroup(stream, query_base, query_base + group_qa_bytes, latent.ptr, rope.ptr, positions.ptr, slots.ptr, counts.ptr, grouped.ptr + group * group_partial_bytes, rows, rank, 2, wb.ptr + group * group_split_bytes);
+            }
             try stream.synchronize();
             const a = try download(gpu, pa); defer gpu.gpa.free(a);
             const b = try download(gpu, pb); defer gpu.gpa.free(b);
+            const grouped_bytes = try download(gpu, grouped); defer gpu.gpa.free(grouped_bytes);
+            try std.testing.expectEqualSlices(u8, b, grouped_bytes);
             if (!std.mem.eql(u8, a, b)) {
                 const group_bytes = rows * (32 * mla.latent_dim * 2 + 32 * 4);
                 for (0..a.len) |byte| if (a[byte] != b[byte]) {
@@ -529,6 +557,29 @@ fn decodeAbsorbExpandCases(gpu: anytype, stream: cuda.Stream, kernels: *const ml
         try std.testing.expectEqualSlices(u8, got_qa[0 .. n * local_heads * mla.latent_dim * @sizeOf(u16)], batch_qa);
         try std.testing.expectEqualSlices(u8, got_v[0 .. n * local_heads * mla.value_dim * @sizeOf(u16)], batch_v);
     }
+    for ([_]usize{ 9, 12, 16 }) |n| {
+        const wide_ol_host = try gpu.gpa.alloc(u16, n * local_heads * mla.latent_dim);
+        defer gpu.gpa.free(wide_ol_host);
+        for (wide_ol_host) |*v| {
+            const sign: u16 = if (random.boolean()) 0x8000 else 0;
+            const exponent: u16 = 96 + random.uintLessThan(u16, 64);
+            v.* = sign | (exponent << 7) | random.uintLessThan(u16, 128);
+        }
+        var wide_ol = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(wide_ol_host));
+        defer wide_ol.free();
+        var generic_v = try cuda.DeviceBuffer.alloc(gpu.d, n * local_heads * mla.value_dim * 2);
+        defer generic_v.free();
+        var wide_v = try cuda.DeviceBuffer.alloc(gpu.d, n * local_heads * mla.value_dim * 2);
+        defer wide_v.free();
+        try kernels.expandV(stream, wide_ol.ptr, dcodes.ptr, dscales.ptr, generic_v.ptr, n, local_heads, 0, false);
+        try kernels.expandVV2Wide(stream, wide_ol.ptr, dcodes.ptr, dscales.ptr, wide_v.ptr, n, local_heads, 0);
+        try stream.synchronize();
+        const generic_bytes = try download(gpu, generic_v);
+        defer gpu.gpa.free(generic_bytes);
+        const wide_bytes = try download(gpu, wide_v);
+        defer gpu.gpa.free(wide_bytes);
+        try std.testing.expectEqualSlices(u8, generic_bytes, wide_bytes);
+    }
     // Exercise the odd absolute head offset, where kvb() crosses three 128-row scale blocks.
     var head1_v1 = try cuda.DeviceBuffer.alloc(gpu.d, 3 * local_heads * mla.latent_dim * 2);
     defer head1_v1.free();
@@ -548,6 +599,77 @@ fn decodeAbsorbExpandCases(gpu: anytype, stream: cuda.Stream, kernels: *const ml
         const expand_us = try decodeMlaBench(gpu, stream, kernels, dol.ptr, dcodes.ptr, dscales.ptr, 0, n, false);
         std.debug.print("BENCH decode_mla rows={d} absorb scalar={d:.2}us v1={d:.2}us v2={d:.2}us v3={d:.2}us | expand_v scalar={d:.2}us v1={d:.2}us v2={d:.2}us\n", .{ n, absorb_us[0], absorb_us[1], absorb_us[2], absorb_us[3], expand_us[0], expand_us[1], expand_us[2] });
     }
+}
+
+fn qpeAbsorbFuseCase(gpu: anytype, stream: cuda.Stream, kernels: *const mla.Mla) !void {
+    const rows = 8;
+    const local_heads = 32;
+    const global_heads = 64;
+    const q_host = try gpu.gpa.alloc(u16, rows * local_heads * 256);
+    defer gpu.gpa.free(q_host);
+    const cos_host = try gpu.gpa.alloc(f32, rows * mla.rope_dim / 2);
+    defer gpu.gpa.free(cos_host);
+    const sin_host = try gpu.gpa.alloc(f32, rows * mla.rope_dim / 2);
+    defer gpu.gpa.free(sin_host);
+    const codes_host = try gpu.gpa.alloc(u8, mla.kvb_rows_per_head * mla.latent_dim * global_heads);
+    defer gpu.gpa.free(codes_host);
+    const scales_host = try gpu.gpa.alloc(f32, ((mla.kvb_rows_per_head * global_heads + 127) / 128) * 4);
+    defer gpu.gpa.free(scales_host);
+    var prng = std.Random.DefaultPrng.init(0x53ab_50e1);
+    const random = prng.random();
+    for (q_host) |*v| {
+        const sign: u16 = if (random.boolean()) 0x8000 else 0;
+        const exponent = 96 + random.uintLessThan(u16, 64);
+        v.* = sign | (exponent << 7) | random.uintLessThan(u16, 128);
+    }
+    for (cos_host, 0..) |*v, i| v.* = 0.5 + @as(f32, @floatFromInt(i % 17)) / 32;
+    for (sin_host, 0..) |*v, i| v.* = -0.5 + @as(f32, @floatFromInt(i % 19)) / 32;
+    for (codes_host) |*v| {
+        v.* = random.int(u8);
+        if ((v.* & 0x7f) == 0x7f) {
+            v.* = (v.* & 0x80) | 0x7e;
+        }
+    }
+    for (scales_host) |*v| v.* = 0.01 + random.float(f32) * 0.2;
+
+    var dq = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(q_host));
+    defer dq.free();
+    var dcos = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(cos_host));
+    defer dcos.free();
+    var dsin = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(sin_host));
+    defer dsin.free();
+    var dcodes = try cuda.DeviceBuffer.fromHost(gpu.d, codes_host);
+    defer dcodes.free();
+    var dscales = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(scales_host));
+    defer dscales.free();
+
+    for (1..rows + 1) |n| for ([_]usize{ 0, 1 }) |head0| {
+        const qa_bytes = n * local_heads * mla.latent_dim * 2;
+        const qpe_bytes = n * local_heads * mla.rope_dim * 2;
+        var separate_qa = try cuda.DeviceBuffer.alloc(gpu.d, qa_bytes);
+        defer separate_qa.free();
+        var fused_qa = try cuda.DeviceBuffer.alloc(gpu.d, qa_bytes);
+        defer fused_qa.free();
+        var separate_qpe = try cuda.DeviceBuffer.alloc(gpu.d, qpe_bytes);
+        defer separate_qpe.free();
+        var fused_qpe = try cuda.DeviceBuffer.alloc(gpu.d, qpe_bytes);
+        defer fused_qpe.free();
+        try kernels.packQpe(stream, dq.ptr, dcos.ptr, dsin.ptr, separate_qpe.ptr, n, local_heads);
+        try kernels.absorbV3(stream, dq.ptr, dcodes.ptr, dscales.ptr, separate_qa.ptr, n, local_heads, head0);
+        try kernels.absorbQpeV3(stream, dq.ptr, dcos.ptr, dsin.ptr, fused_qpe.ptr, dcodes.ptr, dscales.ptr, fused_qa.ptr, n, local_heads, head0);
+        try stream.synchronize();
+        const separate_qa_bytes = try download(gpu, separate_qa);
+        defer gpu.gpa.free(separate_qa_bytes);
+        const fused_qa_bytes = try download(gpu, fused_qa);
+        defer gpu.gpa.free(fused_qa_bytes);
+        const separate_qpe_bytes = try download(gpu, separate_qpe);
+        defer gpu.gpa.free(separate_qpe_bytes);
+        const fused_qpe_bytes = try download(gpu, fused_qpe);
+        defer gpu.gpa.free(fused_qpe_bytes);
+        try std.testing.expectEqualSlices(u8, separate_qa_bytes, fused_qa_bytes);
+        try std.testing.expectEqualSlices(u8, separate_qpe_bytes, fused_qpe_bytes);
+    };
+    pass("glm53-mla: fused q_pe pack and v3 absorb match separately for rows 1..8 and head offsets 0/1", .{});
 }
 
 fn expectDecodeAbsorbBytes(want: []const u8, got: []const u8, rows: usize, local_heads: usize, label: []const u8) !void {

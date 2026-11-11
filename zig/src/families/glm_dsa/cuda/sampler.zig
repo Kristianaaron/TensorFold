@@ -17,6 +17,11 @@ pub const RowWindow = struct { start: usize, count: usize };
 /// Maximum row count sent to one candidate-kernel launch.
 pub const candidate_rows_per_launch = 64;
 
+/// TF_GLM53_CAND_V2: 4,096 bins (top 12 key bits) a row, held in the candidate scratch (16 KiB a row).
+pub const cand2_bins = 4096;
+/// tf_glm53_cand2_select_f32 dynamic shared bytes: 4,096 u64 keys, three 256-entry u32 tables, one u64, eight u32.
+pub const cand2_select_smem = 4096 * 8 + 3 * 256 * 4 + 8 + 8 * 4;
+
 /// Validate candidate launch tiling and return the maximum rows covered by the supplied scratch.
 pub fn candidateLaunchRows(rows: usize, k: usize, scratch_bytes: usize) !usize {
     if (rows == 0) return 0;
@@ -82,10 +87,17 @@ pub const Head = struct {
     mask_fn: cuda.Function,
     candidates_fill_fn: cuda.Function,
     candidates_part_fn: cuda.Function,
+    candidates_part_fast_fn: cuda.Function,
+    candidates_v2_fill_fn: cuda.Function,
+    candidates_v2_hist_fn: cuda.Function,
+    candidates_v2_select_fn: cuda.Function,
     candidates_merge_fn: cuda.Function,
     lse_fn: cuda.Function,
     gate_gather_fn: cuda.Function,
     gate_mass_fn: cuda.Function,
+    fast: bool = false,
+    /// TF_GLM53_CAND_V2=1 (bit-identical): fill2 + hist + select where the scratch holds the histogram.
+    v2: bool = false,
 
     pub fn resolve(mod: cuda.Module) !Head {
         return .{
@@ -93,6 +105,10 @@ pub const Head = struct {
             .mask_fn = try mod.function("tf_glm53_mask_f32"),
             .candidates_fill_fn = try mod.function("tf_glm53_cand_fill_f32"),
             .candidates_part_fn = try mod.function("tf_glm53_cand_part_f32"),
+            .candidates_part_fast_fn = try mod.function("tf_glm53_cand_part_fast_f32"),
+            .candidates_v2_fill_fn = try mod.function("tf_glm53_cand2_fill_f32"),
+            .candidates_v2_hist_fn = try mod.function("tf_glm53_cand2_hist_f32"),
+            .candidates_v2_select_fn = try mod.function("tf_glm53_cand2_select_f32"),
             .candidates_merge_fn = try mod.function("tf_glm53_cand_merge_f32"),
             .lse_fn = try mod.function("tf_glm53_lse_f32"),
             .gate_gather_fn = try mod.function("tf_glm53_gate_gather_f32"),
@@ -134,29 +150,56 @@ pub const Head = struct {
         _ = try candidateLaunchRows(rows, k, scratch_bytes);
         var row_start: usize = 0;
         while (row_start < rows) {
-            const tile_rows = @min(candidate_rows_per_launch, rows - row_start);
+            const tile_rows: usize = @min(candidate_rows_per_launch, rows - row_start);
             const logits_tile = try offsetDevicePtr(logits, row_start, vocab, @sizeOf(f32));
             const values_tile = try offsetDevicePtr(values, row_start, k, @sizeOf(f32));
             const ids_tile = try offsetDevicePtr(ids, row_start, k, @sizeOf(u32));
-            var fill_args: cuda.Args = .{};
-            fill_args.add(values_tile);
-            fill_args.add(ids_tile);
-            fill_args.add(@as(u32, @intCast(tile_rows * k)));
-            try cuda.launch.launch(h.candidates_fill_fn, .{ .grid = .{ .x = @intCast(try std.math.divCeil(usize, tile_rows * k, 256)) }, .block = .{ .x = 256 } }, stream, &fill_args);
-            var a: cuda.Args = .{};
-            a.add(logits_tile);
-            a.add(@as(u32, @intCast(vocab)));
-            a.add(@as(u32, @intCast(vocab_offset)));
-            a.add(@as(u32, @intCast(k)));
-            a.add(scratch);
-            try cuda.launch.launch(h.candidates_part_fn, .{ .grid = .{ .x = @intCast(tile_rows), .y = 32 }, .block = .{ .x = 256 }, .shared = 19_484 }, stream, &a);
-            var merge_args: cuda.Args = .{};
-            merge_args.add(scratch);
-            merge_args.add(@as(u32, @intCast(vocab)));
-            merge_args.add(@as(u32, @intCast(k)));
-            merge_args.add(values_tile);
-            merge_args.add(ids_tile);
-            try cuda.launch.launch(h.candidates_merge_fn, .{ .grid = .{ .x = @intCast(tile_rows), .y = 32 }, .block = .{ .x = 256 }, .shared = 16_384 }, stream, &merge_args);
+            const v2_tile = h.v2 and scratch_bytes >= tile_rows * cand2_bins * 4;
+            if (v2_tile) {
+                var fill2: cuda.Args = .{};
+                fill2.add(values_tile);
+                fill2.add(ids_tile);
+                fill2.add(@as(u32, @intCast(tile_rows * k)));
+                fill2.add(scratch);
+                fill2.add(@as(u32, @intCast(tile_rows * cand2_bins)));
+                try cuda.launch.launch(h.candidates_v2_fill_fn, .{ .grid = .{ .x = @intCast(try std.math.divCeil(usize, @max(tile_rows * k, tile_rows * cand2_bins), 256)) }, .block = .{ .x = 256 } }, stream, &fill2);
+                var hist_args: cuda.Args = .{};
+                hist_args.add(logits_tile);
+                hist_args.add(@as(u32, @intCast(vocab)));
+                hist_args.add(@as(u32, @intCast(vocab_offset)));
+                hist_args.add(scratch);
+                try cuda.launch.launch(h.candidates_v2_hist_fn, .{ .grid = .{ .x = @intCast(tile_rows), .y = 32 }, .block = .{ .x = 256 } }, stream, &hist_args);
+                var select_args: cuda.Args = .{};
+                select_args.add(logits_tile);
+                select_args.add(@as(u32, @intCast(vocab)));
+                select_args.add(@as(u32, @intCast(vocab_offset)));
+                select_args.add(@as(u32, @intCast(k)));
+                select_args.add(scratch);
+                select_args.add(values_tile);
+                select_args.add(ids_tile);
+                try cuda.launch.launch(h.candidates_v2_select_fn, .{ .grid = .{ .x = @intCast(tile_rows) }, .block = .{ .x = 1024 }, .shared = cand2_select_smem }, stream, &select_args);
+            } else {
+                var fill_args: cuda.Args = .{};
+                fill_args.add(values_tile);
+                fill_args.add(ids_tile);
+                fill_args.add(@as(u32, @intCast(tile_rows * k)));
+                try cuda.launch.launch(h.candidates_fill_fn, .{ .grid = .{ .x = @intCast(try std.math.divCeil(usize, tile_rows * k, 256)) }, .block = .{ .x = 256 } }, stream, &fill_args);
+                var a: cuda.Args = .{};
+                a.add(logits_tile);
+                a.add(@as(u32, @intCast(vocab)));
+                a.add(@as(u32, @intCast(vocab_offset)));
+                a.add(@as(u32, @intCast(k)));
+                a.add(scratch);
+                const part_fn = if (h.fast) h.candidates_part_fast_fn else h.candidates_part_fn;
+                try cuda.launch.launch(part_fn, .{ .grid = .{ .x = @intCast(tile_rows), .y = 32 }, .block = .{ .x = 256 }, .shared = 19_484 }, stream, &a);
+                var merge_args: cuda.Args = .{};
+                merge_args.add(scratch);
+                merge_args.add(@as(u32, @intCast(vocab)));
+                merge_args.add(@as(u32, @intCast(k)));
+                merge_args.add(values_tile);
+                merge_args.add(ids_tile);
+                try cuda.launch.launch(h.candidates_merge_fn, .{ .grid = .{ .x = @intCast(tile_rows), .y = 32 }, .block = .{ .x = 256 }, .shared = 16_384 }, stream, &merge_args);
+            }
             row_start += tile_rows;
         }
     }
@@ -593,6 +636,12 @@ test "candidate workspace scales with k and 64-row tiles" {
     try std.testing.expectEqual(@as(usize, 64), candidate_rows_per_launch);
     try std.testing.expectEqual(@as(usize, 64), try candidateLaunchRows(65, 64, try Head.candidateScratchBytes(64, 64)));
     try std.testing.expectError(error.CandidateWorkspaceTooSmall, candidateLaunchRows(65, 64, try Head.candidateScratchBytes(63, 64)));
+}
+
+test "candidate v2 histogram fits the declared shared memory and scratch threshold" {
+    try std.testing.expectEqual(@as(usize, 35_880), cand2_select_smem);
+    try std.testing.expect(try Head.candidateScratchBytes(64, 64) >= 64 * cand2_bins * 4);
+    try std.testing.expect(!(try Head.candidateScratchBytes(64, 32) >= 64 * cand2_bins * 4));
 }
 
 test "candidate output initializes missing candidates to Python sort sentinels" {

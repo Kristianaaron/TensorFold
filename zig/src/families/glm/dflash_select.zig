@@ -13,6 +13,22 @@ extern "c" fn fclose(stream: *anyopaque) c_int;
 
 const Cand = struct { v: f32, id: u32 };
 
+fn mix(x_: u64) u64 {
+    var x = x_;
+    x ^= x >> 30;
+    x *%= 0xBF58476D1CE4E5B9;
+    x ^= x >> 27;
+    x *%= 0x94D049BB133111EB;
+    return x ^ (x >> 31);
+}
+
+pub fn draftUniform(seed: u64, position: u64, id: u32) f64 {
+    var x = mix(seed +% 0x9E3779B97F4A7C15);
+    x = mix(x ^ (position *% 0xD1B54A32D192ED03));
+    x = mix(x ^ id);
+    return @as(f64, @floatFromInt(x >> 11)) * 0x1p-53 + 0x1p-54;
+}
+
 fn bf(x: u16) f32 {
     return @bitCast(@as(u32, x) << 16);
 }
@@ -127,6 +143,8 @@ pub fn selectDspark(dr: *const df.Drafter, i: usize, M: usize, q: df.Req) void {
         const w1 = dr.markov_w1[prev * rank ..][0..rank];
         var best = base_best;
         var best_score: f32 = -std.math.inf(f32);
+        var best_key: f64 = -std.math.inf(f64);
+        const position: u64 = if (q.key_temp > 0) @intCast(q.pos + @as(i64, @intCast(slot))) else 0;
         // TF_GLM53_ROUND_TRACE / TF_GLM53_DRAFT_RECAL: a 32-slot probs buffer also takes z, margin and logp per slot.
         const feats = if (probs) |ps| ps.len >= 32 else false;
         var scores: [MAX_TOPK]f32 = undefined;
@@ -134,12 +152,20 @@ pub fn selectDspark(dr: *const df.Drafter, i: usize, M: usize, q: df.Req) void {
             const w2 = dr.markov_w2[@as(usize, candidates[m].id) * rank ..][0..rank];
             var score = candidates[m].v;
             for (w1, w2) |a, b| score += bf(a) * bf(b);
-            if (feats) scores[m] = score;
-            if (score > best_score or (score == best_score and candidates[m].id < candidates[best].id)) {
+            if (feats or q.key_temp > 0) scores[m] = score;
+            if (q.key_temp > 0) {
+                const noise = -@log(-@log(draftUniform(q.key_seed, position, candidates[m].id)));
+                const key = @as(f64, score) / q.key_temp + noise;
+                if (key > best_key or (key == best_key and candidates[m].id < candidates[best].id)) {
+                    best = m;
+                    best_key = key;
+                }
+            } else if (score > best_score or (score == best_score and candidates[m].id < candidates[best].id)) {
                 best = m;
                 best_score = score;
             }
         }
+        if (q.key_temp > 0) best_score = scores[best];
         const draft = candidates[best].id;
         drafts[slot] = draft;
         // DSpark proposes 8; the glm_dsa backend holds 7 (its depth cap), so write only what the caller holds.
@@ -170,6 +196,75 @@ pub fn selectDspark(dr: *const df.Drafter, i: usize, M: usize, q: df.Req) void {
         prev = draft;
     }
     traceDspark(q.pos, q.anchor, &drafts, &confs, &top1s);
+}
+
+test "glm dflash: DSpark keyed draft selection is deterministic and preserves greedy ranking" {
+    const gpa = std.testing.allocator;
+    var cand: [2 * 8 * 8]i32 = @splat(-1);
+    for (0..8) |row| {
+        const ids = [_]u32{ 2, 3, 4, 5 };
+        const vals = [_]f32{ 0.02, 0.01, 0, -0.01 };
+        for (ids, vals, 0..) |id, value, j| {
+            cand[row * 8 + j] = @intCast(id);
+            cand[row * 8 + 4 + j] = @bitCast(value);
+        }
+    }
+    var w1: [32 * 4]u16 = @splat(0);
+    var w2: [32 * 4]u16 = @splat(0);
+    var conf_w: [6]u16 = @splat(0);
+    var hrows: [8 * 2]u16 = @splat(0);
+    var greedy: [8]u32 = undefined;
+    var first: [8]u32 = undefined;
+    var repeated: [8]u32 = undefined;
+    var other_seed: [8]u32 = undefined;
+    var dr: df.Drafter = .{
+        .gpa = gpa,
+        .d = undefined,
+        .module = undefined,
+        .k = undefined,
+        .weights = undefined,
+        .geometry = .{ .kind = .dspark, .hidden = 2, .selector_rank = 4, .selector_top_k = 4, .block_size = 8 },
+        .split = false,
+        .ff = 0,
+        .rank = 0,
+        .world = 2,
+        .cand = &cand,
+        .markov_w1 = &w1,
+        .markov_w2 = &w2,
+        .conf_w = &conf_w,
+        .hrows = &hrows,
+    };
+    selectDspark(&dr, 0, 8, .{ .slot = 0, .pos = 17, .n = 0, .anchor = 1, .out = &greedy });
+    selectDspark(&dr, 0, 8, .{ .slot = 0, .pos = 17, .n = 0, .anchor = 1, .out = &first, .key_seed = 7, .key_temp = 1 });
+    selectDspark(&dr, 0, 8, .{ .slot = 0, .pos = 17, .n = 0, .anchor = 1, .out = &repeated, .key_seed = 7, .key_temp = 1 });
+    try std.testing.expectEqualSlices(u32, &.{ 2, 2, 2, 2, 2, 2, 2, 2 }, &greedy);
+    try std.testing.expectEqualSlices(u32, &first, &repeated);
+    var changed_seed = false;
+    for (8..40) |seed| {
+        selectDspark(&dr, 0, 8, .{ .slot = 0, .pos = 17, .n = 0, .anchor = 1, .out = &other_seed, .key_seed = @intCast(seed), .key_temp = 1 });
+        if (!std.mem.eql(u32, &first, &other_seed)) {
+            changed_seed = true;
+            break;
+        }
+    }
+    try std.testing.expect(changed_seed);
+
+    for (0..8) |row| {
+        cand[row * 8] = 2;
+        cand[row * 8 + 1] = 3;
+        cand[row * 8 + 2] = 4;
+        cand[row * 8 + 3] = 5;
+        cand[row * 8 + 4] = @bitCast(@as(f32, 100));
+        cand[row * 8 + 5] = @bitCast(@as(f32, 0));
+        cand[row * 8 + 6] = @bitCast(@as(f32, -1));
+        cand[row * 8 + 7] = @bitCast(@as(f32, -2));
+    }
+    selectDspark(&dr, 0, 8, .{ .slot = 0, .pos = 17, .n = 0, .anchor = 1, .out = &first, .key_seed = 7, .key_temp = 1 });
+    try std.testing.expectEqualSlices(u32, &.{ 2, 2, 2, 2, 2, 2, 2, 2 }, &first);
+}
+
+test "glm dflash: DSpark draft uniform matches target keyed uniform" {
+    try std.testing.expectEqual(@as(f64, 0x1.ff498193e4eb0p-1), draftUniform(7, 11, 13)); // sampler.keyedUniform(7, 11, 13)
 }
 
 fn traceDspark(pos: i64, anchor: u32, drafts: *const [8]u32, conf: *const [8]f64, top1: *const [8]u32) void {

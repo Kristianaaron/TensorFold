@@ -101,6 +101,8 @@ pub fn run(gpu: anytype) !void {
         std.debug.print("PASS glm53-pre-group rows={d} split={}\n", .{ rows, split });
     };
 
+    try qaHalfGroupedParity(gpu, &lane, stream, weights[1], weights[2]);
+
     const bf_raw = try gpu.gpa.alloc(u16, 32 * 6144);
     defer gpu.gpa.free(bf_raw);
     for (bf_raw) |*v| v.* = random.int(u16);
@@ -133,6 +135,118 @@ pub fn run(gpu: anytype) !void {
         try actual.download(0, got);
         if (!std.mem.eql(u8, expected, got)) return error.PreGroupMismatch;
     }
+}
+
+fn qaHalfGroupedParity(gpu: anytype, lane: *const qmmf.Lane, stream: cuda.Stream, kv: PackedWeight, wk: PackedWeight) !void {
+    const full_n = 2048;
+    const half_n = 1024;
+    const k = 6144;
+    var prng = std.Random.DefaultPrng.init(0x51a_2048);
+    const random = prng.random();
+    const raw_full = try gpu.gpa.alloc(u8, full_n * k);
+    defer gpu.gpa.free(raw_full);
+    for (raw_full) |*v| {
+        v.* = random.int(u8);
+        while (v.* == 0x7f or v.* == 0xff) v.* = random.int(u8);
+    }
+    const scales_full = try gpu.gpa.alloc(f32, (full_n / 128) * (k / 128));
+    defer gpu.gpa.free(scales_full);
+    for (scales_full) |*v| v.* = 0.125;
+    var q_full = try packQaWeight(gpu, raw_full, scales_full, full_n, full_n, 0);
+    defer { q_full.codes.free(); q_full.scales.free(); }
+    var q_halves: [2]PackedWeight = undefined;
+    for (0..2) |rank| {
+        const row0 = rank * half_n;
+        const raw_half = try gpu.gpa.alloc(u8, half_n * k);
+        defer gpu.gpa.free(raw_half);
+        @memcpy(raw_half, raw_full[row0 * k ..][0 .. half_n * k]);
+        q_halves[rank] = try packQaWeight(gpu, raw_half, scales_full, half_n, full_n, row0);
+    }
+    defer for (&q_halves) |*w| { w.codes.free(); w.scales.free(); };
+
+    for ([_]usize{ 1, 4, 8, 512 }) |rows| {
+        const xh = try gpu.gpa.alloc(u16, rows * k);
+        defer gpu.gpa.free(xh);
+        for (xh) |*v| v.* = random.int(u16);
+        var x = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(xh));
+        defer x.free();
+        var q_reference = try cuda.DeviceBuffer.alloc(gpu.d, rows * full_n * 2);
+        defer q_reference.free();
+        var q_actual = try cuda.DeviceBuffer.alloc(gpu.d, rows * half_n * 2);
+        defer q_actual.free();
+        var kv_reference = try cuda.DeviceBuffer.alloc(gpu.d, rows * @as(usize, @intCast(kv.w.n)) * 2);
+        defer kv_reference.free();
+        var kv_actual = try cuda.DeviceBuffer.alloc(gpu.d, kv_reference.len);
+        defer kv_actual.free();
+        var wk_reference = try cuda.DeviceBuffer.alloc(gpu.d, rows * @as(usize, @intCast(wk.w.n)) * 2);
+        defer wk_reference.free();
+        var wk_actual = try cuda.DeviceBuffer.alloc(gpu.d, wk_reference.len);
+        defer wk_actual.free();
+        var q_part = try cuda.DeviceBuffer.alloc(gpu.d, @max(4, lane.partBytes(rows, q_full.w)));
+        defer q_part.free();
+        var kv_part = try cuda.DeviceBuffer.alloc(gpu.d, @max(4, lane.partBytes(rows, kv.w)));
+        defer kv_part.free();
+        var wk_part = try cuda.DeviceBuffer.alloc(gpu.d, @max(4, lane.partBytes(rows, wk.w)));
+        defer wk_part.free();
+        // Reference: the all-off grouped pre-projection (full q_a with kv_a and wk in one group), the path QA_SHARD
+        // replaces. A lone matmulOut is a different kernel and differs from the group at 512 rows.
+        _ = .{ q_part, kv_part, wk_part };
+        const reference_outs = [_]qmmf.GroupOut{
+            .{ .w = q_full.w, .y = q_reference.ptr },
+            .{ .w = kv.w, .y = kv_reference.ptr },
+            .{ .w = wk.w, .y = wk_reference.ptr },
+        };
+        try lane.matmulGroup(stream, x.ptr, k, rows, &reference_outs, .{});
+        try stream.synchronize();
+        const q_full_bytes = try gpu.gpa.alloc(u8, q_reference.len);
+        defer gpu.gpa.free(q_full_bytes);
+        try q_reference.download(0, q_full_bytes);
+        const q_want = try gpu.gpa.alloc(u8, rows * half_n * 2);
+        defer gpu.gpa.free(q_want);
+        const q_got = try gpu.gpa.alloc(u8, q_actual.len);
+        defer gpu.gpa.free(q_got);
+        for (0..2) |rank| {
+            const outs = [_]qmmf.GroupOut{
+                .{ .w = q_halves[rank].w, .y = q_actual.ptr },
+                .{ .w = kv.w, .y = kv_actual.ptr },
+                .{ .w = wk.w, .y = wk_actual.ptr },
+            };
+            try lane.matmulGroup(stream, x.ptr, k, rows, &outs, .{});
+            try stream.synchronize();
+            const row0 = rank * half_n;
+            for (0..rows) |r| {
+                @memcpy(q_want[r * half_n * 2 ..][0 .. half_n * 2], q_full_bytes[r * full_n * 2 + row0 * 2 ..][0 .. half_n * 2]);
+            }
+            try q_actual.download(0, q_got);
+            try std.testing.expectEqualSlices(u8, q_want, q_got);
+            try expectDeviceEqual(gpu, kv_reference, kv_actual);
+            try expectDeviceEqual(gpu, wk_reference, wk_actual);
+        }
+    }
+}
+
+fn packQaWeight(gpu: anytype, raw: []const u8, scales_full: []const f32, n: usize, full_n: usize, row0: usize) !PackedWeight {
+    const packed_codes = try gpu.gpa.alloc(u8, fp8.padded(n) * 6144);
+    defer gpu.gpa.free(packed_codes);
+    fp8.packCodes(packed_codes, raw, n, 6144);
+    const packed_scales = try gpu.gpa.alloc(f32, fp8.padded(n) / 64 * (6144 / 64));
+    defer gpu.gpa.free(packed_scales);
+    try fp8.packBlockScales(packed_scales, scales_full, full_n, 6144, row0, 0, n, 6144);
+    var codes = try cuda.DeviceBuffer.fromHost(gpu.d, packed_codes);
+    errdefer codes.free();
+    var scales = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(packed_scales));
+    errdefer scales.free();
+    return .{ .codes = codes, .scales = scales, .w = .{ .mode = .fp8b, .codes = codes.ptr, .scales = scales.ptr, .n = @intCast(n), .k = 6144, .npad = @intCast(fp8.padded(n)) } };
+}
+
+fn expectDeviceEqual(gpu: anytype, want: cuda.DeviceBuffer, got: cuda.DeviceBuffer) !void {
+    const a = try gpu.gpa.alloc(u8, want.len);
+    defer gpu.gpa.free(a);
+    const b = try gpu.gpa.alloc(u8, got.len);
+    defer gpu.gpa.free(b);
+    try want.download(0, a);
+    try got.download(0, b);
+    try std.testing.expectEqualSlices(u8, a, b);
 }
 
 fn benchPaths(driver: *const cuda.Driver, lane: qmmf.Lane, stream: cuda.Stream, x: u64, ldx: usize, rows: usize, weights: [3]PackedWeight, refs: [3]cuda.DeviceBuffer, outs: [3]cuda.DeviceBuffer, prefetch: cuda.DeviceBuffer) !void {

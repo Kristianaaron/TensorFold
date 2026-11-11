@@ -6,7 +6,66 @@ const cuda = @import("cuda");
 pub const Geometry = @import("geometry").Geometry;
 const glm = @import("glm");
 
+const side_scratch_alignment: u64 = 256;
+
+const SideScratchLayout = struct { c1: u64, ctx: u64, ckv: u64, gs: u64, part: u64, bytes: u64 };
+
+fn scratchPlace(offset: *u64, bytes: u64) u64 {
+    offset.* = std.mem.alignForward(u64, offset.*, side_scratch_alignment);
+    const result = offset.*;
+    offset.* += bytes;
+    return result;
+}
+
+fn linearInputWidth(w: glm.dflash.Lin) usize {
+    return switch (w) {
+        .q4 => |q| q.k,
+        .bf16 => |t| t.k,
+    };
+}
+
+fn sideScratchLayout(dr: *const glm.dflash.Drafter) SideScratchLayout {
+    const g = dr.geometry;
+    var max_k = linearInputWidth(dr.fc);
+    var max_part: usize = 16;
+    if (dr.fc == .bf16) max_part = @max(max_part, glm.mm.partBytes(glm.dflash_block.stage_rows, dr.fc.bf16));
+    for (dr.layers) |layer| {
+        max_k = @max(max_k, linearInputWidth(layer.kv));
+        if (layer.kv == .bf16) max_part = @max(max_part, glm.mm.partBytes(glm.dflash_block.stage_rows, layer.kv.bf16));
+    }
+    var offset: u64 = 0;
+    const rows: u64 = @intCast(glm.dflash_block.stage_rows);
+    const hidden: u64 = @intCast(g.hidden);
+    const kv_width: u64 = @intCast(g.kvWidth());
+    const c1 = scratchPlace(&offset, rows * hidden * 2);
+    const ctx = scratchPlace(&offset, rows * hidden * 2);
+    const ckv = scratchPlace(&offset, rows * kv_width * 2);
+    const gs = scratchPlace(&offset, rows * @as(u64, @intCast(max_k / 64)) * 4);
+    const part = scratchPlace(&offset, @intCast(max_part));
+    return .{ .c1 = c1, .ctx = ctx, .ckv = ckv, .gs = gs, .part = part, .bytes = std.mem.alignForward(u64, offset, side_scratch_alignment) + side_scratch_alignment - 1 };
+}
+
+pub fn ingestSideScratchBytes(g: glm.dflash.Geometry) u64 {
+    const rows: u64 = @intCast(glm.dflash_block.stage_rows);
+    const hidden: u64 = @intCast(g.hidden);
+    const kv_width: u64 = @intCast(g.kvWidth());
+    const max_k = g.tapRowBytes();
+    const max_part = @max(@as(usize, 16), @max(glm.mm.partBytes(glm.dflash_block.stage_rows, .{ .w = 0, .n = hidden, .k = max_k }), glm.mm.partBytes(glm.dflash_block.stage_rows, .{ .w = 0, .n = 2 * kv_width, .k = hidden })));
+    var offset: u64 = 0;
+    _ = scratchPlace(&offset, rows * hidden * 2);
+    _ = scratchPlace(&offset, rows * hidden * 2);
+    _ = scratchPlace(&offset, rows * kv_width * 2);
+    _ = scratchPlace(&offset, rows * @as(u64, @intCast(max_k / 64)) * 4);
+    _ = scratchPlace(&offset, @intCast(max_part));
+    return std.mem.alignForward(u64, offset, side_scratch_alignment) + side_scratch_alignment - 1;
+}
+
 pub const head_chunk_rows: usize = 8192;
+
+pub fn draftDown4Switch() bool {
+    const v = std.c.getenv("TF_GLM53_DRAFT_DOWN4") orelse return false;
+    return v[0] == '1' and v[1] == 0;
+}
 
 pub fn shareScratchEnabled() bool {
     const raw = std.c.getenv("TF_GLM53_DRAFTER_SHARE") orelse return false;
@@ -103,6 +162,15 @@ pub const Host = struct {
     h_local: [glm.dflash.MAX_M]i32 = undefined,
     h_owner: [glm.dflash.MAX_M]i32 = undefined,
     dr: ?*glm.dflash.Drafter = null,
+    ingest_side: bool = false,
+    ingest_stream: ?cuda.Stream = null,
+    ingest_fork: ?cuda.Event = null,
+    ingest_done: ?cuda.Event = null,
+    stage: ?cuda.DeviceBuffer = null,
+    side_scratch: ?cuda.DeviceBuffer = null,
+    ingest_scratch: ?glm.dflash_block.SideScratch = null,
+    stage_kv: cuda.Function = undefined,
+    down4: bool = false,
 
     pub fn init(h: *Host, gpa: std.mem.Allocator, ctx: *const cuda.Context, stream: cuda.Stream, group: *const cuda.tp_group.Group, glm_glue: cuda.Module, glm53_glue: cuda.Module, embed: u64, head: ?cuda.qmmf.Weight, vocab: glm.shard.Span, rank: usize) !void {
         var modules: [4]cuda.Module = undefined;
@@ -151,7 +219,11 @@ pub const Host = struct {
 
     pub fn load(h: *Host, io: std.Io, dir: []const u8, bits: u8, share_scratch: bool) !void {
         if (bits != 4) return error.BadDrafterBits;
-        h.dr = try Drafter.load(h.gpa, io, h, dir, h.share.rank, 2, bits, try checkConfig(h.gpa, io, dir), share_scratch);
+        if (h.down4) try h.m.q4.loadF32(h.modules[1]);
+        var geometry = try checkConfig(h.gpa, io, dir);
+        geometry.down4 = h.down4;
+        h.dr = try Drafter.load(h.gpa, io, h, dir, h.share.rank, 2, bits, geometry, share_scratch);
+        if (h.ingest_side) try h.openIngestSide();
         const conf_temp = try confTempSwitch();
         h.dr.?.conf_temp = conf_temp;
         if (h.share.rank == 0) std.log.info("glm53 draft conf temp: {d:.3}", .{conf_temp});
@@ -160,7 +232,52 @@ pub const Host = struct {
         try h.dr.?.restart(0, 0);
     }
 
+    fn openIngestSide(h: *Host) !void {
+        const dr = h.dr.?;
+        const g = dr.geometry;
+        if (g.kind != .dspark or g.head_dim != 64 or g.kv_heads != 64 or g.kvWidth() != 4096) return error.DraftIngestSideNeedsDspark;
+        h.stage_kv = try dr.module.function("df_ctx_kv_stage_glm");
+        dr.stage_commit = try dr.module.function("df_ring_commit_glm");
+        h.ingest_stream = try cuda.Stream.init(h.d, true);
+        h.ingest_fork = try cuda.Event.init(h.d, false);
+        h.ingest_done = try cuda.Event.init(h.d, false);
+        h.stage = try cuda.DeviceBuffer.alloc(h.d, glm.dflash_block.stageBytes(g));
+        const scratch_layout = sideScratchLayout(dr);
+        h.side_scratch = try cuda.DeviceBuffer.alloc(h.d, scratch_layout.bytes);
+        const scratch_base = std.mem.alignForward(u64, h.side_scratch.?.ptr, side_scratch_alignment);
+        h.ingest_scratch = .{
+            .c1 = scratch_base + scratch_layout.c1,
+            .ctx = scratch_base + scratch_layout.ctx,
+            .ckv = scratch_base + scratch_layout.ckv,
+            .gs = scratch_base + scratch_layout.gs,
+            .part = scratch_base + scratch_layout.part,
+        };
+        dr.stage = h.stage.?.ptr;
+    }
+
+    pub fn ingestFork(ctx: *anyopaque, s: cuda.Stream, positions: u64, rows: usize) anyerror!void {
+        const h: *Host = @ptrCast(@alignCast(ctx));
+        const dr = h.dr orelse return error.NoDrafter;
+        const side = h.ingest_stream orelse return error.StagedIngestNotOpen;
+        try h.ingest_fork.?.record(s);
+        try side.wait(h.ingest_fork.?);
+        var on_side = h.*;
+        on_side.stream = side;
+        try glm.dflash_block.ingestStaged(dr, &on_side, dr.taps_step, positions, rows, h.ingest_scratch.?, h.stage.?.ptr, h.stage_kv);
+        try h.ingest_done.?.record(side);
+    }
+
+    pub fn ingestJoin(ctx: *anyopaque, s: cuda.Stream) anyerror!void {
+        const h: *Host = @ptrCast(@alignCast(ctx));
+        try s.wait(h.ingest_done orelse return error.StagedIngestNotOpen);
+    }
+
     pub fn deinit(h: *Host) void {
+        if (h.stage) |*stage| stage.free();
+        if (h.side_scratch) |*scratch| scratch.free();
+        if (h.ingest_fork) |*event| event.deinit();
+        if (h.ingest_done) |*event| event.deinit();
+        if (h.ingest_stream) |*stream| stream.deinit();
         if (h.dr) |dr| dr.deinit();
         h.scratch.free();
         var i = h.modules.len;
@@ -173,6 +290,11 @@ pub const Host = struct {
 
     pub fn embedDraft(h: *Host, ids: u64, out: u64, rows: usize, width: usize) !void {
         _ = ids;
+        try h.embedDraftUpload(rows);
+        try h.embedDraftDevice(out, rows, width);
+    }
+
+    pub fn embedDraftUpload(h: *Host, rows: usize) !void {
         const vl = h.share.vocab.len();
         const gathered = h.scratch.ptr;
         const gathered_cap = 2 * glm.dflash.MAX_M * 6144 * 2;
@@ -185,6 +307,13 @@ pub const Host = struct {
         }
         try h.d.check(h.d.api.cuMemcpyHtoDAsync_v2(local_dev, @ptrCast(&h.h_local), rows * @sizeOf(i32), h.stream.handle), "cuMemcpyHtoDAsync");
         try h.d.check(h.d.api.cuMemcpyHtoDAsync_v2(owners_dev, @ptrCast(&h.h_owner), rows * @sizeOf(i32), h.stream.handle), "cuMemcpyHtoDAsync");
+    }
+
+    pub fn embedDraftDevice(h: *Host, out: u64, rows: usize, width: usize) !void {
+        const gathered = h.scratch.ptr;
+        const gathered_cap = 2 * glm.dflash.MAX_M * 6144 * 2;
+        const local_dev = gathered + gathered_cap;
+        const owners_dev = local_dev + glm.dflash.MAX_M * 4;
         const mine = gathered + h.share.rank * rows * width * 2;
         try glm.glue.embedB16(.{ .glue = &h.m.glue }, h.stream, local_dev, h.w.embed, mine, rows, width, 1);
         try h.group.?.allGather(h.stream, mine, gathered, rows * width * 2);
@@ -198,9 +327,19 @@ pub const Host = struct {
         try cuda.launch.launch(h.embed_pick, .{ .grid = .{ .x = @intCast((rows * width + 255) / 256) }, .block = .{ .x = 256 } }, h.stream, &a);
     }
 
+    pub fn captureDraftGraph(h: *Host) !void {
+        const dr = h.dr orelse return error.NoDrafter;
+        try dr.capturePass(h, h.share.rank == 0);
+    }
+
     pub fn restartHook(ctx: *anyopaque, from: usize) anyerror!void {
         const h: *Host = @ptrCast(@alignCast(ctx));
         try h.dr.?.restart(0, from);
+    }
+
+    pub fn rewindHook(ctx: *anyopaque, floor: usize, from: usize) anyerror!void {
+        const h: *Host = @ptrCast(@alignCast(ctx));
+        try h.dr.?.rewind(0, floor, from);
     }
 
     pub fn promptHook(ctx: *anyopaque, start: usize, rows: usize) anyerror!void {
@@ -213,9 +352,9 @@ pub const Host = struct {
         try h.dr.?.noteVerify(0, 0, rows, pos0, true);
     }
 
-    pub fn draftHook(ctx: *anyopaque, pos: usize, n: usize, anchor: u32, out: ?[]u32, probs: ?[]f64) anyerror!void {
+    pub fn draftHook(ctx: *anyopaque, pos: usize, n: usize, anchor: u32, out: ?[]u32, probs: ?[]f64, key_seed: u64, key_temp: f64) anyerror!void {
         const h: *Host = @ptrCast(@alignCast(ctx));
-        try h.dr.?.draft(h, &[1]glm.dflash.Req{.{ .slot = 0, .pos = @intCast(pos), .n = n, .anchor = anchor, .out = out, .probs = probs }});
+        try h.dr.?.draft(h, &[1]glm.dflash.Req{.{ .slot = 0, .pos = @intCast(pos), .n = n, .anchor = anchor, .out = out, .probs = probs, .key_seed = key_seed, .key_temp = key_temp }});
     }
 
     /// Export the preallocated DFlash2 ring through host memory; this does not allocate device memory.
@@ -288,6 +427,7 @@ pub fn runtimeGeometry(geometry: Geometry) glm.dflash.Geometry {
         .mask = geometry.mask,
         .eps = geometry.rms_norm_eps,
         .tap_streams = 1,
+        .down4 = geometry.down4,
     };
 }
 
@@ -462,7 +602,7 @@ pub fn weightBytes(g: Geometry, bits: u8, world: usize) !u64 {
     const quantized = if (bits == 4) (qweight / 2 + qweight / 16) else qweight;
     const small_per_layer = (if (g.conv) @as(u64, 6) * d * 2 else @as(u64, 2) * d * 2) + 2 * @as(u64, @intCast(g.head_dim)) * 2 + (if (g.conv) @as(u64, 2) * @as(u64, @intCast(g.conv_kernel_size)) * 2 * d * 2 + @as(u64, @intCast(g.conv_group_size)) * 256 else @as(u64, 0));
     const meta = @as(u64, @intCast(g.layers)) * (small_per_layer + (if (g.conv) @as(u64, 32 * 256) else @as(u64, 0)));
-    const down = @as(u64, @intCast(g.layers)) * d * ff * 2;
+    const down = if (g.down4) @as(u64, @intCast(g.layers)) * (d * ff / 2 + d * ff / 16) else @as(u64, @intCast(g.layers)) * d * ff * 2;
     const selector = if (g.kind == .dspark) @as(u64, 0) else @as(u64, @intCast(g.selector_rank)) * d * 2;
     return quantized + meta + down + selector + 2 * d * 2 + (if (g.conv) @as(u64, 64 * 256) else @as(u64, 0));
 }
@@ -764,6 +904,22 @@ test "glm dsa dflash memory plan includes device scratch, rings, target head and
     try std.testing.expect(one.scratch > 0 and one.host_tables > 0);
     try std.testing.expectEqual(one.weights + one.draft_head + one.scratch + one.rings, one.deviceBytes());
     try std.testing.expectEqual(one.host_books + one.host_tables, one.hostBytes());
+}
+
+test "TF_GLM53_DRAFT_DOWN4 memory plan" {
+    var g: Geometry = .{};
+    const bf16_bytes = try weightBytes(g, 4, 2);
+    g.down4 = true;
+    const down4_bytes = try weightBytes(g, 4, 2);
+    const d: u64 = @intCast(g.hidden);
+    const ff: u64 = @intCast(g.intermediate / 2);
+    const expected_delta = @as(u64, @intCast(g.layers)) * (d * ff * 2 - d * ff / 2 - d * ff / 16);
+    try std.testing.expectEqual(expected_delta, bf16_bytes - down4_bytes);
+
+    var env_geometry: Geometry = .{};
+    env_geometry.down4 = draftDown4Switch();
+    const plan = try memoryPlan(env_geometry, 4, 2, 1);
+    try std.testing.expectEqual(try weightBytes(env_geometry, 4, 2), plan.weights);
 }
 
 test "glm dsa dflash config arrays fail closed when not arrays" {

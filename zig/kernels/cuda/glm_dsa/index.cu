@@ -559,6 +559,304 @@ extern "C" __global__ void __launch_bounds__(256) tf_glm53_index_scores_mma_16(c
     tf_glm53_index_scores_mma_entry<16>(qi, iw, iw_stride, iw_col, keys, pos, scores, nkeys, key_stride, rank, world, rows, smem);
 }
 
+constexpr int IQS_KEYS = 64, IQS_STR = 136, IQS_ROWS = 4;
+constexpr int IQS_REL_BYTES = IQS_ROWS * 32 * IQS_KEYS * sizeof(float);
+constexpr int IQS_WEIGHT_BYTES = IQS_ROWS * 32 * sizeof(float);
+constexpr int IQS_SMEM(int stages) { return stages * IQS_KEYS * IQS_STR * (int)sizeof(__nv_bfloat16) + IQS_REL_BYTES + IQS_WEIGHT_BYTES; }
+static_assert(IQS_SMEM(3) <= 101376, "qs s3 must fit in 99 KB");
+
+__device__ __forceinline__ void iqs_cp16(__nv_bfloat16* dst, const __nv_bfloat16* src, bool valid) {
+    const unsigned int shared = static_cast<unsigned int>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(shared), "l"(src), "r"(valid ? 16 : 0));
+}
+
+template <int STAGES>
+__device__ __forceinline__ void iqs_prefetch(__nv_bfloat16* stage, const __nv_bfloat16* keys, int nkeys, int tile, int tid) {
+    for (int piece = tid; piece < IQS_KEYS * 16; piece += 256) {   // the 8-half row pad is never read
+        const int key = tile * IQS_KEYS + piece / 16, chunk = piece % 16;
+        const bool valid = key < nkeys;
+        const __nv_bfloat16* src = valid ? keys + static_cast<long long>(key) * 128 + chunk * 8 : keys;
+        iqs_cp16(stage + (piece / 16) * IQS_STR + chunk * 8, src, valid);
+    }
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+
+template <int N>
+__device__ __forceinline__ void iqs_wait() {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N) : "memory");
+}
+
+__device__ __forceinline__ int iqs_vis(int row, int rows, int vis_rows, const long long* pos, int rank, int world) {
+    if (row >= rows) return 0;
+    const int first = (row / vis_rows) * vis_rows;
+    long long hi = -1;
+    for (int r = first; r < rows && r < first + vis_rows; ++r) hi = max(hi, pos[r]);
+    return hi < rank ? 0 : static_cast<int>((hi - rank) / world + 1);
+}
+
+template <int STAGES>
+__device__ __forceinline__ void tf_glm53_index_scores_qs_task(const __nv_bfloat16* qi, const __nv_bfloat16* iw,
+                              int iw_stride, int iw_col, const __nv_bfloat16* keys, const long long* pos, float* scores,
+                              int nkeys, int key_stride, int rank, int world, int rows, int vis_rows, int tiles, char* smem) {
+    const int row0 = TF_VBID.y * IQS_ROWS, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, q = lane & 3;
+    const int total_tiles = (nkeys + IQS_KEYS - 1) / IQS_KEYS;
+    const int first_tile = TF_VBID.x * tiles;
+    __nv_bfloat16* stage_base = reinterpret_cast<__nv_bfloat16*>(smem);
+    float* rel = reinterpret_cast<float*>(smem + STAGES * IQS_KEYS * IQS_STR * sizeof(__nv_bfloat16));
+    float* w = reinterpret_cast<float*>(reinterpret_cast<char*>(rel) + IQS_REL_BYTES);
+    __shared__ int vis_sh[IQS_ROWS];   // its own cells: w is rewritten below without a barrier after these reads
+    if (tid < IQS_ROWS) vis_sh[tid] = iqs_vis(row0 + tid, rows, vis_rows, pos, rank, world);
+    __syncthreads();
+    int max_vis = 0;
+    for (int rr = 0; rr < IQS_ROWS; ++rr) max_vis = max(max_vis, vis_sh[rr]);
+    const int row_vis = vis_sh[tid / IQS_KEYS];
+    const int end_tile = min(min(total_tiles, (max_vis + IQS_KEYS - 1) / IQS_KEYS), first_tile + tiles);
+    if (first_tile >= end_tile) return;
+
+    for (int x = tid; x < IQS_ROWS * 32; x += 256) {
+        const int row = row0 + x / 32;
+        w[x] = row < rows ? __bfloat162float(iw[static_cast<long long>(row) * iw_stride + iw_col + x % 32]) * 0.1767766952966369f : 0.0f;
+    }
+    __syncthreads();
+
+    const int pair0 = warp * 16 + g, pair1 = pair0 + 8;
+    const int row_a0 = row0 + pair0 / 32, row_a1 = row0 + pair1 / 32;
+    const int head_a0 = pair0 % 32, head_a1 = pair1 % 32;
+    const __nv_bfloat16* a0 = row_a0 < rows ? qi + (static_cast<long long>(row_a0) * 32 + head_a0) * 128 : nullptr;
+    const __nv_bfloat16* a1 = row_a1 < rows ? qi + (static_cast<long long>(row_a1) * 32 + head_a1) * 128 : nullptr;
+    uint32_t af[8][4];
+#pragma unroll
+    for (int st = 0; st < 8; ++st) {
+        const int k0 = st * 16 + 2 * q;
+        af[st][0] = a0 ? *reinterpret_cast<const uint32_t*>(a0 + k0) : 0;
+        af[st][1] = a1 ? *reinterpret_cast<const uint32_t*>(a1 + k0) : 0;
+        af[st][2] = a0 ? *reinterpret_cast<const uint32_t*>(a0 + k0 + 8) : 0;
+        af[st][3] = a1 ? *reinterpret_cast<const uint32_t*>(a1 + k0 + 8) : 0;
+    }
+
+    for (int ahead = 0; ahead < STAGES; ++ahead) {
+        const int prefetch_tile = first_tile + ahead < end_tile ? first_tile + ahead : total_tiles;
+        iqs_prefetch<STAGES>(stage_base + ahead * IQS_KEYS * IQS_STR, keys, nkeys, prefetch_tile, tid);
+    }
+
+    for (int tile = first_tile; tile < end_tile; ++tile) {
+        iqs_wait<STAGES - 1>();
+        __syncthreads();
+        const int slot = (tile - first_tile) % STAGES;
+        __nv_bfloat16* ks = stage_base + slot * IQS_KEYS * IQS_STR;
+        float acc[8][4];
+#pragma unroll
+        for (int nt = 0; nt < 8; ++nt) acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.0f;
+#pragma unroll
+        for (int st = 0; st < 8; ++st) {
+            const int k0 = st * 16 + 2 * q;
+            const uint32_t a[4] = { af[st][0], af[st][1], af[st][2], af[st][3] };
+#pragma unroll
+            for (int nt = 0; nt < 8; ++nt) {
+                const __nv_bfloat16* b0 = ks + (nt * 8 + g) * IQS_STR;
+                const uint32_t b[2] = { *reinterpret_cast<const uint32_t*>(b0 + k0), *reinterpret_cast<const uint32_t*>(b0 + k0 + 8) };
+                ism_mma(acc[nt], a, b);
+            }
+        }
+#pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            const int col = nt * 8 + 2 * q;
+            rel[(warp * 16 + g) * IQS_KEYS + col] = fmaxf(acc[nt][0] * 0.08838834764831845f, 0.0f);
+            rel[(warp * 16 + g) * IQS_KEYS + col + 1] = fmaxf(acc[nt][1] * 0.08838834764831845f, 0.0f);
+            rel[(warp * 16 + g + 8) * IQS_KEYS + col] = fmaxf(acc[nt][2] * 0.08838834764831845f, 0.0f);
+            rel[(warp * 16 + g + 8) * IQS_KEYS + col + 1] = fmaxf(acc[nt][3] * 0.08838834764831845f, 0.0f);
+        }
+        __syncthreads();
+        // One group is committed every tile (empty past the end), so wait_group<STAGES - 1> always covers the next tile.
+        if (tile + STAGES < end_tile) iqs_prefetch<STAGES>(stage_base + slot * IQS_KEYS * IQS_STR, keys, nkeys, tile + STAGES, tid);
+        else asm volatile("cp.async.commit_group;\n" ::: "memory");
+        const int key0 = tile * IQS_KEYS;
+        const int rr = tid / IQS_KEYS, key = key0 + tid % IQS_KEYS, row = row0 + rr;
+        if (row < rows && key < nkeys && key0 < ((row_vis + IQS_KEYS - 1) / IQS_KEYS) * IQS_KEYS) {
+            if (static_cast<long long>(key) * world + rank > pos[row]) {
+                scores[static_cast<long long>(row) * key_stride + key] = -CUDART_INF_F;
+            } else {
+                float total = 0.0f;
+                for (int h = 0; h < 32; ++h) total = fmaf(w[rr * 32 + h], rel[(rr * 32 + h) * IQS_KEYS + tid % IQS_KEYS], total);
+                scores[static_cast<long long>(row) * key_stride + key] = total;
+            }
+        }
+        // no barrier here: the next tile's wait + barrier comes before any thread rewrites rel
+    }
+    iqs_wait<0>();
+    __syncthreads();
+}
+
+template <int STAGES>
+__device__ __forceinline__ void tf_glm53_index_scores_qs_entry(const __nv_bfloat16* qi, const __nv_bfloat16* iw,
+                              int iw_stride, int iw_col, const __nv_bfloat16* keys, const long long* pos, float* scores,
+                              int nkeys, int key_stride, int rank, int world, int rows, int vis_rows, int tiles, char* smem) {
+    TF_VBLOCK_ENTER();
+    tf_glm53_index_scores_qs_task<STAGES>(qi, iw, iw_stride, iw_col, keys, pos, scores, nkeys, key_stride, rank, world, rows, vis_rows, tiles, smem);
+}
+
+extern "C" __global__ void __launch_bounds__(256) tf_glm53_index_scores_qs_s2(const __nv_bfloat16* qi, const __nv_bfloat16* iw,
+                              int iw_stride, int iw_col, const __nv_bfloat16* keys, const long long* pos, float* scores,
+                              int nkeys, int key_stride, int rank, int world, int rows, int vis_rows, int tiles) {
+    extern __shared__ __align__(32) char smem[];
+    tf_glm53_index_scores_qs_entry<2>(qi, iw, iw_stride, iw_col, keys, pos, scores, nkeys, key_stride, rank, world, rows, vis_rows, tiles, smem);
+}
+
+extern "C" __global__ void __launch_bounds__(256) tf_glm53_index_scores_qs_s3(const __nv_bfloat16* qi, const __nv_bfloat16* iw,
+                              int iw_stride, int iw_col, const __nv_bfloat16* keys, const long long* pos, float* scores,
+                              int nkeys, int key_stride, int rank, int world, int rows, int vis_rows, int tiles) {
+    extern __shared__ __align__(32) char smem[];
+    tf_glm53_index_scores_qs_entry<3>(qi, iw, iw_stride, iw_col, keys, pos, scores, nkeys, key_stride, rank, world, rows, vis_rows, tiles, smem);
+}
+
+constexpr int IQS2_SMEM(int stages, int keys) {
+    return stages * keys * IQS_STR * (int)sizeof(__nv_bfloat16) + IQS_ROWS * 32 * keys * (int)sizeof(float) + IQS_WEIGHT_BYTES;
+}
+static_assert(IQS2_SMEM(3, 32) <= 50176, "qs2 k32 s3 must fit two CTAs per SM");
+
+template <int STAGES, int KEYS>
+__device__ __forceinline__ void tf_glm53_index_scores_qs2_task(const __nv_bfloat16* qi, const __nv_bfloat16* iw,
+                              int iw_stride, int iw_col, const __nv_bfloat16* keys, const long long* pos, float* scores,
+                              int nkeys, int key_stride, int rank, int world, int rows, int vis_rows, int tiles, char* smem) {
+    const int row0 = TF_VBID.y * IQS_ROWS, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, q = lane & 3;
+    const int total_tiles = (nkeys + KEYS - 1) / KEYS;
+    const int first_tile = TF_VBID.x * tiles;
+    __nv_bfloat16* stage_base = reinterpret_cast<__nv_bfloat16*>(smem);
+    float* rel = reinterpret_cast<float*>(smem + STAGES * KEYS * IQS_STR * sizeof(__nv_bfloat16));
+    float* w = reinterpret_cast<float*>(reinterpret_cast<char*>(rel) + IQS_ROWS * 32 * KEYS * sizeof(float));
+    __shared__ int vis_sh[IQS_ROWS];
+    if (tid < IQS_ROWS) vis_sh[tid] = iqs_vis(row0 + tid, rows, vis_rows, pos, rank, world);
+    __syncthreads();
+    int max_vis = 0;
+    for (int rr = 0; rr < IQS_ROWS; ++rr) max_vis = max(max_vis, vis_sh[rr]);
+    const int rounded_vis = ((max_vis + 63) / 64) * 64;
+    const int end_tile = min(min(total_tiles, (rounded_vis + KEYS - 1) / KEYS), first_tile + tiles);
+    if (first_tile >= end_tile) return;
+
+    for (int x = tid; x < IQS_ROWS * 32; x += 256) {
+        const int row = row0 + x / 32;
+        w[x] = row < rows ? __bfloat162float(iw[static_cast<long long>(row) * iw_stride + iw_col + x % 32]) * 0.1767766952966369f : 0.0f;
+    }
+    __syncthreads();
+
+    const int pair0 = warp * 16 + g, pair1 = pair0 + 8;
+    const int row_a0 = row0 + pair0 / 32, row_a1 = row0 + pair1 / 32;
+    const int head_a0 = pair0 % 32, head_a1 = pair1 % 32;
+    const __nv_bfloat16* a0 = row_a0 < rows ? qi + (static_cast<long long>(row_a0) * 32 + head_a0) * 128 : nullptr;
+    const __nv_bfloat16* a1 = row_a1 < rows ? qi + (static_cast<long long>(row_a1) * 32 + head_a1) * 128 : nullptr;
+    uint32_t af[8][4];
+#pragma unroll
+    for (int st = 0; st < 8; ++st) {
+        const int k0 = st * 16 + 2 * q;
+        af[st][0] = a0 ? *reinterpret_cast<const uint32_t*>(a0 + k0) : 0;
+        af[st][1] = a1 ? *reinterpret_cast<const uint32_t*>(a1 + k0) : 0;
+        af[st][2] = a0 ? *reinterpret_cast<const uint32_t*>(a0 + k0 + 8) : 0;
+        af[st][3] = a1 ? *reinterpret_cast<const uint32_t*>(a1 + k0 + 8) : 0;
+    }
+
+    for (int ahead = 0; ahead < STAGES; ++ahead) {
+        const int prefetch_tile = first_tile + ahead < end_tile ? first_tile + ahead : total_tiles;
+        for (int piece = tid; piece < KEYS * 16; piece += 256) {
+            const int key = prefetch_tile * KEYS + piece / 16, chunk = piece % 16;
+            const bool valid = key < nkeys;
+            const __nv_bfloat16* src = valid ? keys + static_cast<long long>(key) * 128 + chunk * 8 : keys;
+            iqs_cp16(stage_base + ahead * KEYS * IQS_STR + (piece / 16) * IQS_STR + chunk * 8, src, valid);
+        }
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+    }
+
+    for (int tile = first_tile; tile < end_tile; ++tile) {
+        iqs_wait<STAGES - 1>();
+        __syncthreads();
+        const int slot = (tile - first_tile) % STAGES;
+        __nv_bfloat16* ks = stage_base + slot * KEYS * IQS_STR;
+        float acc[KEYS / 8][4];
+#pragma unroll
+        for (int nt = 0; nt < KEYS / 8; ++nt) acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.0f;
+#pragma unroll
+        for (int st = 0; st < 8; ++st) {
+            const uint32_t a[4] = { af[st][0], af[st][1], af[st][2], af[st][3] };
+#pragma unroll
+            for (int np = 0; np < KEYS / 16; ++np) {
+                const int key_row = np * 16 + ((lane >> 4) << 3) + (lane & 7);
+                const int half = st * 16 + ((lane >> 3) & 1) * 8;
+                const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(ks + key_row * IQS_STR + half));
+                uint32_t b[4];
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(b[0]), "=r"(b[1]), "=r"(b[2]), "=r"(b[3]) : "r"(addr) : "memory");
+                ism_mma(acc[2 * np], a, b);
+                ism_mma(acc[2 * np + 1], a, b + 2);
+            }
+        }
+#pragma unroll
+        for (int nt = 0; nt < KEYS / 8; ++nt) {
+            const int col = nt * 8 + 2 * q;
+            rel[(warp * 16 + g) * KEYS + col] = fmaxf(acc[nt][0] * 0.08838834764831845f, 0.0f);
+            rel[(warp * 16 + g) * KEYS + col + 1] = fmaxf(acc[nt][1] * 0.08838834764831845f, 0.0f);
+            rel[(warp * 16 + g + 8) * KEYS + col] = fmaxf(acc[nt][2] * 0.08838834764831845f, 0.0f);
+            rel[(warp * 16 + g + 8) * KEYS + col + 1] = fmaxf(acc[nt][3] * 0.08838834764831845f, 0.0f);
+        }
+        __syncthreads();
+        if (tile + STAGES < end_tile) {
+            const int prefetch_tile = tile + STAGES;
+            for (int piece = tid; piece < KEYS * 16; piece += 256) {
+                const int key = prefetch_tile * KEYS + piece / 16, chunk = piece % 16;
+                const bool valid = key < nkeys;
+                const __nv_bfloat16* src = valid ? keys + static_cast<long long>(key) * 128 + chunk * 8 : keys;
+                iqs_cp16(stage_base + slot * KEYS * IQS_STR + (piece / 16) * IQS_STR + chunk * 8, src, valid);
+            }
+            asm volatile("cp.async.commit_group;\n" ::: "memory");
+        } else {
+            asm volatile("cp.async.commit_group;\n" ::: "memory");  // one group a tile, as the qs task: wait_group<STAGES - 1> then always covers the next tile
+        }
+        if (tid < 4 * KEYS) {
+            const int rr = tid / KEYS, key_offset = tid % KEYS, key = tile * KEYS + key_offset, row = row0 + rr;
+            const int row_vis = vis_sh[min(tid / KEYS, IQS_ROWS - 1)];
+            const int key64 = (key / 64) * 64;
+            if (row < rows && key < nkeys && key64 < ((row_vis + 63) / 64) * 64) {
+                if (static_cast<long long>(key) * world + rank > pos[row]) {
+                    scores[static_cast<long long>(row) * key_stride + key] = -CUDART_INF_F;
+                } else {
+                    float total = 0.0f;
+                    for (int h = 0; h < 32; ++h) total = fmaf(w[rr * 32 + h], rel[(rr * 32 + h) * KEYS + key_offset], total);
+                    scores[static_cast<long long>(row) * key_stride + key] = total;
+                }
+            }
+        }
+    }
+    iqs_wait<0>();
+    __syncthreads();
+}
+
+template <int STAGES, int KEYS>
+__device__ __forceinline__ void tf_glm53_index_scores_qs2_entry(const __nv_bfloat16* qi, const __nv_bfloat16* iw,
+                              int iw_stride, int iw_col, const __nv_bfloat16* keys, const long long* pos, float* scores,
+                              int nkeys, int key_stride, int rank, int world, int rows, int vis_rows, int tiles, char* smem) {
+    TF_VBLOCK_ENTER();
+    tf_glm53_index_scores_qs2_task<STAGES, KEYS>(qi, iw, iw_stride, iw_col, keys, pos, scores, nkeys, key_stride, rank, world, rows, vis_rows, tiles, smem);
+}
+
+extern "C" __global__ void __launch_bounds__(256) tf_glm53_index_scores_qs2_k64_s2(const __nv_bfloat16* qi, const __nv_bfloat16* iw,
+                              int iw_stride, int iw_col, const __nv_bfloat16* keys, const long long* pos, float* scores,
+                              int nkeys, int key_stride, int rank, int world, int rows, int vis_rows, int tiles) {
+    extern __shared__ __align__(32) char smem[];
+    tf_glm53_index_scores_qs2_entry<2, 64>(qi, iw, iw_stride, iw_col, keys, pos, scores, nkeys, key_stride, rank, world, rows, vis_rows, tiles, smem);
+}
+
+extern "C" __global__ void __launch_bounds__(256, 2) tf_glm53_index_scores_qs2_k32_s2(const __nv_bfloat16* qi, const __nv_bfloat16* iw,
+                              int iw_stride, int iw_col, const __nv_bfloat16* keys, const long long* pos, float* scores,
+                              int nkeys, int key_stride, int rank, int world, int rows, int vis_rows, int tiles) {
+    extern __shared__ __align__(32) char smem[];
+    tf_glm53_index_scores_qs2_entry<2, 32>(qi, iw, iw_stride, iw_col, keys, pos, scores, nkeys, key_stride, rank, world, rows, vis_rows, tiles, smem);
+}
+
+extern "C" __global__ void __launch_bounds__(256, 2) tf_glm53_index_scores_qs2_k32_s3(const __nv_bfloat16* qi, const __nv_bfloat16* iw,
+                              int iw_stride, int iw_col, const __nv_bfloat16* keys, const long long* pos, float* scores,
+                              int nkeys, int key_stride, int rank, int world, int rows, int vis_rows, int tiles) {
+    extern __shared__ __align__(32) char smem[];
+    tf_glm53_index_scores_qs2_entry<3, 32>(qi, iw, iw_stride, iw_col, keys, pos, scores, nkeys, key_stride, rank, world, rows, vis_rows, tiles, smem);
+}
+
 __device__ __forceinline__ bool before(Candidate a, Candidate b) {
     const float as = a.score + 0.0f, bs = b.score + 0.0f;
     uint32_t ai = __float_as_uint(as), bi = __float_as_uint(bs);

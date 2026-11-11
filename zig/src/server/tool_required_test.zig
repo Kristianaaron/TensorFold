@@ -10,6 +10,7 @@ const mt = @import("model_text.zig");
 const Server = @import("server.zig").Server;
 const openai = @import("openai.zig");
 const responses = @import("responses_translate.zig");
+const anthropic = @import("anthropic_translate.zig");
 const tools = @import("tool_grammar.zig");
 const parse = @import("tool_parse.zig");
 const a = std.testing.allocator;
@@ -148,6 +149,39 @@ test "ablate is opt-in per server flag and requires a loaded vector file" {
     var cx5: errors.Cx = .{ .a = g };
     try srv.checkFeatures(&cx5, try value(g, "{\"ablate\":false}"), false, false, &.{1}, &.{}, &request);
     try std.testing.expect(!request.ablate);
+}
+
+test "ablate reaches the feature gate through the chat, responses and messages parsers" {
+    // 2026-11-08: openai.plan copied an allowlist of body keys into input.fields without "ablate", so checkFeatures
+    // never saw it and "ablate": true was silently ignored. Drive the real parsers, not checkFeatures alone.
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const g = arena.allocator();
+    var text: Text = .{};
+    var stub: Stub = .{};
+    const srv = try Server.init(a, std.testing.io, stub.engine(), text.text(), .{ .served_name = "m", .model_ids = &.{"m"} }, null);
+    defer srv.deinit();
+    srv.config.allow_ablate = true;
+    srv.info.ablate = true;
+    const History = struct {
+        pub fn conversation(_: @This(), c: *errors.Cx, _: json.Value) errors.Refused![]json.Value {
+            return c.refuse("this fixture has no stored response");
+        }
+    };
+    for ([_]bool{ true, false }) |on| for (0..3) |route| {
+        var cx: errors.Cx = .{ .a = g };
+        const flag = if (on) "true" else "false";
+        const chat_body = switch (route) {
+            0 => try value(g, try std.fmt.allocPrint(g, "{{\"model\":\"m\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}],\"ablate\":{s}}}", .{flag})),
+            1 => (try responses.translate(&cx, try value(g, try std.fmt.allocPrint(g, "{{\"model\":\"m\",\"input\":\"hi\",\"ablate\":{s}}}", .{flag})), History{})).chat,
+            else => try anthropic.translate(&cx, try value(g, try std.fmt.allocPrint(g, "{{\"model\":\"m\",\"max_tokens\":8,\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}],\"ablate\":{s}}}", .{flag})), false),
+        };
+        const input = try openai.chatInput(srv, &cx, chat_body);
+        try std.testing.expect(input.fields.get("ablate") != null);
+        var request: api.Request = .{ .prompt = &.{1}, .max_tokens = 1 };
+        try srv.checkFeatures(&cx, input.fields, false, false, &.{1}, &.{}, &request);
+        try std.testing.expectEqual(on, request.ablate);
+    };
 }
 
 test "required tools: Gemma and unknown templates can constrain required calls on a grammar backend" {

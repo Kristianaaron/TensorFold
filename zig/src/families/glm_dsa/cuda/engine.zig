@@ -127,6 +127,8 @@ pub fn absentCandidate(c: sampler.Candidate) bool {
     return c.id == 0xFFFFFFFF and c.value == -std.math.inf(f32);
 }
 
+pub const lazy_undrawn: u32 = std.math.maxInt(u32);
+
 /// Device-to-host reads of head results. Production synchronizes the stream, then copies.
 pub const Download = struct {
     ctx: ?*anyopaque = null,
@@ -153,9 +155,10 @@ pub const Drafter = struct {
     taps_prefill: forward.taps_mod.Taps,
     taps_step: forward.taps_mod.Taps,
     restart_fn: *const fn (ctx: *anyopaque, from: usize) anyerror!void,
+    rewind_fn: *const fn (ctx: *anyopaque, floor: usize, from: usize) anyerror!void,
     prompt_fn: *const fn (ctx: *anyopaque, start: usize, rows: usize) anyerror!void,
     verify_fn: *const fn (ctx: *anyopaque, rows: usize, pos0: usize) anyerror!void,
-    draft_fn: *const fn (ctx: *anyopaque, pos: usize, n: usize, anchor: u32, out: ?[]u32, probs: ?[]f64) anyerror!void,
+    draft_fn: *const fn (ctx: *anyopaque, pos: usize, n: usize, anchor: u32, out: ?[]u32, probs: ?[]f64, key_seed: u64, key_temp: f64) anyerror!void,
     state_fn: ?*const fn (ctx: *anyopaque, dst: []u8) anyerror!i64 = null,
     adopt_fn: ?*const fn (ctx: *anyopaque, src: []const u8, from: i64) anyerror!void = null,
     ring_adopt_fn: ?*const fn (ctx: *anyopaque, from: i64) anyerror!void = null,
@@ -187,7 +190,7 @@ pub const SnapOps = struct {
     commit_fn: *const fn (ctx: *anyopaque, n: usize) anyerror!void,
 };
 
-const DraftFill = union(enum) { restart: usize, prompt: struct { start: usize, rows: usize } };
+const DraftFill = union(enum) { restart: usize, rewind: struct { floor: usize, from: usize }, prompt: struct { start: usize, rows: usize } };
 
 pub const Engine = struct {
     gpa: std.mem.Allocator,
@@ -200,6 +203,8 @@ pub const Engine = struct {
     graph_live: bool = false,
     abl: ?*const @import("ablate").Ablation = null,
     ablate_on: bool = false,
+    draft_gumbel: bool = false,
+    ring_keep: bool = false,
     drafter: ?Drafter = null,
     /// Fine resident prompt reuse grain; zero keeps the normal prefill piece grain.
     reuse_grain: usize = 0,
@@ -240,6 +245,13 @@ pub const Engine = struct {
     head_rows: usize = 0,
     head_per_rank: usize = 0,
     head_status: u32 = 0,
+    /// TF_GLM53_LAZY_DRAW=1: verify draws rows up to the first rejection (later rows read lazy_undrawn).
+    lazy_draw: bool = false,
+    /// One verify: draw every row (set by the rank-0 adapter for host-token windows and the round trace).
+    full_draw: bool = false,
+    /// TF_GLM53_LAZY_DRAW: readHead's merged candidates and log-normaliser per row, reused by drawRow.
+    merged_rows: [forward.max_decode_rows]?[]sampler.Candidate = @splat(null),
+    merged_log_z: [forward.max_decode_rows]f32 = @splat(0),
 
     fallback_device: ?cuda.DeviceBuffer = null,
     fallback_logits_host: []f32 = &.{},
@@ -325,6 +337,10 @@ pub const Engine = struct {
         if (e.deferDraftFill()) try e.draft_fill_pending.append(e.gpa, .{ .restart = from }) else try d.restart_fn(d.ctx, from);
     }
 
+    fn rewindDraft(e: *Engine, d: Drafter, floor: usize, from: usize) !void {
+        if (e.deferDraftFill()) try e.draft_fill_pending.append(e.gpa, .{ .rewind = .{ .floor = floor, .from = from } }) else try d.rewind_fn(d.ctx, floor, from);
+    }
+
     fn promptDraft(e: *Engine, d: Drafter, start: usize, rows: usize) !void {
         if (e.deferDraftFill()) try e.draft_fill_pending.append(e.gpa, .{ .prompt = .{ .start = start, .rows = rows } }) else try d.prompt_fn(d.ctx, start, rows);
     }
@@ -333,6 +349,7 @@ pub const Engine = struct {
         const d = e.drafter orelse return;
         for (e.draft_fill_pending.items) |op| switch (op) {
             .restart => |from| try d.restart_fn(d.ctx, from),
+            .rewind => |range| try d.rewind_fn(d.ctx, range.floor, range.from),
             .prompt => |range| try d.prompt_fn(d.ctx, range.start, range.rows),
         };
         e.draft_fill_pending.clearRetainingCapacity();
@@ -343,7 +360,11 @@ pub const Engine = struct {
         const d = e.drafter.?;
         const from = @max(start, end -| d.window);
         if (start != e.tapped or e.tap_high > start) {
-            try e.restartDraft(d, from);
+            if (e.ring_keep and start == e.tapped) {
+                try e.rewindDraft(d, e.tap_high -| d.window, from);
+            } else {
+                try e.restartDraft(d, from);
+            }
             e.tap_high = 0;
         }
         var t = d.taps_prefill;
@@ -366,6 +387,7 @@ pub const Engine = struct {
     }
 
     pub fn deinit(e: *Engine) void {
+        e.clearMerged();
         if (e.mk) |x| x.destroy();
         if (e.prof) |*p| p.deinit();
         if (e.owned_graph_cache) |*cache| cache.deinit();
@@ -385,6 +407,13 @@ pub const Engine = struct {
 
         e.keys.deinit(e.gpa);
         e.* = undefined;
+    }
+
+    fn clearMerged(e: *Engine) void {
+        for (&e.merged_rows) |*slot| {
+            if (slot.*) |list| e.gpa.free(list);
+            slot.* = null;
+        }
     }
 
     /// TF_GLM53_NO_GRAPHS=1: decode windows run eagerly (diagnosis of graph replay vs eager on the full model).
@@ -483,6 +512,7 @@ pub const Engine = struct {
     }
 
     fn readHead(e: *Engine, stream: cuda.Stream, gathered: u64, rows: usize, per_rank: usize) !void {
+        if (e.lazy_draw) e.clearMerged();
         e.head_masked = e.mask_rows != 0;
         const n = per_rank * forward.world;
         if (e.head_host.len < n) {
@@ -547,7 +577,8 @@ pub const Engine = struct {
             made += 1;
         }
         const merged = try sampler.mergeCandidates(e.gpa, &lists, k);
-        defer e.gpa.free(merged);
+        var keep_merged = false;
+        defer if (!keep_merged) e.gpa.free(merged);
         var rank_lse: [forward.world]sampler.Lse = undefined;
         for (0..forward.world) |rank| {
             const base = e.head_host[rank * per ..];
@@ -558,7 +589,13 @@ pub const Engine = struct {
             };
         }
         const log_z = sampler.mergeLse(&rank_lse);
-        return .{ .fits = try nucleusFitsCandidates(e.gpa, merged, log_z, e.rule), .log_z = log_z };
+        const info: NucleusInfo = .{ .fits = try nucleusFitsCandidates(e.gpa, merged, log_z, e.rule), .log_z = log_z };
+        if (e.lazy_draw and row < e.merged_rows.len) {
+            e.merged_rows[row] = merged;
+            e.merged_log_z[row] = log_z;
+            keep_merged = true;
+        }
+        return info;
     }
 
     fn fetchFullLogitsRow(e: *Engine, stream: cuda.Stream, row: usize) !void {
@@ -820,6 +857,7 @@ pub const Engine = struct {
         for (positions, 0..) |*p, i| p.* = e.pos + i;
         var f = e.f;
         f.taps = try e.promptTaps(start, start + ids.len);
+        f.ablate = if (e.ablate_on) e.abl else null;
         f.head = .none;
         f.sink = null;
         e.parkBeforeWrite(start + ids.len);
@@ -862,6 +900,7 @@ pub const Engine = struct {
     /// The position does not move; `keep` accepts rows.
     pub fn verify(e: *Engine, ids: []const u32, out: []u32) !void {
         defer e.mask_rows = 0;
+        defer e.full_draw = false;
         const masked = e.mask_rows != 0;
         if (masked and e.mask_rows != ids.len) return error.MaskRowsMismatch;
         const rows = ids.len;
@@ -956,7 +995,7 @@ pub const Engine = struct {
         }
         if (e.drafter) |d| try d.verify_fn(d.ctx, rows, e.pos);
         try e.readHead(f.stream, f.st.ws.head_gather, rows, rows * f.head.rowBytes());
-        try e.draw(0, rows, e.pos, out);
+        if (e.lazy_draw and !e.full_draw) try e.drawUntilReject(ids, e.pos, out) else try e.draw(0, rows, e.pos, out);
     }
 
     /// Spark parity hook: one verify window run eagerly, then through the graph cache twice (capture, replay); the
@@ -1010,7 +1049,9 @@ pub const Engine = struct {
             try d.restart_fn(d.ctx, pos);
             e.tap_high = 0;
         }
-        try d.draft_fn(d.ctx, pos, n, anchor, out, probs);
+        const key_seed: u64 = if (e.draft_gumbel and e.rule.temperature > 0) e.seed else 0;
+        const key_temp: f64 = if (e.draft_gumbel and e.rule.temperature > 0) e.rule.temperature else 0;
+        try d.draft_fn(d.ctx, pos, n, anchor, out, probs, key_seed, key_temp);
         e.tapped = pos;
         e.tap_high = @max(e.tap_high, pos);
     }
@@ -1066,6 +1107,20 @@ pub const Engine = struct {
         }
     }
 
+    /// TF_GLM53_LAZY_DRAW: rows of the last head exchange drawn in order until a row's draw differs from the next
+    /// window id; the rows after it get lazy_undrawn. Every drawn row equals draw()'s.
+    fn drawUntilReject(e: *Engine, ids: []const u32, position: u64, out: []u32) !void {
+        const rows = ids.len;
+        if (e.head_status != 0) return error.RoceExchangeFailed;
+        if (rows > e.head_rows or out.len < rows) return error.BadDraw;
+        var j: usize = 0;
+        while (j < rows) : (j += 1) {
+            out[j] = try e.drawRow(j, position + j);
+            if (j + 1 < rows and out[j] != ids[j + 1]) break;
+        }
+        if (j + 1 < rows) @memset(out[j + 1 .. rows], lazy_undrawn);
+    }
+
     fn drawRow(e: *Engine, row: usize, position: u64) !u32 {
         const n = e.head_rows;
         switch (e.f.head) {
@@ -1084,6 +1139,9 @@ pub const Engine = struct {
                 return best.?.id;
             },
             .candidates => |k| {
+                if (e.lazy_draw and row < e.merged_rows.len and e.rule.top_k == 0 and e.rule.top_p < 1 and e.rule.temperature == 1) {
+                    if (e.merged_rows[row]) |merged| return e.drawMerged(row, position, merged, e.merged_log_z[row]);
+                }
                 var lists: [forward.world][]const sampler.Candidate = undefined;
                 var made: usize = 0;
                 defer for (lists[0..made]) |list| e.gpa.free(list.ptr[0..k]);
@@ -1102,8 +1160,7 @@ pub const Engine = struct {
                 }
                 const merged = try sampler.mergeCandidates(e.gpa, &lists, k);
                 defer e.gpa.free(merged);
-                if (e.rule.top_k == 0 and e.rule.top_p < 1) {
-                    if (e.rule.temperature != 1) return error.UnsupportedExactNucleusTemperature;
+                if (e.rule.top_k == 0 and e.rule.top_p < 1 and e.rule.temperature == 1) {
                     var rank_lse: [forward.world]sampler.Lse = undefined;
                     for (0..forward.world) |rank| {
                         const base = e.head_host[rank * e.head_per_rank ..];
@@ -1122,9 +1179,22 @@ pub const Engine = struct {
                     return drawNucleusWithFallback(e.gpa, merged, full_logits, force_full, log_z, e.seed, position, e.rule);
                 }
                 if (e.rule.top_k > 0) return e.drawCandidates(merged, position);
-                return error.IncompleteCandidateCoverage;
+                if (!e.usesFallbackRows() or row >= e.fallback_rows.len or !e.fallback_rows[row] or e.fallback_vocab == 0) return error.IncompleteCandidateCoverage;
+                return drawFullNucleusFromLogits(e.gpa, e.fallback_logits_host[row * e.fallback_vocab ..][0..e.fallback_vocab], std.math.nan(f32), e.seed, position, e.rule);
             },
         }
+    }
+
+    /// drawRow's nucleus tail on readHead's merged list and log-normaliser for this row.
+    fn drawMerged(e: *Engine, row: usize, position: u64, merged: []const sampler.Candidate, log_z: f32) !u32 {
+        var force_full = false;
+        if (e.usesFallbackRows()) {
+            if (row >= e.fallback_rows.len or row >= e.fallback_log_z.len) return error.FallbackRowsTooSmall;
+            force_full = e.fallback_rows[row];
+        }
+        if (force_full and e.fallback_vocab == 0) return error.MissingFallbackVocabulary;
+        const full_logits = if (e.fallback_vocab == 0) &.{} else e.fallback_logits_host[row * e.fallback_vocab ..][0..e.fallback_vocab];
+        return drawNucleusWithFallback(e.gpa, merged, full_logits, force_full, log_z, e.seed, position, e.rule);
     }
 
     /// WP10's deterministic candidate sampler after the ranks' candidates have been merged.
@@ -1302,6 +1372,134 @@ test "engine draw falls back when the full-vocabulary nucleus exceeds K" {
     var fit: [1]u32 = undefined;
     try e.draw(0, 1, position, &fit);
     try std.testing.expectEqual(actual[0], fit[0]);
+}
+
+test "lazy draw: readHead's merged list draws what drawRow's own merge draws" {
+    const allocator = std.testing.allocator;
+    const logits = [_]f32{ 0.0, -0.1, -0.4, -1.0, -2.0, -4.0 };
+    const k = logits.len / forward.world;
+    const per_rank = k * 8 + 8;
+    const host = try allocator.alloc(u8, per_rank * forward.world);
+    defer allocator.free(host);
+    @memset(host, 0);
+    for (0..forward.world) |rank| {
+        const rank_logits = logits[rank * k ..][0..k];
+        const base = host[rank * per_rank ..][0..per_rank];
+        for (rank_logits, 0..) |value, i| {
+            @memcpy(base[i * 4 ..][0..4], std.mem.asBytes(&value));
+            std.mem.writeInt(u32, base[k * 4 + i * 4 ..][0..4], @intCast(rank * k + i), .little);
+        }
+        const lse = sampler.partialLse(rank_logits);
+        @memcpy(base[k * 8 ..][0..4], std.mem.asBytes(&lse.max));
+        @memcpy(base[k * 8 + 4 ..][0..4], std.mem.asBytes(&lse.sum));
+    }
+    var fake_forward: forward.Forward = undefined;
+    fake_forward.head = .{ .candidates = k };
+    var e: Engine = .{
+        .gpa = allocator,
+        .f = fake_forward,
+        // top_p 0.8: the merged top 3 hold 0.83 of the mass, so the nucleus fits without the full-vocabulary fallback.
+        .rule = .{ .temperature = 1, .top_p = 0.8 },
+        .head_rows = 1,
+        .head_per_rank = per_rank,
+        .head_host = host,
+        .fallback_rows = try allocator.dupe(bool, &.{false}),
+        .fallback_log_z = try allocator.dupe(f32, &.{0}),
+        .lazy_draw = true,
+    };
+    defer e.clearMerged();
+    defer allocator.free(e.fallback_rows);
+    defer allocator.free(e.fallback_log_z);
+    for (0..32) |position| {
+        _ = try e.nucleusInfo(0);
+        var reused: [1]u32 = undefined;
+        try e.draw(0, 1, position, &reused);
+        e.clearMerged();
+        e.lazy_draw = false;
+        var merged_again: [1]u32 = undefined;
+        try e.draw(0, 1, position, &merged_again);
+        try std.testing.expectEqual(merged_again[0], reused[0]);
+        e.lazy_draw = true;
+    }
+}
+
+test "lazy draw: rows after the first rejection read lazy_undrawn" {
+    const allocator = std.testing.allocator;
+    const rows = 3;
+    const per_rank = rows * 8;
+    const host = try allocator.alloc(u8, per_rank * forward.world);
+    defer allocator.free(host);
+    @memset(host, 0);
+    const ids_by_row = [_]u32{ 11, 77440 + 9, 77440 + 1 };
+    for (0..forward.world) |rank| {
+        const base = host[rank * per_rank ..][0..per_rank];
+        for (0..rows) |row| {
+            const value: f32 = if (rank == 0) 1.0 else 3.0;
+            @memcpy(base[row * 4 ..][0..4], std.mem.asBytes(&value));
+            const id: u32 = if (rank == 0) @as(u32, @intCast(row + 20)) else ids_by_row[row];
+            std.mem.writeInt(u32, base[rows * 4 + row * 4 ..][0..4], id, .little);
+        }
+    }
+    var fake_forward: forward.Forward = undefined;
+    fake_forward.head = .greedy;
+    var e: Engine = .{ .gpa = allocator, .f = fake_forward, .head_rows = rows, .head_per_rank = per_rank, .head_host = host };
+    var out: [rows]u32 = undefined;
+    try e.drawUntilReject(&.{ 1, 11, 3 }, 40, &out);
+    try std.testing.expectEqualSlices(u32, &.{ 11, 77440 + 9, lazy_undrawn }, &out);
+    try e.drawUntilReject(&.{ 1, 11, 77440 + 9 }, 40, &out);
+    try std.testing.expectEqualSlices(u32, &.{ 11, 77440 + 9, 77440 + 1 }, &out);
+}
+
+test "engine draw uses the full vocabulary for any temperature with top_k 0" {
+    const allocator = std.testing.allocator;
+    const logits = [_]f32{ 0.0, -0.1, -0.4, -1.0, -2.0, -4.0 };
+    const k: usize = 2;
+    const per_rank = k * 8 + 8;
+    const host = try allocator.alloc(u8, per_rank * forward.world);
+    defer allocator.free(host);
+    @memset(host, 0);
+    for (0..forward.world) |rank| {
+        const rank_logits = logits[rank * 3 ..][0..3];
+        const candidates = try sampler.topCandidatesRef(allocator, rank_logits, @intCast(rank * 3), k);
+        defer allocator.free(candidates);
+        const base = host[rank * per_rank ..][0..per_rank];
+        for (candidates, 0..) |candidate, i| {
+            @memcpy(base[i * 4 ..][0..4], std.mem.asBytes(&candidate.value));
+            std.mem.writeInt(u32, base[k * 4 + i * 4 ..][0..4], candidate.id, .little);
+        }
+    }
+    var full: [logits.len]sampler.Candidate = undefined;
+    for (logits, 0..) |value, id| full[id] = .{ .value = value, .id = @intCast(id) };
+    const fallback_logits = try allocator.dupe(f32, &logits);
+    defer allocator.free(fallback_logits);
+    var fake_forward: forward.Forward = undefined;
+    fake_forward.head = .{ .candidates = k };
+    const rules = [_]sampler.Sampling{
+        .{ .temperature = 0.2, .top_p = 0.95 },
+        .{ .temperature = 0.2, .top_p = 1 },
+        .{ .temperature = 1.5, .top_p = 0.95 },
+        .{ .temperature = 1, .top_p = 1 },
+    };
+    for (rules) |rule| for (0..32) |position| {
+        var e: Engine = .{
+            .gpa = allocator,
+            .f = fake_forward,
+            .seed = 19,
+            .rule = rule,
+            .head_rows = 1,
+            .head_per_rank = per_rank,
+            .head_host = host,
+            .fallback_logits_host = fallback_logits,
+            .fallback_rows = try allocator.dupe(bool, &.{true}),
+            .fallback_log_z = try allocator.dupe(f32, &.{std.math.nan(f32)}),
+            .fallback_vocab = logits.len,
+        };
+        defer allocator.free(e.fallback_rows);
+        defer allocator.free(e.fallback_log_z);
+        var actual: [1]u32 = undefined;
+        try e.draw(0, 1, position, &actual);
+        try std.testing.expectEqual(try sampler.drawCandidates(allocator, &full, 19, position, rule), actual[0]);
+    };
 }
 
 pub fn greedyRow(head_host: []const u8, per: usize, n: usize, r: usize) ?sampler.Candidate {

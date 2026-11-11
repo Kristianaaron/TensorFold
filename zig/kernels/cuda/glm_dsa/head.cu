@@ -164,6 +164,103 @@ extern "C" __global__ void tf_glm53_cand_part_f32(const float* x, unsigned vocab
     tf_glm53_cand_part_f32_task(x, vocab, offset, k, scratch, smem);
 }
 
+__device__ __forceinline__ void tf_glm53_cand_part_fast_f32_task(const float* x, unsigned vocab, unsigned offset, unsigned k,
+                                                   unsigned long long* scratch, char* smem) {
+    const unsigned row = TF_VBID.x, part = TF_VBID.y, t = threadIdx.x;
+    if (k > 2048 || k == 0) return;
+    const unsigned begin = (unsigned long long)vocab * part / 32;
+    const unsigned end = (unsigned long long)vocab * (part + 1) / 32;
+    const unsigned local_want = min(k, (unsigned)(end - begin));
+    unsigned* hist = reinterpret_cast<unsigned*>(smem);
+    unsigned* scan = hist + 256;
+    unsigned* tmp = scan + 256;
+    unsigned long long* selected = reinterpret_cast<unsigned long long*>(tmp + 256);
+    unsigned long long* scalars = selected + 2048;
+    unsigned long long& prefix = scalars[0];
+    unsigned* state = reinterpret_cast<unsigned*>(scalars + 1);
+    unsigned& target = state[0];
+    unsigned& want = state[1];
+    unsigned& chosen = state[2];
+    unsigned& count = state[3];
+    unsigned& valid = state[4];
+    for (unsigned i = t; i < 2048; i += TF_VBDIM.x) selected[i] = ~0ull;
+    if (t == 0) { prefix = 0; target = local_want - 1; want = local_want; valid = 1; }
+    TF_TASK_SYNC();
+    for (unsigned pass = 0; pass < 8; ++pass) {
+        const unsigned long long mask = pass == 0 ? 0ull : (~0ull << (64 - pass * 8));
+        if (t < 256) hist[t] = 0;
+        TF_TASK_SYNC();
+        const unsigned shift = 56 - pass * 8;
+        for (unsigned i = begin + t; i < end; i += TF_VBDIM.x) {
+            const float v = x[(size_t)row * vocab + i];
+            if (isnan(v)) continue;
+            const unsigned long long key = candidate_key(v, offset + i);
+            if ((key & mask) == prefix) atomicAdd(&hist[(key >> shift) & 255], 1u);
+        }
+        TF_TASK_SYNC();
+        if (t < 256) scan[t] = hist[t];
+        TF_TASK_SYNC();
+        for (unsigned step = 1; step < 256; step <<= 1) {
+            if (t < 256) tmp[t] = scan[t] + (t >= step ? scan[t - step] : 0);
+            TF_TASK_SYNC();
+            if (t < 256) scan[t] = tmp[t];
+            TF_TASK_SYNC();
+        }
+        if (pass == 0 && t == 0) { want = min(local_want, scan[255]); target = want ? want - 1 : 0; valid = want != 0; }
+        TF_TASK_SYNC();
+        if (valid) {
+            if (t == 0) chosen = 256;
+            TF_TASK_SYNC();
+            if (t < 256 && scan[t] > target && (t == 0 || scan[t - 1] <= target)) atomicMin(&chosen, t);
+            TF_TASK_SYNC();
+            if (t == 0) {
+                const unsigned before = chosen == 0 ? 0 : scan[chosen - 1];
+                const unsigned bucket = scan[chosen] - before;
+                target -= before;
+                prefix |= (unsigned long long)chosen << shift;
+                if (bucket == 1) { if (shift != 0) prefix |= (1ull << shift) - 1; valid = 2; }
+            }
+            TF_TASK_SYNC();
+            if (valid == 2) break;
+        }
+    }
+    if (t == 0) count = 0;
+    TF_TASK_SYNC();
+    for (unsigned i = begin + t; i < end; i += TF_VBDIM.x) {
+        const float v = x[(size_t)row * vocab + i];
+        if (isnan(v)) continue;
+        const unsigned long long key = candidate_key(v, offset + i);
+        if (key <= prefix) {
+            const unsigned slot = atomicAdd(&count, 1u);
+            if (slot < local_want) selected[slot] = key;
+        }
+    }
+    TF_TASK_SYNC();
+    unsigned sort_n = 2;
+    while (sort_n < local_want) sort_n <<= 1;
+    for (unsigned width = 2; width <= sort_n; width <<= 1) {
+        for (unsigned stride = width >> 1; stride; stride >>= 1) {
+            for (unsigned i = t; i < sort_n; i += TF_VBDIM.x) {
+                const unsigned partner = i ^ stride;
+                if (partner > i) {
+                    const bool ascending = (i & width) == 0;
+                    const unsigned long long a = selected[i], b = selected[partner];
+                    if ((ascending && a > b) || (!ascending && a < b)) selected[i] = b, selected[partner] = a;
+                }
+            }
+            TF_TASK_SYNC();
+        }
+    }
+    for (unsigned i = t; i < local_want; i += TF_VBDIM.x) scratch[((size_t)row * 32 + part) * k + i] = selected[i];
+}
+
+extern "C" __global__ void tf_glm53_cand_part_fast_f32(const float* x, unsigned vocab, unsigned offset, unsigned k,
+                                                   unsigned long long* scratch) {
+    TF_VBLOCK_ENTER();
+    extern __shared__ __align__(16) char smem[];
+    tf_glm53_cand_part_fast_f32_task(x, vocab, offset, k, scratch, smem);
+}
+
 // Stage two: rank each retained local key by counting smaller keys in the 32
 // sorted lists. Unique token ids make ranks unique; output ranks below k are exact.
 __device__ __forceinline__ void tf_glm53_cand_merge_f32_task(const unsigned long long* scratch, unsigned vocab, unsigned k,
@@ -217,6 +314,185 @@ extern "C" __global__ void tf_glm53_cand_merge_f32(const unsigned long long* scr
     TF_VBLOCK_ENTER();
     extern __shared__ __align__(16) char smem[];
     tf_glm53_cand_merge_f32_task(scratch, vocab, k, values, ids, smem);
+}
+
+// TF_GLM53_CAND_V2=1. 4,096 bins of the top 12 key bits; select keeps up to 4,096 keys a row in shared memory.
+// Dynamic shared memory of tf_glm53_cand2_select_f32 (sampler.zig cand2_select_smem): keys[4096] u64 (bins[4096]
+// u32 alias its first half until the threshold bin is known), hist/scan/tmp[256] u32, one u64 and eight u32.
+__device__ __forceinline__ unsigned cand2_bin(unsigned long long key) { return static_cast<unsigned>(key >> 52); }
+
+extern "C" __global__ void tf_glm53_cand2_fill_f32(float* values, unsigned* ids, unsigned count, unsigned* hist,
+                                                     unsigned hist_count) {
+    TF_VBLOCK_ENTER();
+    const unsigned i = TF_VBID.x * TF_VBDIM.x + threadIdx.x;
+    if (i < count) values[i] = -CUDART_INF_F, ids[i] = 0xffffffffu;
+    if (i < hist_count) hist[i] = 0;
+}
+
+extern "C" __global__ void __launch_bounds__(256) tf_glm53_cand2_hist_f32(const float* x, unsigned vocab,
+                                                                             unsigned offset, unsigned* hist) {
+    TF_VBLOCK_ENTER();
+    __shared__ unsigned bins[4096];
+    const unsigned row = TF_VBID.x, part = TF_VBID.y, t = threadIdx.x;
+    for (unsigned i = t; i < 4096; i += TF_VBDIM.x) bins[i] = 0;
+    TF_TASK_SYNC();
+    const unsigned begin = (unsigned long long)vocab * part / 32;
+    const unsigned end = (unsigned long long)vocab * (part + 1) / 32;
+    for (unsigned i = begin + t; i < end; i += TF_VBDIM.x) {
+        const float v = x[(size_t)row * vocab + i];
+        if (isnan(v)) continue;
+        atomicAdd(&bins[cand2_bin(candidate_key(v, offset + i))], 1u);
+    }
+    TF_TASK_SYNC();
+    for (unsigned i = t; i < 4096; i += TF_VBDIM.x) if (bins[i] != 0) atomicAdd(&hist[(size_t)row * 4096 + i], bins[i]);
+}
+
+extern "C" __global__ void __launch_bounds__(1024) tf_glm53_cand2_select_f32(const float* x, unsigned vocab,
+        unsigned offset, unsigned k, const unsigned* hist_in, float* values, unsigned* ids) {
+    TF_VBLOCK_ENTER();
+    extern __shared__ __align__(16) char smem[];
+    const unsigned row = TF_VBID.x, t = threadIdx.x;
+    if (TF_VBDIM.x != 1024) __trap();
+    if (k > 2048 || k == 0) return;
+    unsigned long long* keys = reinterpret_cast<unsigned long long*>(smem);
+    unsigned* bins = reinterpret_cast<unsigned*>(smem);
+    unsigned* hist = reinterpret_cast<unsigned*>(smem + 4096 * 8);
+    unsigned* scan = hist + 256;
+    unsigned* tmp = scan + 256;
+    unsigned long long* scalars = reinterpret_cast<unsigned long long*>(tmp + 256);
+    unsigned long long& prefix = scalars[0];
+    unsigned* st = reinterpret_cast<unsigned*>(scalars + 1);
+    unsigned& total = st[0];
+    unsigned& bucket = st[1];
+    unsigned& upto = st[2];
+    unsigned& count = st[3];
+    unsigned& target = st[4];
+    unsigned& chosen = st[5];
+    unsigned& done = st[6];
+    for (unsigned i = t; i < 4096; i += 1024) bins[i] = hist_in[(size_t)row * 4096 + i];
+    TF_TASK_SYNC();
+    unsigned own[4];
+    unsigned mine = 0;
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j) { own[j] = bins[4 * t + j]; mine += own[j]; }
+    const unsigned lane = t & 31, warp = t >> 5;
+    unsigned inc = mine;
+#pragma unroll
+    for (unsigned o = 1; o < 32; o <<= 1) {
+        const unsigned up = __shfl_up_sync(0xffffffffu, inc, o);
+        if (lane >= o) inc += up;
+    }
+    if (lane == 31) tmp[warp] = inc;
+    TF_TASK_SYNC();
+    if (warp == 0) {
+        const unsigned wt = tmp[lane];
+        unsigned winc = wt;
+#pragma unroll
+        for (unsigned o = 1; o < 32; o <<= 1) {
+            const unsigned up = __shfl_up_sync(0xffffffffu, winc, o);
+            if (lane >= o) winc += up;
+        }
+        tmp[32 + lane] = winc - wt;
+        if (lane == 31) total = winc;
+    }
+    TF_TASK_SYNC();
+    const unsigned want = min(k, total);
+    if (want == 0) return;
+    unsigned before = tmp[32 + warp] + inc - mine;
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j) {
+        if (own[j] != 0 && before < want && before + own[j] >= want) { bucket = 4 * t + j; upto = before + own[j]; }
+        before += own[j];
+    }
+    TF_TASK_SYNC();
+    const unsigned b = bucket;
+    const unsigned n_keys = upto;
+    unsigned sort_n = 2;
+    if (n_keys <= 4096) {
+        while (sort_n < n_keys) sort_n <<= 1;
+        for (unsigned i = t; i < sort_n; i += 1024) keys[i] = ~0ull;
+        if (t == 0) count = 0;
+        TF_TASK_SYNC();
+        for (unsigned i = t; i < vocab; i += 1024) {
+            const float v = x[(size_t)row * vocab + i];
+            if (isnan(v)) continue;
+            const unsigned long long key = candidate_key(v, offset + i);
+            if (cand2_bin(key) <= b) {
+                const unsigned slot = atomicAdd(&count, 1u);
+                if (slot < 4096) keys[slot] = key;
+            }
+        }
+        TF_TASK_SYNC();
+    } else {
+        if (t == 0) { prefix = 0; target = want - 1; done = 0; }
+        TF_TASK_SYNC();
+        for (unsigned pass = 0; pass < 8; ++pass) {
+            const unsigned long long mask = pass == 0 ? 0ull : (~0ull << (64 - pass * 8));
+            if (t < 256) hist[t] = 0;
+            TF_TASK_SYNC();
+            const unsigned shift = 56 - pass * 8;
+            for (unsigned i = t; i < vocab; i += 1024) {
+                const float v = x[(size_t)row * vocab + i];
+                if (isnan(v)) continue;
+                const unsigned long long key = candidate_key(v, offset + i);
+                if ((key & mask) == prefix) atomicAdd(&hist[(key >> shift) & 255], 1u);
+            }
+            TF_TASK_SYNC();
+            if (t < 256) scan[t] = hist[t];
+            TF_TASK_SYNC();
+            for (unsigned step = 1; step < 256; step <<= 1) {
+                if (t < 256) tmp[t] = scan[t] + (t >= step ? scan[t - step] : 0);
+                TF_TASK_SYNC();
+                if (t < 256) scan[t] = tmp[t];
+                TF_TASK_SYNC();
+            }
+            if (t == 0) chosen = 256;
+            TF_TASK_SYNC();
+            if (t < 256 && scan[t] > target && (t == 0 || scan[t - 1] <= target)) atomicMin(&chosen, t);
+            TF_TASK_SYNC();
+            if (t == 0) {
+                const unsigned below = chosen == 0 ? 0 : scan[chosen - 1];
+                const unsigned in_bucket = scan[chosen] - below;
+                target -= below;
+                prefix |= (unsigned long long)chosen << shift;
+                if (in_bucket == 1) { if (shift != 0) prefix |= (1ull << shift) - 1; done = 1; }
+            }
+            TF_TASK_SYNC();
+            if (done) break;
+        }
+        while (sort_n < want) sort_n <<= 1;
+        for (unsigned i = t; i < sort_n; i += 1024) keys[i] = ~0ull;
+        if (t == 0) count = 0;
+        TF_TASK_SYNC();
+        const unsigned long long limit = prefix;
+        for (unsigned i = t; i < vocab; i += 1024) {
+            const float v = x[(size_t)row * vocab + i];
+            if (isnan(v)) continue;
+            const unsigned long long key = candidate_key(v, offset + i);
+            if (key <= limit) {
+                const unsigned slot = atomicAdd(&count, 1u);
+                if (slot < want) keys[slot] = key;
+            }
+        }
+        TF_TASK_SYNC();
+    }
+    for (unsigned width = 2; width <= sort_n; width <<= 1) {
+        for (unsigned stride = width >> 1; stride; stride >>= 1) {
+            for (unsigned i = t; i < sort_n; i += 1024) {
+                const unsigned partner = i ^ stride;
+                if (partner > i) {
+                    const bool ascending = (i & width) == 0;
+                    const unsigned long long a = keys[i], c = keys[partner];
+                    if ((ascending && a > c) || (!ascending && a < c)) keys[i] = c, keys[partner] = a;
+                }
+            }
+            TF_TASK_SYNC();
+        }
+    }
+    for (unsigned i = t; i < want; i += 1024) {
+        values[(size_t)row * k + i] = candidate_value(keys[i]);
+        ids[(size_t)row * k + i] = static_cast<unsigned>(keys[i]);
+    }
 }
 
 // Stable fp32 local LSE partial [max,sum], merged across ranks in sampler.zig.

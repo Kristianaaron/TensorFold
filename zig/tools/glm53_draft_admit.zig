@@ -46,7 +46,8 @@ pub const Verdict = struct { available: u64, pass: bool, allocated: bool };
 pub fn admit(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, stream: cuda.Stream, dir: []const u8, rank: usize, bits: u8, streams: usize, available: u64, floor: u64, meminfo: *const fn (std.mem.Allocator, std.Io) ?u64, head: ?cuda.qmmf.Weight) !Verdict {
     const share_scratch = drafts.shareScratchEnabled();
     if (bits != 4) return error.DrafterBitsUnsupported; // the loader packs 4 bits or keeps bf16 (bits 0), no 8-bit path
-    const geometry = try drafts.checkConfig(gpa, io, dir);
+    var geometry = try drafts.checkConfig(gpa, io, dir);
+    geometry.down4 = drafts.draftDown4Switch();
     const plan = try drafts.memoryPlan(geometry, bits, 2, streams);
     const transient = if (head != null) @max(loaderTransientBytes(geometry, bits), drafts.packerTransientBytes(geometry, 2)) else loaderTransientBytes(geometry, bits);
     std.debug.print("DRAFTER plan ({d}-bit, {d} stream(s)): weights {d:.3} draft_head {d:.3} scratch {d:.3} rings {d:.3} device {d:.3} GiB; host {d:.3} GiB; loader transient {d:.3} GiB\n", .{ bits, streams, g(plan.weights), g(plan.draft_head), g(plan.scratch), g(plan.rings), g(plan.deviceBytes()), g(plan.hostBytes()), g(transient) });

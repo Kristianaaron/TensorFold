@@ -20,6 +20,7 @@ const state = @import("state.zig");
 const prefill_gemm = @import("prefill_gemm");
 const types = @import("types");
 const ablate_mod = @import("ablate");
+pub const l2pf_mod = @import("l2pf.zig");
 pub const taps_mod = @import("taps.zig");
 
 pub const hidden = state.hidden;
@@ -44,6 +45,11 @@ pub fn collFusePartialPlan(rank: usize, block_bytes: usize) struct { send: usize
     const pair = (world + 1) * block_bytes;
     return .{ .send = peer_rank * block_bytes, .pair = pair, .peer = pair + peer_rank * block_bytes, .need = (world + 3) * block_bytes };
 }
+
+pub fn partialRoceSwitch() bool {
+    const value = std.c.getenv("TF_GLM53_PARTIAL_ROCE") orelse return false;
+    return std.mem.eql(u8, std.mem.span(value), "1");
+}
 pub const rms_eps: f32 = 1e-5;
 pub const index_eps: f32 = 1e-6;
 pub const rope_theta: f64 = 8e6;
@@ -59,6 +65,7 @@ pub const Glue = struct {
     router_part: cuda.Function,
     router_tile: cuda.Function,
     topk: cuda.Function,
+    topk_compact: cuda.Function,
     slice_sum: cuda.Function,
 
     pub fn load(m: cuda.Module) !Glue {
@@ -104,6 +111,10 @@ pub const Kernels = struct {
     glue: Glue,
     glue53: moe.Kernels,
     residual_rmsnorm_6144: cuda.Function,
+    /// TF_GLM53_ADD_NORM_FUSE=1 only (loadAddNormFuse at setup); null otherwise.
+    moe_residual_rmsnorm_6144: ?cuda.Function = null,
+    /// TF_GLM53_QA_SHARD=1 only (loadQaShard at setup).
+    rmsnorm_2048_halves: ?cuda.Function = null,
     ablate: ?cuda.Function = null,
     swiglu_plain: cuda.Function,
     mla: mla.Mla,
@@ -111,8 +122,9 @@ pub const Kernels = struct {
     head: sampler.Head,
     lane: *const cuda.qmmf.Lane,
     experts: *const cuda.exl3_experts.Experts,
-    /// TF_GLM53_PREFILL_W8A8=1: the W8A8 o_proj kernels (cuda.w8a8, glm53_w8a8 image), set at setup; null otherwise.
+    /// TF_GLM53_PREFILL_W8A8=1 or =2: the W8A8 kernels (cuda.w8a8, glm53_w8a8 image), set at setup; null otherwise.
     w8a8: ?cuda.w8a8.Fns = null,
+    qmmf_var: ?*const cuda.qmmf.VariantFns = null,
 
     pub const Modules = struct { glm_glue: cuda.Module, glm53_glue: cuda.Module, glm53_mla: cuda.Module, glm53_index: cuda.Module, glm53_head: cuda.Module };
 
@@ -130,14 +142,49 @@ pub const Kernels = struct {
         };
     }
 
+    /// Resolve the optional MoE residual plus next-layer norm kernel when selected at setup.
+    pub fn loadAddNormFuse(k: *Kernels, glm53_glue: cuda.Module) !void {
+        k.moe_residual_rmsnorm_6144 = glm53_glue.function("tf_glm53_moe_residual_rmsnorm_6144") catch return error.MissingAddNormFuseKernel;
+    }
+
+    /// TF_GLM53_QA_SHARD=1: resolve tf_glm53_rmsnorm_2048_halves in glm53_glue (setup calls it only with the switch on).
+    pub fn loadQaShard(k: *Kernels, glm53_glue: cuda.Module) !void {
+        k.rmsnorm_2048_halves = glm53_glue.function("tf_glm53_rmsnorm_2048_halves") catch return error.MissingQaShardKernel;
+    }
+
+    /// TF_GLM53_QA_SHARD=1 q_a_norm: x0 / x1 are rank 0's and rank 1's [rows][half_stride] halves (bit-identical to
+    /// glue.rmsnorm at width 2048 on the assembled rows).
+    pub fn rmsnorm2048Halves(k: *const Kernels, stream: cuda.Stream, x0: u64, x1: u64, half_stride: usize, w: u64, out: u64, o_stride: usize, rows: usize, eps: f32) !void {
+        if (rows == 0) return;
+        const norm = k.rmsnorm_2048_halves orelse return error.MissingQaShardKernel;
+        var a: cuda.Args = .{};
+        inline for (.{ x0, x1, @as(i64, @intCast(half_stride)), w, out, @as(i64, @intCast(o_stride)), eps }) |v| a.add(v);
+        try cuda.launch.launch(norm, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 128 } }, stream, &a);
+    }
+
     pub fn router(k: *const Kernels) moe.RouterKernels {
-        return .{ .router_part = k.glue.router_part, .router_tile = k.glue.router_tile, .topk = k.glue.topk, .slice_sum = k.glue.slice_sum };
+        return .{ .router_part = k.glue.router_part, .router_tile = k.glue.router_tile, .topk = k.glue.topk, .topk_compact = k.glue.topk_compact, .slice_sum = k.glue.slice_sum };
     }
 
     pub fn mlpKernels(k: *const Kernels) mlp.Kernels {
         return .{ .linear = k.lane, .swiglu_plain = k.swiglu_plain };
     }
 };
+
+const QmmfVarShape = struct { n: usize, k: usize, out: cuda.qmmf.Out, variant: cuda.qmmf.Variant };
+const qmmf_var_shapes = [_]QmmfVarShape{
+    .{ .n = 8192, .k = 2048, .out = .bf16, .variant = .b128 },
+    .{ .n = 6144, .k = 8192, .out = .f32, .variant = .b128 },
+    .{ .n = 2048, .k = 6144, .out = .bf16, .variant = .b128 },
+    .{ .n = 6144, .k = 1024, .out = .f32, .variant = .b128 },
+};
+
+fn qmmfVariantFor(w: cuda.qmmf.Weight, out: cuda.qmmf.Out) cuda.qmmf.Variant {
+    for (qmmf_var_shapes) |shape| {
+        if (@as(usize, w.n) == shape.n and @as(usize, w.k) == shape.k and out == shape.out) return shape.variant;
+    }
+    return .release;
+}
 
 /// The exchanges of one forward step, by what they carry.
 pub const Phase = enum { embed, stage_fetch, index_candidates, absorbed_query, shard_qkv_a, attention_partial, attention_output, moe_partial, head };
@@ -155,6 +202,21 @@ pub const QueryPairLayout = struct {
         return rank * layout.rank_bytes;
     }
 };
+
+const AttendGroupBases = struct { qa: u64, qpe: u64, partial: u64, split: u64 };
+
+fn attendGroupBases(ws: *const state.Workspace, group: usize, rows: usize, qa_bytes: usize, qpe_bytes: usize, q_one_gather: bool) AttendGroupBases {
+    const layout = QueryPairLayout.init(qa_bytes, qpe_bytes);
+    const query_base = if (q_one_gather) ws.fused_queries + layout.rankBase(group) else 0;
+    const partial_group_bytes = rows * state.decode_partial_row_bytes;
+    const split_group_bytes = rows * mla.decode_splits * 32 * (mla.latent_dim + 2) * 4;
+    return .{
+        .qa = if (q_one_gather) query_base + layout.qa else ws.qa + group * qa_bytes,
+        .qpe = if (q_one_gather) query_base + layout.qpe else ws.qpe + group * qpe_bytes,
+        .partial = ws.part + group * partial_group_bytes,
+        .split = ws.attend_split + group * split_group_bytes,
+    };
+}
 
 /// Host reference for the byte layout used by the decode staging gather.
 pub fn packQueryPairBytes(dst: []u8, qa: []const u8, qpe: []const u8) !void {
@@ -323,6 +385,12 @@ pub fn shardQkvASwitch() bool {
     return std.mem.eql(u8, std.mem.span(value), "1");
 }
 
+/// TF_GLM53_QA_SHARD: only the exact value "1" enables it. native.zig and the bring-up tool read it once.
+pub fn qaShardSwitch() bool {
+    const value = std.c.getenv("TF_GLM53_QA_SHARD") orelse return false;
+    return std.mem.eql(u8, std.mem.span(value), "1");
+}
+
 pub fn tboSelected(value: ?[]const u8) bool {
     const raw = value orelse return false;
     return std.mem.eql(u8, raw, "1");
@@ -355,6 +423,25 @@ pub fn piecePipeSwitch() bool {
 pub fn moePipeSwitch() bool {
     const value = std.c.getenv("TF_GLM53_MOE_PIPE") orelse return false;
     return std.mem.eql(u8, std.mem.span(value), "1");
+}
+
+pub fn parseGatherOvl(value: ?[]const u8) !u8 {
+    const raw = value orelse return 0;
+    if (std.mem.eql(u8, raw, "0")) return 0;
+    if (std.mem.eql(u8, raw, "1")) return 1;
+    return error.BadGatherOvl;
+}
+
+pub fn moeRingSelected(value: ?[]const u8) !u8 {
+    var ring: u8 = 2;
+    if (value) |raw| ring = std.fmt.parseInt(u8, raw, 10) catch return error.BadMoeRing;
+    if (ring < 2 or ring > state.Workspace.max_moe_pipe_ring_slots) return error.BadMoeRing;
+    return ring;
+}
+
+pub fn moeRingSwitch() !u8 {
+    const value = std.c.getenv("TF_GLM53_MOE_RING") orelse return 2;
+    return moeRingSelected(std.mem.span(value));
 }
 
 pub fn wsTrimSwitch() bool {
@@ -391,7 +478,7 @@ pub fn attnPipeSelected(value: ?[]const u8) bool {
     return if (value) |v| std.mem.eql(u8, v, "1") else false;
 }
 
-pub const PipeOp = enum { attention, reduce_issue, reduce_finish, ffn_pre, routed_group };
+pub const PipeOp = enum { attention, reduce_issue, reduce_finish, ffn_pre, ffn_route, ffn_shared, routed_group };
 
 pub const IndexPipeOp = struct { kind: enum { score, ready, gather, merge_wait, merge }, block: u16 = 0 };
 
@@ -411,9 +498,10 @@ pub fn indexPipeSchedule(blocks: usize, out: []IndexPipeOp) !usize {
 }
 
 /// Host-side order model for the grouped prefill schedule; used to guard the required overlap and flush point.
-pub fn piecePipeSchedule(enabled: bool, pieces: usize, out: []PipeOp) !usize {
+pub fn piecePipeSchedule(enabled: bool, gather_ovl: u8, pieces: usize, out: []PipeOp) !usize {
     var at: usize = 0;
-    const needed = if (enabled) pieces * 4 + 1 else pieces * 2 + 1;
+    const extra_shared = if (enabled and gather_ovl != 0 and pieces != 0) pieces - 1 else 0;
+    const needed = if (enabled) pieces * 4 + 1 + extra_shared else pieces * 2 + 1;
     if (out.len < needed) return error.ScheduleBufferTooSmall;
     for (0..pieces) |_| {
         out[at] = .attention;
@@ -423,7 +511,7 @@ pub fn piecePipeSchedule(enabled: bool, pieces: usize, out: []PipeOp) !usize {
             at += 1;
             if (at > 2) {
                 out[at] = .reduce_finish;
-                out[at + 1] = .ffn_pre;
+                out[at + 1] = if (gather_ovl == 0) .ffn_pre else .ffn_route;
                 at += 2;
             }
         } else {
@@ -432,6 +520,10 @@ pub fn piecePipeSchedule(enabled: bool, pieces: usize, out: []PipeOp) !usize {
         }
     }
     if (enabled and pieces != 0) {
+        if (gather_ovl != 0) for (1..pieces) |_| {
+            out[at] = .ffn_shared;
+            at += 1;
+        };
         out[at] = .reduce_finish;
         out[at + 1] = .ffn_pre;
         at += 2;
@@ -441,17 +533,23 @@ pub fn piecePipeSchedule(enabled: bool, pieces: usize, out: []PipeOp) !usize {
 }
 
 test "piece pipe issues next attention before finishing prior piece and flushes before routed group" {
-    var ops: [13]PipeOp = undefined;
-    const n = try piecePipeSchedule(true, 3, &ops);
+    var ops: [15]PipeOp = undefined;
+    const n = try piecePipeSchedule(true, 0, 3, &ops);
     const attention_next = 1 + std.mem.indexOfScalar(PipeOp, ops[1..n], .attention).?;
     const first_finish = std.mem.indexOfScalar(PipeOp, ops[0..n], .reduce_finish).?;
     const first_pre = std.mem.indexOfScalar(PipeOp, ops[0..n], .ffn_pre).?;
     const routed = std.mem.indexOfScalar(PipeOp, ops[0..n], .routed_group).?;
     try std.testing.expect(attention_next < first_finish and first_finish < first_pre);
     try std.testing.expect(ops[routed - 2] == .reduce_finish and ops[routed - 1] == .ffn_pre);
+    const gather_ovl_expected = [_]PipeOp{ .attention, .reduce_issue, .attention, .reduce_issue, .reduce_finish, .ffn_route, .attention, .reduce_issue, .reduce_finish, .ffn_route, .ffn_shared, .ffn_shared, .reduce_finish, .ffn_pre, .routed_group };
+    const gather_ovl_n = try piecePipeSchedule(true, 1, 3, &ops);
+    try std.testing.expectEqualSlices(PipeOp, &gather_ovl_expected, ops[0..gather_ovl_n]);
     var off: [7]PipeOp = undefined;
-    const off_n = try piecePipeSchedule(false, 3, &off);
+    const off_n = try piecePipeSchedule(false, 0, 3, &off);
     try std.testing.expectEqualSlices(PipeOp, &.{ .attention, .ffn_pre, .attention, .ffn_pre, .attention, .ffn_pre, .routed_group }, off[0..off_n]);
+    var off_gather_ovl: [7]PipeOp = undefined;
+    const off_gather_ovl_n = try piecePipeSchedule(false, 1, 3, &off_gather_ovl);
+    try std.testing.expectEqualSlices(PipeOp, off[0..off_n], off_gather_ovl[0..off_gather_ovl_n]);
 }
 
 test "index pipe queues gathers in rank order and merges only after every gather" {
@@ -521,6 +619,15 @@ test "MoE pipe waits on slot reuse and piece completion before next attention an
     var off: [9]MoePipeOp = undefined;
     const off_n = try moePipeSchedule(false, 3, &off);
     try std.testing.expectEqualSlices(MoePipeOp, &.{ .block_post, .reduce_finish, .block_post, .reduce_finish, .block_post, .reduce_finish, .routed_group, .taps, .final_norm }, off[0..off_n]);
+}
+
+test "MoE ring selection defaults to two and accepts only sizes two through eight" {
+    try std.testing.expectEqual(@as(u8, 2), try moeRingSelected(null));
+    try std.testing.expectEqual(@as(u8, 2), try moeRingSelected("2"));
+    try std.testing.expectEqual(@as(u8, 8), try moeRingSelected("8"));
+    try std.testing.expectError(error.BadMoeRing, moeRingSelected("1"));
+    try std.testing.expectError(error.BadMoeRing, moeRingSelected("9"));
+    try std.testing.expectError(error.BadMoeRing, moeRingSelected("x"));
 }
 
 pub const TboOp = enum { compute_piece, collective_piece, consume_piece, compute_a, ready_a, collective_a, compute_b, ready_b, collective_b, wait_a, consume_a, wait_b, consume_b };
@@ -840,6 +947,7 @@ pub const ExchangePlan = struct {
 
 pub const Bytes = struct {
     pub const embed_row = hidden * 2;
+    pub const q_a_half_row = 1024 * 2;
     pub const absorbed_query_row = state.local_heads * (mla.latent_dim + mla.rope_dim) * 2;
     pub const attention_partial_row = state.decode_partial_row_bytes;
     pub const reduce_row = hidden * 4;
@@ -863,6 +971,9 @@ pub const StepShape = struct {
     rank: usize = 0,
     /// Models the opt-in decode plan for host collective-count assertions.
     coll_fuse: bool = false,
+    q_one_gather: bool = false,
+    partial_roce: bool = false,
+    qa_shard: bool = false,
 };
 
 /// Rows that select from the indexer (position >= 2048).
@@ -917,7 +1028,8 @@ pub fn plan(s: StepShape) !ExchangePlan {
     p.entries[@backingInt(Phase.index_candidates)].when = "full layers with sparse rows: packed local top-2048 {score, position} per score block";
     p.entries[@backingInt(Phase.absorbed_query)].when = "decode: qa [world][R][32][512] and q_pe [world][R][32][64]";
     p.entries[@backingInt(Phase.shard_qkv_a)].when = "prefill and decode: packed per-rank q_a and kv_a rows";
-    p.entries[@backingInt(Phase.attention_partial)] = .{ .phase = .attention_partial, .all_gather = s.mode == .decode and s.coll_fuse, .when = if (s.mode == .decode and s.coll_fuse) "decode: one-shot rank gather of bf16 partials [R][32][512] + fp32 LSE [R][32]" else "decode: peer-only bf16 partials [R][32] + fp32 LSE [R][32]" };
+    const partial_gather = s.mode == .decode and (s.coll_fuse or s.partial_roce);
+    p.entries[@backingInt(Phase.attention_partial)] = .{ .phase = .attention_partial, .all_gather = partial_gather, .when = if (partial_gather) "decode: one-shot rank gather of bf16 partials [R][32][512] + fp32 LSE [R][32]" else "decode: peer-only bf16 partials [R][32] + fp32 LSE [R][32]" };
     p.entries[@backingInt(Phase.attention_output)].when = "per piece, after o_proj: fp32 rank partials, rank-order sum, residual";
     p.entries[@backingInt(Phase.moe_partial)].when = "per piece: dense MLP fp32 or MoE BF16 rank partials, rank-order sum, residual";
     p.entries[@backingInt(Phase.head)].when = "after the fp32 head: top-1 + LSE (16 B/row) or k candidates (8k B/row)";
@@ -937,6 +1049,7 @@ pub fn plan(s: StepShape) !ExchangePlan {
             const pc = pieceAt(s.mode, s.positions, s.piece_rows, at);
             const n = pc.end - pc.start;
             const pos = s.positions[pc.start..pc.end];
+            if (s.qa_shard) p.add(.shard_qkv_a, n * Bytes.q_a_half_row, 1);
             if (l.index_full and sparseIn(pos)) {
                 var b: usize = 0;
                 while (b < n) : (b += s.score_rows) {
@@ -945,7 +1058,7 @@ pub fn plan(s: StepShape) !ExchangePlan {
                 }
             }
             if (s.mode == .decode) {
-                p.add(.absorbed_query, n * Bytes.absorbed_query_row, if (s.coll_fuse) 1 else 2);
+                p.add(.absorbed_query, n * Bytes.absorbed_query_row, if (s.coll_fuse or s.q_one_gather) 1 else 2);
                 p.add(.attention_partial, n * Bytes.attention_partial_row, 1);
             }
             p.add(.attention_output, n * Bytes.reduce_row, 1);
@@ -975,6 +1088,23 @@ pub fn decodeSideSwitch() bool {
 pub fn decodeSideSelected(value: ?[]const u8) bool {
     const raw = value orelse return false;
     return !std.mem.eql(u8, raw, "0");
+}
+
+pub fn routeCompactSelected(value: ?[]const u8) bool {
+    const raw = value orelse return false;
+    return std.mem.eql(u8, raw, "1");
+}
+
+/// TF_GLM53_ADD_NORM_FUSE: only the exact value "1" enables it.
+pub fn addNormFuseSwitch() bool {
+    const value = std.c.getenv("TF_GLM53_ADD_NORM_FUSE") orelse return false;
+    return std.mem.eql(u8, std.mem.span(value), "1");
+}
+
+/// TF_GLM53_QPE_ABSORB_FUSE: only the exact value "1" enables it.
+pub fn qpeAbsorbFuseSwitch() bool {
+    const value = std.c.getenv("TF_GLM53_QPE_ABSORB_FUSE") orelse return false;
+    return std.mem.eql(u8, std.mem.span(value), "1");
 }
 
 
@@ -1024,7 +1154,7 @@ pub fn promptExpertsSelected(value: ?[]const u8) bool {
     return promptExpertsModeSelected(value) != .off;
 }
 
-/// TF_GLM53_PROMPT_MLA selects the fixed 16x8 kernel with "1" and grouped 64x64 kernel with "2".
+/// TF_GLM53_PROMPT_MLA selects the fixed 16x8 kernel ("1"), grouped 64x64 kernel ("2"), pipelined 64x64 pair ("3"), or pipelined 64x32 expand pair ("4").
 pub const PromptMlaMode = mla.PromptMlaMode;
 
 pub fn promptMlaSwitch() PromptMlaMode {
@@ -1036,6 +1166,8 @@ pub fn promptMlaSelected(value: ?[]const u8) PromptMlaMode {
     const raw = value orelse return .off;
     if (std.mem.eql(u8, raw, "1")) return .tile16;
     if (std.mem.eql(u8, raw, "2")) return .tile64;
+    if (std.mem.eql(u8, raw, "3")) return .p2;
+    if (std.mem.eql(u8, raw, "4")) return .p2n;
     return .off;
 }
 
@@ -1084,6 +1216,29 @@ pub fn decodeUnionSelected(value: ?[]const u8) bool {
     return if (value) |raw| std.mem.eql(u8, raw, "1") else false;
 }
 
+pub fn ownAttendSwitch() bool {
+    const value = std.c.getenv("TF_GLM53_OWN_ATTEND") orelse return false;
+    return ownAttendSelected(std.mem.span(value));
+}
+
+pub fn ownAttendSelected(value: ?[]const u8) bool {
+    return decodeUnionSelected(value);
+}
+
+pub fn qOneGatherSwitch() bool {
+    const value = std.c.getenv("TF_GLM53_Q_ONE_GATHER") orelse return false;
+    return qOneGatherSelected(std.mem.span(value));
+}
+
+pub fn qOneGatherSelected(value: ?[]const u8) bool {
+    return decodeUnionSelected(value);
+}
+
+pub fn draftIngestSideSwitch() bool {
+    const value = std.c.getenv("TF_GLM53_DRAFT_INGEST_SIDE") orelse return false;
+    return decodeUnionSelected(std.mem.span(value));
+}
+
 /// The wider verify attend path is opt-in; only the exact value "1" enables it.
 pub fn decodeUnion16Switch() bool {
     const value = std.c.getenv("TF_GLM53_DECODE_UNION16") orelse return false;
@@ -1108,8 +1263,33 @@ pub fn prefillW8a8Switch() bool {
     return prefillW8a8Selected(std.mem.span(value));
 }
 
+pub fn qmmfVarSwitch() !bool {
+    const value = std.c.getenv("TF_GLM53_QMMF_VAR") orelse return false;
+    const raw = std.mem.span(value);
+    if (std.mem.eql(u8, raw, "0")) return false;
+    if (std.mem.eql(u8, raw, "1")) return true;
+    return error.BadQmmfVar;
+}
+
+/// 0 is unset, "0", or any other token. 1 and 2 are the two on levels.
+pub fn prefillW8a8LevelSelected(value: ?[]const u8) u8 {
+    const raw = value orelse return 0;
+    if (std.mem.eql(u8, raw, "1")) return 1;
+    if (std.mem.eql(u8, raw, "2")) return 2;
+    return 0;
+}
+
 pub fn prefillW8a8Selected(value: ?[]const u8) bool {
-    return if (value) |raw| std.mem.eql(u8, raw, "1") else false;
+    return prefillW8a8LevelSelected(value) >= 1;
+}
+
+pub fn prefillW8a8AllSelected(value: ?[]const u8) bool {
+    return prefillW8a8LevelSelected(value) == 2;
+}
+
+pub fn prefillW8a8AllSwitch() bool {
+    const value = std.c.getenv("TF_GLM53_PREFILL_W8A8") orelse return false;
+    return prefillW8a8AllSelected(std.mem.span(value));
 }
 
 /// Native prefill stage-plane fetch overlap is opt-in until both ranks have the same communicator plan.
@@ -1168,6 +1348,21 @@ pub fn decodeMlaModeSwitch() DecodeMlaMode {
     const value = std.c.getenv("TF_GLM53_DECODE_MLA") orelse return .off;
     return decodeMlaModeSelected(std.mem.span(value));
 
+}
+
+pub fn decodeMla16Selected(value: ?[]const u8) bool {
+    return if (value) |raw| std.mem.eql(u8, raw, "1") else false;
+}
+
+pub fn decodeMla16Switch() bool {
+    const value = std.c.getenv("TF_GLM53_DECODE_MLA16") orelse return false;
+    return decodeMla16Selected(std.mem.span(value));
+}
+
+pub fn validateDecodeMla16(enabled: bool, mode: DecodeMlaMode, verify_max: usize) !void {
+    if (!enabled) return;
+    if (mode != .v3) return error.DecodeMla16NeedsDecodeMla3;
+    if (verify_max != 16) return error.DecodeMla16NeedsVerifyMax16;
 }
 
 /// Chunks are cut at absolute multiples of `chunk_rows`, so a resumed prompt cuts where a fresh one does.
@@ -1405,6 +1600,22 @@ test "attention pipe switch accepts only the exact opt-in value" {
     try std.testing.expect(!attnPipeSelected("0"));
     try std.testing.expect(attnPipeSelected("1"));
     try std.testing.expect(!attnPipeSelected("2"));
+    try std.testing.expectEqual(@as(u8, 0), try parseGatherOvl(null));
+    try std.testing.expectEqual(@as(u8, 0), try parseGatherOvl("0"));
+    try std.testing.expectEqual(@as(u8, 1), try parseGatherOvl("1"));
+    try std.testing.expectError(error.BadGatherOvl, parseGatherOvl("2"));
+}
+
+test "decode MLA 16 switch is exact and requires MLA 3 with verify max 16" {
+    try std.testing.expect(!decodeMla16Selected(null));
+    try std.testing.expect(!decodeMla16Selected("0"));
+    try std.testing.expect(!decodeMla16Selected("01"));
+    try std.testing.expect(!decodeMla16Selected("true"));
+    try std.testing.expect(decodeMla16Selected("1"));
+    try validateDecodeMla16(false, .off, 8);
+    try std.testing.expectError(error.DecodeMla16NeedsDecodeMla3, validateDecodeMla16(true, .v2, 16));
+    try std.testing.expectError(error.DecodeMla16NeedsVerifyMax16, validateDecodeMla16(true, .v3, 8));
+    try validateDecodeMla16(true, .v3, 16);
 }
 
 /// TBO design for each 512-row prefill piece (not active yet): retain the compute stream C and create communication
@@ -1417,7 +1628,7 @@ test "attention pipe switch accepts only the exact opt-in value" {
 /// keep one ordered collective stream per rank; without that, asynchronous gathers can race the shared workspace.
 
 /// WP8's routed-expert callback state: this layer's EXL3 weights and the forward's scratch.
-const Routed = struct { f: *const Forward, layer: experts.Loaded, mode: Mode = .decode };
+const Routed = struct { f: *const Forward, layer: experts.Loaded, mode: Mode = .decode, compact: bool = false };
 
 pub const Forward = struct {
     gpa: std.mem.Allocator,
@@ -1462,6 +1673,8 @@ pub const Forward = struct {
     smla_p: ?bool = null,
     /// null reads TF_GLM53_SHARD_QKV_A; setup reads it once and passes it here.
     shard_qkv_a: ?bool = null,
+    /// TF_GLM53_QA_SHARD=1, captured once at setup (Geometry.qa_shard).
+    qa_shard: bool = false,
     /// null reads TF_GLM53_SMLA_FP8; setup (native.zig, bring-up) reads it once and passes it here. Requires SMLA-P
     /// (validateSetup refuses it otherwise). Prefill attend only.
     smla_fp8: ?bool = null,
@@ -1474,9 +1687,15 @@ pub const Forward = struct {
     /// Off (the default) launches exactly what it did before.
     decode_union: bool = false,
     decode_union_rows: usize = mla.max_decode_rows,
+    decode_mla16: bool = false,
     /// TF_GLM53_PREFILL_W8A8=1, captured once at setup (Geometry.prefill_w8a8): prefill o_proj through k.w8a8.
     /// Off (the default) launches exactly what it did before the switch existed.
     prefill_w8a8: bool = false,
+    /// TF_GLM53_PREFILL_W8A8=2. Level 1 stays o_proj. This adds every other FP8B prefill projection `w8a8.serves` accepts.
+    /// Off leaves those launches on qmmf. Setup refuses it unless prefill_w8a8 is also set.
+    prefill_w8a8_all: bool = false,
+    /// TF_GLM53_QMMF_VAR=1 enables same-bit FP8B schedule variants for selected prefill shapes.
+    qmmf_var: bool = false,
     /// TF_GLM53_PRE_FUSE, captured once at setup (Geometry.pre_fuse). Off (the default) launches exactly what it did before.
     pre_fuse: PreFuse = .off,
     /// TF_GLM53_PREP_FUSE, captured once at setup (Geometry.prep_fuse). Off (the default) launches exactly what it did before.
@@ -1489,8 +1708,10 @@ pub const Forward = struct {
     piece_pipe: ?bool = null,
     /// Captured once at setup. This moves only grouped-prefill MoE reductions to the ordered comm stream.
     moe_pipe: bool = false,
+    gather_ovl: u8 = 0,
     ws_trim: bool = false,
     moe_post: bool = false,
+    moe_ep: bool = false,
     comm_prio: bool = false,
     /// Captured once at setup; 2 selects exact radix-threshold/linear index merge.
     index_merge: u8 = 0,
@@ -1502,8 +1723,20 @@ pub const Forward = struct {
     lowrank_decode: bool = true,
     /// Captured once during setup and carried in Geometry for the index MMA CTA row tile.
     index_mma_rows: usize = 4,
+    index_qs: u8 = 0,
     /// Captured once during setup and carried in Geometry; decode-only collective and query fusion.
     coll_fuse: bool = false,
+    /// TF_GLM53_ROUTE_COMPACT=1 writes side decode picks and weights in eight-slot rows.
+    route_compact: bool = false,
+    /// TF_GLM53_ADD_NORM_FUSE=1, captured once at setup (Geometry.add_norm_fuse); see addNormFused.
+    add_norm_fuse: bool = false,
+    /// TF_GLM53_QPE_ABSORB_FUSE=1, captured once at setup (Geometry.qpe_absorb_fuse).
+    qpe_absorb_fuse: bool = false,
+    /// TF_GLM53_L2PF=1: forks at sites f and n of each decode layer, joins before the head.
+    l2pf: ?*const l2pf_mod.L2pf = null,
+    own_attend: bool = false,
+    q_one_gather: bool = false,
+    partial_roce: bool = false,
     /// Set from TF_GLM53_ROW_PRUNE during native setup; tests can select the path directly.
     row_prune: ?bool = null,
 /// null uses the setup value in Geometry; tests can select the MLA decode kernels directly.
@@ -1554,11 +1787,36 @@ pub const Forward = struct {
             if (f.decode_union_rows > mla.max_decode_rows and (f.decode_union_rows > f.st.ws.decode_rows or f.st.ws.sizes.attend_split < mla.splitWorkspaceBytes(f.decode_union_rows, 2 * state.local_heads))) return error.DecodeUnionWorkspace;
         }
         if (!f.decode_union and f.decode_union_rows != mla.max_decode_rows) return error.DecodeUnion16WithoutDecodeUnion;
+        if (f.q_one_gather) {
+            if (!f.decodeMlaV3Enabled()) return error.QOneGatherNeedsDecodeMla3;
+            if (f.k.mla.attend_verify_fn == null) return error.MissingQOneGatherKernel;
+        }
+        if (f.add_norm_fuse and f.k.moe_residual_rmsnorm_6144 == null) return error.MissingAddNormFuseKernel;
+        if (f.qpe_absorb_fuse) {
+            if (!f.decodeMlaV3Enabled()) return error.QpeAbsorbFuseNeedsDecodeMla3;
+            if (f.k.mla.absorb_qpe_v3_fn == null) return error.MissingQpeAbsorbFuseKernel;
+        }
+        if (f.qa_shard) {
+            if (f.shardQkvAEnabled()) return error.QaShardWithShardQkvA;
+            if (f.k.rmsnorm_2048_halves == null) return error.MissingQaShardKernel;
+            if (f.st.ws.sizes.sh_q < @as(u64, @intCast(f.st.ws.piece_rows * Bytes.q_a_half_row))) return error.QaShardWorkspace;
+            if (f.tboEnabled()) return error.QaShardWithTbo;
+            if (f.prefill_gemms != null) return error.QaShardWithPrefillBf16;
+            if (f.prep_fuse == .split) return error.QaShardWithPrepFuseSplit;
+            for (f.w.layers) |l| {
+                if (l.attn.q_a.n != 1024) return error.QaShardWeights;
+            }
+        }
+        if (f.prefill_w8a8_all and !f.prefill_w8a8) return error.W8a8Level;
         if (f.prefill_w8a8) {
             if (f.k.w8a8 == null) return error.MissingW8a8Kernels;
             for (f.w.layers) |l| if (!cuda.w8a8.supports(l.attn.o_proj)) return error.W8a8Weight;
             const vo_width = state.local_heads * mla.value_dim;
             if (f.st.ws.sizes.part < cuda.w8a8.scratchBytes(f.st.ws.piece_rows, vo_width)) return error.W8a8Scratch;
+        }
+        if (f.prefill_w8a8_all) {
+            const need: u64 = @intCast(cuda.w8a8.scratchBytes(f.st.ws.piece_rows, cuda.w8a8.level2_k));
+            if (f.st.ws.sizes.w8a8_scratch < need) return error.W8a8Scratch;
         }
         if (f.moe_pipe and f.tboEnabled()) return error.MoePipeWithTbo;
         if (f.index_pipe and f.tboEnabled()) return error.IndexPipeWithTbo;
@@ -1605,6 +1863,7 @@ pub const Forward = struct {
                 },
             };
         }
+        const moe_ring: u8 = if (f.moe_pipe) @intCast(f.st.ws.moe_pipe_slots) else 2;
         if (f.st.adapt) |ad| {
             if (!f.promptExpertsEnabled() or f.tboEnabled()) return error.ExpertRowsAdaptNeedsPromptExperts;
             for (f.w.layers) |dl| {
@@ -1618,11 +1877,15 @@ pub const Forward = struct {
                     if (!cuda.exl3_experts.pmx.eligible(l)) return error.ExpertRowsAdaptNeedsPromptExperts;
                 } else if (f.promptExpertsWide() and !cuda.exl3_experts.prompt.eligible(l)) return error.ExpertRowsAdaptNeedsPromptExperts;
             }
-            try state.validateMoePipeGeometry(.{ .expert_rows = ad.rows, .chunk_rows = f.st.ws.rows, .piece_rows = f.st.ws.piece_rows, .decode_rows = f.st.ws.decode_rows, .moe_pipe = f.moe_pipe });
+            try state.validateMoePipeGeometry(.{ .expert_rows = ad.rows, .chunk_rows = f.st.ws.rows, .piece_rows = f.st.ws.piece_rows, .decode_rows = f.st.ws.decode_rows, .moe_pipe = f.moe_pipe, .moe_ring = moe_ring });
         } else {
-            try state.validateMoePipeGeometry(.{ .expert_rows = f.st.ws.expert_rows, .chunk_rows = f.st.ws.rows, .piece_rows = f.st.ws.piece_rows, .decode_rows = f.st.ws.decode_rows, .moe_pipe = f.moe_pipe });
+            try state.validateMoePipeGeometry(.{ .expert_rows = f.st.ws.expert_rows, .chunk_rows = f.st.ws.rows, .piece_rows = f.st.ws.piece_rows, .decode_rows = f.st.ws.decode_rows, .moe_pipe = f.moe_pipe, .moe_ring = moe_ring });
         }
         try state.validatePromptExpertsCarve(f.promptExpertsEnabled(), &f.st.ws);
+        if (f.moe_ep) {
+            const ep_experts = cuda.exl3_experts.scratchBytes(state.decodeExpertShape(true), f.st.ws.generic_rows, state.routed_slots) catch return error.MoeEpWorkspace;
+            if (f.st.ws.sizes.experts < @as(u64, @intCast(ep_experts)) or f.st.ws.sizes.picks_local < @as(u64, @intCast(f.st.ws.decode_rows * state.routed_slots * 4))) return error.MoeEpWorkspace;
+        }
         if (f.pre_fuse != .off or f.prep_fuse != .off) try f.validatePreGroup();
     }
 
@@ -1638,10 +1901,15 @@ pub const Forward = struct {
         return f.shard_qkv_a orelse shardQkvASwitch();
     }
 
+    /// In decode, layer `plane` can write the next layer's input norm with its FFN residual.
+    fn addNormFused(f: *const Forward, mode: Mode, plane: usize) bool {
+        return f.add_norm_fuse and mode == .decode and f.ablate == null and f.tbo_half == null and f.tbo_xn_off == 0 and plane + 1 < f.w.layers.len;
+    }
+
     fn groupedPre(f: *const Forward, mode: Mode) bool { return groupedPreFor(mode, f.pre_fuse, f.prep_fuse); }
     fn preGroupOuts(f: *const Forward, a: weights.Attention, buf: *[3]cuda.qmmf.GroupOut) []const cuda.qmmf.GroupOut {
         const ws = &f.st.ws;
-        buf[0] = .{ .w = a.q_a, .y = ws.q_a };
+        buf[0] = .{ .w = a.q_a, .y = if (f.qa_shard) ws.sh_q else ws.q_a };
         buf[1] = .{ .w = a.kv_a, .y = ws.kv };
         if (a.indexer) |ix| { buf[2] = .{ .w = ix.wk, .y = ws.ik }; return buf[0..3]; }
         return buf[0..2];
@@ -1649,7 +1917,11 @@ pub const Forward = struct {
     fn projectPreGroup(f: *const Forward, mode: Mode, s: cuda.Stream, xn: u64, rows: usize, a: weights.Attention) !void {
         var buf: [3]cuda.qmmf.GroupOut = undefined;
         const prefetch = mode == .decode and f.pre_fuse == .prefetch;
-        try f.k.lane.matmulGroup(s, xn, hidden, rows, f.preGroupOuts(a, &buf), .{ .split = mode == .prefill and f.prep_fuse == .split, .prefetch = if (prefetch) a.q_b.codes else 0, .prefetch_bytes = if (prefetch) @as(usize, a.q_b.npad) * a.q_b.k else 0 });
+        const options: cuda.qmmf.GroupOptions = .{ .split = mode == .prefill and f.prep_fuse == .split, .prefetch = if (prefetch) a.q_b.codes else 0, .prefetch_bytes = if (prefetch) @as(usize, a.q_b.npad) * a.q_b.k else 0 };
+        if (mode == .prefill) {
+            if (f.qmmf_var) if (f.k.qmmf_var) |vf| return cuda.qmmf.matmulGroupVariant(f.k.lane.*, vf, s, xn, hidden, rows, f.preGroupOuts(a, &buf), options);
+        }
+        try f.k.lane.matmulGroup(s, xn, hidden, rows, f.preGroupOuts(a, &buf), options);
     }
     fn validatePreGroup(f: *const Forward) !void {
         if (f.shardQkvAEnabled()) return error.PreFuseWithShardQkvA;
@@ -1806,7 +2078,7 @@ pub const Forward = struct {
     /// The exchange plan this forward follows for one window (what `launch` sends, by phase).
     pub fn stepPlan(f: *const Forward, mode: Mode, positions: []const usize, head_rows: usize, layers: []Layer) !ExchangePlan {
         for (f.w.layers, layers) |l, *out| out.* = layerOf(l);
-        return plan(.{ .mode = mode, .positions = positions, .layers = layers, .head = f.head, .head_rows = head_rows, .head_block = f.st.ws.head_rows, .score_rows = f.st.ws.score_rows, .piece_rows = f.st.ws.piece_rows, .rank = f.rank });
+        return plan(.{ .mode = mode, .positions = positions, .layers = layers, .head = f.head, .head_rows = head_rows, .head_block = f.st.ws.head_rows, .score_rows = f.st.ws.score_rows, .piece_rows = f.st.ws.piece_rows, .rank = f.rank, .coll_fuse = f.coll_fuse, .partial_roce = f.partial_roce, .q_one_gather = f.q_one_gather, .qa_shard = f.qa_shard });
     }
 
     fn step(f: *const Forward, mode: Mode, positions: []const usize, tokens: []const u32, head: Chunk) !void {
@@ -1814,22 +2086,44 @@ pub const Forward = struct {
         try f.launch(mode, positions, head);
     }
 
+    /// Level 2. False leaves the caller on its existing launch. That is the level being off, the BF16 prefill GEMM
+    /// owning the call, a weight `w8a8.serves` rejects, or a row count that does not fit `ws.w8a8_scratch`.
+    /// Grouped q_a, kv_a and wk stay in projectPreGroup. o_proj stays in oProjW8a8. A rejected shape still takes
+    /// the qmmf variant when that switch is on.
+    fn launchPrefillW8a8(f: *const Forward, s: cuda.Stream, x: u64, ldx: usize, rows: usize, w: cuda.qmmf.Weight, y: u64, out: cuda.qmmf.Out) !bool {
+        if (!f.prefill_w8a8_all or f.prefill_gemms != null) return false;
+        if (!cuda.w8a8.servesFast(w)) return false;
+        const ws = &f.st.ws;
+        const need: u64 = @intCast(cuda.w8a8.scratchBytes(rows, @as(usize, @intCast(w.k))));
+        if (ws.sizes.w8a8_scratch < need) return false;
+        const fns = f.k.w8a8 orelse return error.MissingW8a8Kernels;
+        try fns.run(s, x, ldx, rows, w, y, out, ws.w8a8_scratch, ws.sizes.w8a8_scratch);
+        return true;
+    }
+
     fn project(f: *const Forward, mode: Mode, s: cuda.Stream, x: u64, ldx: usize, rows: usize, w: cuda.qmmf.Weight, y: u64, out: cuda.qmmf.Out, part: u64) !void {
-        if (mode != .prefill or f.prefill_gemms == null or w.mode != .fp8b) return f.k.lane.matmulOut(s, x, ldx, rows, w, y, out, part);
-        const dequant_stream = f.st.dequant_stream orelse return error.MissingDequantStream;
-        const ready = f.st.dequant_ready orelse return error.MissingDequantEvent;
-        const consumed = f.st.dequant_consumed orelse return error.MissingDequantConsumeEvent;
-        try dequant_stream.wait(consumed);
-        try f.k.lane.dequantizeFp8bBf16RowMajor(dequant_stream, w, f.st.ws.prefill_weight);
-        try ready.record(dequant_stream);
-        try s.wait(ready);
-        const dtype: cuda.cublaslt.DataType = if (out == .f32) .f32 else .bf16;
-        try f.prefill_gemms.?.run(s, x, f.st.ws.prefill_weight, y, rows, w.n, w.k, dtype);
-        try consumed.record(s);
+        if (mode == .prefill) if (try f.launchPrefillW8a8(s, x, ldx, rows, w, y, out)) return;
+        if (mode != .prefill or w.mode != .fp8b) return f.k.lane.matmulOut(s, x, ldx, rows, w, y, out, part);
+        if (f.prefill_gemms != null) {
+            const dequant_stream = f.st.dequant_stream orelse return error.MissingDequantStream;
+            const ready = f.st.dequant_ready orelse return error.MissingDequantEvent;
+            const consumed = f.st.dequant_consumed orelse return error.MissingDequantConsumeEvent;
+            try dequant_stream.wait(consumed);
+            try f.k.lane.dequantizeFp8bBf16RowMajor(dequant_stream, w, f.st.ws.prefill_weight);
+            try ready.record(dequant_stream);
+            try s.wait(ready);
+            const dtype: cuda.cublaslt.DataType = if (out == .f32) .f32 else .bf16;
+            try f.prefill_gemms.?.run(s, x, f.st.ws.prefill_weight, y, rows, w.n, w.k, dtype);
+            try consumed.record(s);
+            return;
+        }
+        if (f.qmmf_var) if (f.k.qmmf_var) |vf| return cuda.qmmf.matmulOutVariant(f.k.lane.*, vf, qmmfVariantFor(w, out), s, x, ldx, rows, w, y, out, part);
+        return f.k.lane.matmulOut(s, x, ldx, rows, w, y, out, part);
     }
 
     /// QMMF projection planned as if it had `pin_n` output columns, while writing its actual width.
-    fn projectPinned(f: *const Forward, s: cuda.Stream, x: u64, ldx: usize, rows: usize, w: cuda.qmmf.Weight, y: u64, out: cuda.qmmf.Out, part: u64, pin_n: usize) !void {
+    fn projectPinned(f: *const Forward, mode: Mode, s: cuda.Stream, x: u64, ldx: usize, rows: usize, w: cuda.qmmf.Weight, y: u64, out: cuda.qmmf.Out, part: u64, pin_n: usize) !void {
+        if (mode == .prefill) if (try f.launchPrefillW8a8(s, x, ldx, rows, w, y, out)) return;
         return f.k.lane.matmulOutPinned(s, x, ldx, rows, w, y, out, part, pin_n);
     }
     /// TF_GLM53_PREFILL_W8A8=1 prefill o_proj: the same fp32 rank partial rows as project(.f32), from the e4m3
@@ -1931,6 +2225,7 @@ pub const Forward = struct {
             at = p.end;
         }
         var ordinal: usize = 0;
+        var ingest_forked = false;
         var moe_pending: MoePipePendingSet = .{};
         for (f.w.layers, 0..) |l, i| {
             // `i` is the plane (and stage-pair) index of this layer; `next` the next layer's.
@@ -1980,7 +2275,7 @@ pub const Forward = struct {
                     try f.tboPiece(l, i, positions, p, ordinal, next);
                 } else {
                     try f.attention(l, i, mode, positions, p, ordinal, next, 0, false, false, null);
-                    try f.ffn(l, p, mode);
+                    if (f.addNormFused(mode, i)) try f.ffnNorm(l, p, mode, f.w.layers[i + 1].in_norm) else try f.ffn(l, p, mode);
                 }
                 if (prefill and f.prof_prefill) if (f.prof) |profile| {
                     try f.profileSync();
@@ -1991,9 +2286,19 @@ pub const Forward = struct {
             // Taps observe the complete layer output, including every deferred MoE residual.
             if (f.moePipeEnabled() and f.taps != null) try f.finishAllMoePending(&moe_pending);
             if (f.taps) |t| try taps_mod.at(t, f.stream, l.index, f.st.ws.x, positions[0], positions.len);
+            if (mode == .decode and f.taps != null and f.taps.?.ingest != null) {
+                const t = f.taps.?;
+                if (taps_mod.slotOf(t.layers, l.index)) |tap_slot| {
+                    if (tap_slot + 1 == t.layers.len) {
+                        try t.ingest.?.fork_fn(t.ingest.?.ctx, f.stream, f.st.ws.positions, positions.len);
+                        ingest_forked = true;
+                    }
+                }
+            }
             if (l.attn.indexer != null) ordinal += 1;
         }
         if (f.moePipeEnabled()) try f.finishAllMoePending(&moe_pending);
+        if (mode == .decode) if (f.l2pf) |pf| try pf.join(f.stream);
         if (head.end > head.start and f.head != .none) {
             try f.profileBegin(mode, f.w.layers.len, .head);
             try f.headRows(head.start, head.end - head.start);
@@ -2002,6 +2307,10 @@ pub const Forward = struct {
                 try f.profileSync();
                 try profile.collect();
             };
+        }
+        if (ingest_forked) {
+            const ing = f.taps.?.ingest.?;
+            try ing.join_fn(ing.ctx, f.stream);
         }
     }
 
@@ -2184,6 +2493,34 @@ pub const Forward = struct {
         try copyRows(f.stream, ws.wts8 + off * state.routed_slots * 4, state.routed_slots * 4, ws.wts, state.route_slots * 4, state.routed_slots * 4, n, "GLM-5.3 compact route weights");
     }
 
+    fn ffnRoute(f: *const Forward, l: weights.DeviceLayer, m: anytype, p: Chunk, off: usize) !void {
+        const ws = &f.st.ws;
+        const n = p.end - p.start;
+        const lr: ?moe.LowRankWeights = if (m.lowrank) |r| .{ .a = r.a, .b = r.b, .mid = ws.lowrank_mid + off * 8 * (r.rank_local * 4), .rank_local = r.rank_local } else null;
+        if (m.lowrank) |r| if (r.rank_local > state.lowrank_max) return error.LowRankTooWide;
+        var lowrank_k = f.k.glue53;
+        lowrank_k.decode_fast = false;
+        try f.profileBegin(.prefill, l.index, .route);
+        try moe.route(f.k.router(), f.stream, ws.xn + off * hidden * 2, hidden, m.router, m.bias, ws.router_logits, ws.router_part, ws.picks, ws.wts, n);
+        try f.profileEnd(.prefill, l.index, .route);
+        if (lr) |lr_weights| {
+            try f.profileBegin(.prefill, l.index, .lowrank);
+            try moe.lowrankPre(lowrank_k, f.stream, ws.xn + off * hidden * 2, hidden, n, lr_weights);
+            try f.profileEnd(.prefill, l.index, .lowrank);
+        }
+        try copyRows(f.stream, ws.picks8 + off * state.routed_slots * 4, state.routed_slots * 4, ws.picks, state.route_slots * 4, state.routed_slots * 4, n, "GLM-5.3 compact route picks");
+        try copyRows(f.stream, ws.wts8 + off * state.routed_slots * 4, state.routed_slots * 4, ws.wts, state.route_slots * 4, state.routed_slots * 4, n, "GLM-5.3 compact route weights");
+    }
+
+    fn ffnShared(f: *const Forward, l: weights.DeviceLayer, m: anytype, mlp_k: anytype, p: Chunk, off: usize) !void {
+        const ws = &f.st.ws;
+        const n = p.end - p.start;
+        const scratch: mlp.Scratch = .{ .gate_up = ws.mlp_gate_up, .activation = ws.mlp_act, .mm_part = ws.lane_part };
+        try f.profileBegin(.prefill, l.index, .shared);
+        try mlp.block(mlp_k, f.stream, m.shared, scratch, ws.xn + off * hidden * 2, n, mlp.shared_width, ws.shared_out + off * hidden * 4);
+        try f.profileEnd(.prefill, l.index, .shared);
+    }
+
     fn reduce(f: *const Forward, p: Chunk, phase: Phase, source: u64, bf16_partial: bool, next_norm: ?u64, xn_off: usize, prof: ?CollectiveProfile) !void {
         const ws = &f.st.ws;
         const n = p.end - p.start;
@@ -2211,6 +2548,20 @@ pub const Forward = struct {
         } else {
             try f.k.glue.residualAdd(f.stream, ws.x + p.start * hidden * 2, ws.x + p.start * hidden * 2, ws.gathered, n, hidden);
         }
+    }
+
+    /// The bf16 all-gather feeds both the stored residual and the next layer's input norm.
+    fn reduceAddNorm(f: *const Forward, p: Chunk, source: u64, next_norm: u64, prof: ?CollectiveProfile) !void {
+        if (f.tbo_half != null) return error.AddNormFuseWithTbo;
+        const ws = &f.st.ws;
+        const n = p.end - p.start;
+        const fused = f.k.moe_residual_rmsnorm_6144 orelse return error.MissingAddNormFuseKernel;
+        if (prof) |timing| try f.profileBegin(timing.mode, timing.layer, timing.stage);
+        try f.coll.allGather(f.stream, source, ws.gathered, n * hidden * 2, .moe_partial);
+        if (prof) |timing| try f.profileEnd(timing.mode, timing.layer, timing.stage);
+        var args: cuda.Args = .{};
+        inline for (.{ ws.x + p.start * hidden * 2, ws.gathered, next_norm, ws.xn, @as(c_int, @intCast(n)), f.w.config.eps }) |v| args.add(v);
+        try cuda.launch.launch(fused, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 256 } }, f.stream, &args);
     }
 
     fn finishTboReduce(f: *const Forward, p: Chunk, bf16_partial: bool, next_norm: ?u64, xn_off: usize, half: usize) !void {
@@ -2249,7 +2600,7 @@ pub const Forward = struct {
         // The side stream is used for rounds of at most 8 rows (DFlash2 blocks). 12- and 16-row copy rounds
         // (TF_GLM53_VERIFY_MAX=16) run on the main stream: side parity at 12 rows failed on 2026-10-30 (planes
         // differed, tokens and logits equal) and its cause is still open.
-        const side_on = mode == .decode and rows <= side_max_rows and f.decodeSideEnabled() and f.ablate == null and !megakernelSwitch();
+        const side_on = mode == .decode and rows <= side_max_rows and f.decodeSideEnabled() and !megakernelSwitch();
         const eps = f.w.config.eps;
         if (a.local_heads != state.local_heads) return error.BadHeadShare;
         // Row inputs and the window-wide token list at this piece's rows.
@@ -2261,7 +2612,8 @@ pub const Forward = struct {
         const counts = ws.global_counts + lo * 4;
         try f.profileBegin(mode, plane, .attn_pre);
         try f.profileSubBegin(mode, plane, .attn_pre_input_norm);
-        try k.glue.rmsnorm(s, ws.x + lo * hidden * 2, hidden, l.in_norm, xn, hidden, rows, hidden, eps);
+        const in_normed = plane > 0 and !cache_only and !skip_cache and pipe_slot == null and xn_off == 0 and f.addNormFused(mode, plane - 1);
+        if (!in_normed) try k.glue.rmsnorm(s, ws.x + lo * hidden * 2, hidden, l.in_norm, xn, hidden, rows, hidden, eps);
         try f.profileSubEnd(mode, plane, .attn_pre_input_norm);
         if (cache_only) {
             try f.profileSubBegin(mode, plane, .attn_pre_kv_a_proj);
@@ -2306,10 +2658,10 @@ pub const Forward = struct {
         if (f.shardQkvAEnabled()) {
             const kvw: usize = if (f.rank == 0) 256 else 320;
             try f.profileSubBegin(mode, plane, .attn_pre_q_a_proj);
-            try f.projectPinned(s, xn, hidden, rows, a.q_a, ws.sh_q, .bf16, ws.lane_part, 2048);
+            try f.projectPinned(mode, s, xn, hidden, rows, a.q_a, ws.sh_q, .bf16, ws.lane_part, 2048);
             try f.profileSubEnd(mode, plane, .attn_pre_q_a_proj);
             try f.profileSubBegin(mode, plane, .attn_pre_kv_a_proj);
-            try f.projectPinned(s, xn, hidden, rows, a.kv_a, ws.sh_kv, .bf16, ws.lane_part, 576);
+            try f.projectPinned(mode, s, xn, hidden, rows, a.kv_a, ws.sh_kv, .bf16, ws.lane_part, 576);
             try f.profileSubEnd(mode, plane, .attn_pre_kv_a_proj);
             try copyRows(s, ws.sh_mine, 2688, ws.sh_q, 2048, 2048, rows, "shard q_a");
             try copyRows(s, ws.sh_mine + 2048, 2688, ws.sh_kv, kvw * 2, kvw * 2, rows, "shard kv_a");
@@ -2326,11 +2678,18 @@ pub const Forward = struct {
             }
         } else if (!grouped) {
             try f.profileSubBegin(mode, plane, .attn_pre_q_a_proj);
-            try f.project(mode, s, xn, hidden, rows, a.q_a, ws.q_a, .bf16, ws.lane_part);
+            if (f.qa_shard) try f.projectPinned(mode, s, xn, hidden, rows, a.q_a, ws.sh_q, .bf16, ws.lane_part, state.q_lora) else try f.project(mode, s, xn, hidden, rows, a.q_a, ws.q_a, .bf16, ws.lane_part);
             try f.profileSubEnd(mode, plane, .attn_pre_q_a_proj);
         }
+        if (f.qa_shard) {
+            // TF_GLM53_QA_SHARD=1: this rank's 1024 q_a columns are in ws.sh_q (grouped or pinned projection above). The
+            // gather lands [rank 0 rows][rank 1 rows] of 1024 bf16 in ws.q_a; the halves norm below reads them in place.
+            try f.profileSubBegin(mode, plane, .attn_pre_qkv_gather);
+            try f.coll.allGather(s, ws.sh_q, ws.q_a, rows * Bytes.q_a_half_row, .shard_qkv_a);
+            try f.profileSubEnd(mode, plane, .attn_pre_qkv_gather);
+        }
         try f.profileSubBegin(mode, plane, .attn_pre_q_a_norm);
-        try k.glue.rmsnorm(s, ws.q_a, state.q_lora, a.q_a_norm, ws.q_resid, state.q_lora, rows, state.q_lora, eps);
+        if (f.qa_shard) try k.rmsnorm2048Halves(s, ws.q_a, ws.q_a + @as(u64, @intCast(rows * Bytes.q_a_half_row)), 1024, a.q_a_norm, ws.q_resid, state.q_lora, rows, eps) else try k.glue.rmsnorm(s, ws.q_a, state.q_lora, a.q_a_norm, ws.q_resid, state.q_lora, rows, state.q_lora, eps);
         try f.profileSubEnd(mode, plane, .attn_pre_q_a_norm);
         try f.profileSubBegin(mode, plane, .attn_pre_q_b_proj);
         try f.project(mode, s, ws.q_resid, state.q_lora, rows, a.q_b, ws.q, .bf16, ws.lane_part);
@@ -2388,7 +2747,7 @@ pub const Forward = struct {
             if (sparseIn(pos)) {
                 try f.profileSubBegin(mode, plane, .attn_pre_indexer_weights_proj);
                 if (mode == .prefill and f.prep_fuse == .split) {
-                    try f.k.lane.matmulOutSplit(s, xn, hidden, rows, ix.weights_proj, ws.iw, .bf16, ws.lane_part);
+                    if (!try f.launchPrefillW8a8(s, xn, hidden, rows, ix.weights_proj, ws.iw, .bf16)) try f.k.lane.matmulOutSplit(s, xn, hidden, rows, ix.weights_proj, ws.iw, .bf16, ws.lane_part);
                 } else try f.project(mode, s, xn, hidden, rows, ix.weights_proj, ws.iw, .bf16, ws.lane_part);
                 try f.profileSubEnd(mode, plane, .attn_pre_indexer_weights_proj);
                 try f.profileSubBegin(mode, plane, .attn_pre_indexer_query_proj);
@@ -2406,19 +2765,22 @@ pub const Forward = struct {
         const prompt_mla = if (prefill) f.promptMlaMode() else .off;
         const qa_bytes = rows * state.local_heads * mla.latent_dim * 2;
         const qpe_bytes = rows * state.local_heads * mla.rope_dim * 2;
-        const qa = if (prefill) ws.qa else ws.qa + f.rank * qa_bytes;
-        const qpe = if (prefill) ws.qpe else ws.qpe + f.rank * qpe_bytes;
+        const query_layout = QueryPairLayout.init(qa_bytes, qpe_bytes);
+        const fused_query_base = ws.fused_queries + query_layout.rankBase(f.rank);
+        const qa = if (prefill) ws.qa else if (f.q_one_gather) fused_query_base + query_layout.qa else ws.qa + f.rank * qa_bytes;
+        const qpe = if (prefill) ws.qpe else if (f.q_one_gather) fused_query_base + query_layout.qpe else ws.qpe + f.rank * qpe_bytes;
+        // 12/16-row copy rounds exceed the decode MLA kernels' 8 rows and stay on the generic path.
+        const use_decode_mla = mode == .decode and rows <= mla.max_decode_rows and f.decodeMlaEnabled();
+        const qpe_fused = f.qpe_absorb_fuse and use_decode_mla and f.decodeMlaV3Enabled();
         try f.profileSubBegin(mode, plane, .attn_pre_q_pe_pack);
-        try k.mla.packQpe(s, ws.q, cos, sin, qpe, rows, state.local_heads);
+        if (!qpe_fused) try k.mla.packQpe(s, ws.q, cos, sin, qpe, rows, state.local_heads);
         try f.profileSubEnd(mode, plane, .attn_pre_q_pe_pack);
 
-        // 12/16-row copy rounds (TF_GLM53_VERIFY_MAX=16) exceed the decode MLA kernels' 8 rows: they use the generic kernels.
-        const use_decode_mla = mode == .decode and rows <= mla.max_decode_rows and f.decodeMlaEnabled();
         try f.profileSubBegin(mode, plane, .attn_pre_absorb);
         if (prefill and prompt_mla != .off) {
             try k.mla.absorbPrompt(s, ws.q, a.kv_b.codes, a.kv_b.scales, qa, rows, state.local_heads, kvb_head0, prompt_mla);
         } else if (use_decode_mla and f.decodeMlaV3Enabled()) {
-            try k.mla.absorbV3(s, ws.q, a.kv_b.codes, a.kv_b.scales, qa, rows, state.local_heads, kvb_head0);
+            if (qpe_fused) try k.mla.absorbQpeV3(s, ws.q, cos, sin, qpe, a.kv_b.codes, a.kv_b.scales, qa, rows, state.local_heads, kvb_head0) else try k.mla.absorbV3(s, ws.q, a.kv_b.codes, a.kv_b.scales, qa, rows, state.local_heads, kvb_head0);
         } else {
             try k.mla.absorb(s, ws.q, a.kv_b.codes, a.kv_b.scales, qa, rows, state.local_heads, kvb_head0, use_decode_mla);
         }
@@ -2454,8 +2816,11 @@ pub const Forward = struct {
         } else {
             try f.profileEnd(mode, plane, .attn_pre);
             try f.profileBegin(mode, plane, .attn_comm);
-            if (f.coll_fuse) {
-                const layout = QueryPairLayout.init(qa_bytes, qpe_bytes);
+            if (f.q_one_gather) {
+                // RoCE is bound to the main stream. Its in-place rank block already holds this rank's values.
+                try f.coll.allGather(s, fused_query_base, ws.fused_queries, query_layout.rank_bytes, .absorbed_query);
+            } else if (f.coll_fuse) {
+                const layout = query_layout;
                 const mine = ws.fused_queries + layout.rankBase(f.rank);
                 const all = ws.fused_queries;
                 try Collective.copyDevice(s, mine + layout.qa, qa, qa_bytes, "GLM-5.3 pack absorbed query qa");
@@ -2481,23 +2846,44 @@ pub const Forward = struct {
             const send_partial = mine + peer * block_bytes;
             const peer_partial = mine + world * block_bytes;
             try f.profileBegin(mode, plane, .attn_pre);
-            if (f.decode_union and rows >= 1 and rows <= f.decode_union_rows) {
+            const own_attend = f.own_attend and side_on and f.decode_union and rows <= f.decode_union_rows and !f.coll_fuse;
+            if (own_attend) {
+                const own_group = attendGroupBases(ws, f.rank, rows, qa_bytes, qpe_bytes, f.q_one_gather);
+                const side_stream = f.st.side orelse return error.MissingDecodeSideStream;
+                const attn_fork = f.st.attn_fork orelse return error.MissingDecodeSideEvents;
+                try attn_fork.record(s);
+                try side_stream.wait(attn_fork);
+                try k.mla.attendVerifyGroup(side_stream, own_group.qa, own_group.qpe, latent, rope, positions_at, ws.local_slots, ws.local_counts, own_group.partial, rows, f.rank, world, own_group.split);
+                try (f.st.attn_done orelse return error.MissingDecodeSideEvents).record(side_stream);
+                const peer_group = attendGroupBases(ws, peer, rows, qa_bytes, qpe_bytes, f.q_one_gather);
+                try k.mla.attendVerifyGroup(s, peer_group.qa, peer_group.qpe, latent, rope, positions_at, ws.local_slots, ws.local_counts, peer_group.partial, rows, f.rank, world, peer_group.split);
+            } else if (f.q_one_gather or (f.decode_union and rows >= 1 and rows <= f.decode_union_rows)) {
+                if (f.q_one_gather) {
+                    const group_zero = attendGroupBases(ws, 0, rows, qa_bytes, qpe_bytes, true);
+                    const group_one = attendGroupBases(ws, 1, rows, qa_bytes, qpe_bytes, true);
+                    try k.mla.attendVerifyGroup(s, group_zero.qa, group_zero.qpe, latent, rope, positions_at, ws.local_slots, ws.local_counts, group_zero.partial, rows, f.rank, world, group_zero.split);
+                    try k.mla.attendVerifyGroup(s, group_one.qa, group_one.qpe, latent, rope, positions_at, ws.local_slots, ws.local_counts, group_one.partial, rows, f.rank, world, group_one.split);
+                } else {
                 try k.mla.attendVerify(s, ws.qa, ws.qpe, latent, rope, positions_at, ws.local_slots, ws.local_counts, mine, rows, 2 * state.local_heads, f.rank, world, ws.attend_split);
+                }
             } else try k.mla.attend(s, ws.qa, ws.qpe, latent, rope, null, positions_at, tokens, ws.local_slots, counts, ws.local_counts, dense_len, mine, rows, 2 * state.local_heads, f.rank, world, false, ws.attend_split);
             try f.profileEnd(mode, plane, .attn_pre);
             try f.profileBegin(mode, plane, .attn_comm);
-            if (f.coll_fuse) {
+            if (f.coll_fuse or f.partial_roce) {
                 const fuse_plan = collFusePartialPlan(f.rank, block_bytes);
                 if (fuse_plan.need > ws.sizes.part) return error.CollFusePartialScratch;
                 try f.coll.oneShotGather(s, mine + fuse_plan.send, mine + fuse_plan.pair, block_bytes);
             } else try f.coll.sendRecv(s, send_partial, block_bytes, peer_partial, block_bytes, peer, .attention_partial);
             try f.profileEnd(mode, plane, .attn_comm);
             try f.profileBegin(mode, plane, .attn_post);
-            const merge_peer = if (f.coll_fuse) mine + collFusePartialPlan(f.rank, block_bytes).peer else peer_partial;
+            const merge_peer = if (f.coll_fuse or f.partial_roce) mine + collFusePartialPlan(f.rank, block_bytes).peer else peer_partial;
+            if (own_attend) try s.wait(f.st.attn_done orelse return error.MissingDecodeSideEvents);
             try k.mla.merge(s, local_partial, merge_peer, ws.ol, ws.lse_out, rows, state.local_heads, f.rank);
             try f.profileEnd(mode, plane, .attn_post);
             try f.profileBegin(mode, plane, .expand_v);
-            if (use_decode_mla and f.decodeMlaV2Enabled()) {
+            if (f.decode_mla16 and f.decodeMlaV2Enabled() and rows > mla.max_decode_rows and rows <= mla.decode_mla16_rows) {
+                try k.mla.expandVV2Wide(s, ws.ol, a.kv_b.codes, a.kv_b.scales, ws.vo, rows, state.local_heads, kvb_head0);
+            } else if (use_decode_mla and f.decodeMlaV2Enabled()) {
                 try k.mla.expandVV2(s, ws.ol, a.kv_b.codes, a.kv_b.scales, ws.vo, rows, state.local_heads, kvb_head0);
             } else {
                 try k.mla.expandV(s, ws.ol, a.kv_b.codes, a.kv_b.scales, ws.vo, rows, state.local_heads, kvb_head0, use_decode_mla);
@@ -2511,6 +2897,7 @@ pub const Forward = struct {
             try f.oProjW8a8(s, ws.vo, vo_width, rows, a.o_proj, output);
         } else try f.project(mode, s, ws.vo, vo_width, rows, a.o_proj, output, .f32, ws.lane_part);
         try f.profileEnd(mode, plane, .attn_post);
+        if (mode == .decode and pipe_slot == null) if (f.l2pf) |pf| try pf.fork(f.stream, l.index, .f);
         if (pipe_slot) |ring_slot| {
             try f.reduceIssue(p, ring_slot);
         } else try f.reduce(p, .attention_output, output, false, l.post_norm, xn_off, .{ .mode = mode, .layer = plane, .stage = .attn_comm, .after = .attn_post });
@@ -2527,6 +2914,7 @@ pub const Forward = struct {
         const k = f.k;
         var index_k = k.index;
         index_k.score_mma_rows = f.index_mma_rows;
+        index_k.score_qs = if (mode == .prefill) f.index_qs else 0;
         const s = f.stream;
         const rows = positions.len;
         const top = positions[rows - 1];
@@ -2568,6 +2956,7 @@ pub const Forward = struct {
         const k = f.k;
         var index_k = k.index;
         index_k.score_mma_rows = f.index_mma_rows;
+        index_k.score_qs = if (mode == .prefill) f.index_qs else 0;
         const main = f.stream;
         const comm = f.st.tbo_stream orelse return error.MissingTboStream;
         const rows = positions.len;
@@ -2626,7 +3015,7 @@ pub const Forward = struct {
         const ws = &f.st.ws;
         const m = switch (l.ffn) { .moe => |moe_weights| moe_weights, .dense => return error.ExpectedMoeLayer };
         var mlp_k = f.k.mlpKernels();
-        if (f.prefill_gemms != null) {
+        if (f.prefill_gemms != null or f.qmmf_var or f.prefill_w8a8_all) {
             mlp_k.project_ctx = @constCast(f);
             mlp_k.project_fn = mlpProject;
         }
@@ -2639,8 +3028,11 @@ pub const Forward = struct {
             var row_at = group_at;
             var piece_ordinal: usize = 0;
             var pending: ?PipePending = null;
-            var moe_slot_used = [_]bool{ false, false };
-            const pipe_on = f.piecePipeEnabled();
+            var deferred_shared: [state.Workspace.max_moe_pipe_pieces]PipePending = undefined;
+            var deferred_shared_count: usize = 0;
+            var moe_slot_used: [state.Workspace.max_moe_pipe_ring_slots]bool = @splat(false);
+            // The piece pipe skips the attention-site ablation; an ablated prompt takes the plain path (as TBO does).
+            const pipe_on = f.piecePipeEnabled() and f.ablate == null;
             while (row_at < group_end) {
                 const p = pieceAt(.prefill, positions, ws.piece_rows, row_at);
                 const n = p.end - p.start;
@@ -2652,7 +3044,14 @@ pub const Forward = struct {
                     try f.attention(l, plane, .prefill, positions, p, ordinal, next, off, false, false, ring_slot);
                     if (pending) |previous| {
                         try f.reduceFinish(previous.p, previous.off, previous.slot, l.post_norm, l.index);
-                        try f.ffnPre(l, m, mlp_k, previous.p, previous.off);
+                        if (f.gather_ovl == 0) {
+                            try f.ffnPre(l, m, mlp_k, previous.p, previous.off);
+                        } else {
+                            try f.ffnRoute(l, m, previous.p, previous.off);
+                            std.debug.assert(deferred_shared_count < state.Workspace.max_moe_pipe_pieces);
+                            deferred_shared[deferred_shared_count] = previous;
+                            deferred_shared_count += 1;
+                        }
                     }
                     // ffnPre(q) reads only q's xn/shared_out/picks8/wts8/lowrank_mid rows. It is ordered on
                     // the main stream after attention(p); attention(p) does not read q's x/xn rows. Gather(p)
@@ -2667,6 +3066,9 @@ pub const Forward = struct {
                 piece_ordinal += 1;
             }
             if (pending) |last| {
+                if (f.gather_ovl != 0) for (deferred_shared[0..deferred_shared_count]) |deferred| {
+                    try f.ffnShared(l, m, mlp_k, deferred.p, deferred.off);
+                };
                 try f.reduceFinish(last.p, last.off, last.slot, l.post_norm, l.index);
                 try f.ffnPre(l, m, mlp_k, last.p, last.off);
                 pending = null;
@@ -2699,7 +3101,11 @@ pub const Forward = struct {
                 if (f.moe_post) {
                     comptime std.debug.assert(state.routed_slots == moe.top_k);
                     const y = post_y orelse return error.MoePostPromptOutputMissing;
-                    try moe.postPrompt(legacy_lowrank_k, f.stream, y + off * state.routed_slots * hidden * 4, ws.wts8 + off * state.routed_slots * 4, ws.shared_out + off * hidden * 4, lr, n, moe_out);
+                    if (f.moe_ep) {
+                        try moe.postPromptEp(legacy_lowrank_k, f.stream, y + off * state.routed_slots * hidden * 4, ws.wts8 + off * state.routed_slots * 4, ws.picks_local + off * state.routed_slots * 4, ws.shared_out + off * hidden * 4, lr, n, moe_out);
+                    } else {
+                        try moe.postPrompt(legacy_lowrank_k, f.stream, y + off * state.routed_slots * hidden * 4, ws.wts8 + off * state.routed_slots * 4, ws.shared_out + off * hidden * 4, lr, n, moe_out);
+                    }
                 } else {
                     try moe.blockPost(legacy_lowrank_k, f.stream, ws.routed_out + off * hidden * 4, ws.shared_out + off * hidden * 4, lr, n, moe_out);
                 }
@@ -2726,6 +3132,10 @@ pub const Forward = struct {
 
     /// One piece's FFN consumes the normalized attention output, then runs MoE or dense MLP -> TP sum -> residual.
     fn ffn(f: *const Forward, l: weights.DeviceLayer, p: Chunk, mode: Mode) !void {
+        return f.ffnNorm(l, p, mode, null);
+    }
+
+    fn ffnNorm(f: *const Forward, l: weights.DeviceLayer, p: Chunk, mode: Mode, next_norm: ?u64) !void {
         // Decode side stream for the key path and shared expert after bertholomus/TensorFold glm-dsa-tp4 commit f14e7f7 (Apache-2.0, Albert Lee); independent Zig.
         const ws = &f.st.ws;
         const k = f.k;
@@ -2736,7 +3146,7 @@ pub const Forward = struct {
         const out = f.slot(n);
         const dense = switch (l.ffn) { .dense => true, .moe => false };
         var mlp_k = k.mlpKernels();
-        if (mode == .prefill and f.prefill_gemms != null) {
+        if (mode == .prefill and (f.prefill_gemms != null or f.qmmf_var or f.prefill_w8a8_all)) {
             mlp_k.project_ctx = @constCast(f);
             mlp_k.project_fn = mlpProject;
         }
@@ -2746,6 +3156,7 @@ pub const Forward = struct {
                 try mlp.block(mlp_k, s, d, scratch, xn, n, mlp.dense_width, out);
             },
             .moe => |m| {
+                if (f.moe_ep and mode != .decode) return error.MoeEpUnsupported;
                 var routed: Routed = .{ .f = f, .layer = m.routed, .mode = mode };
                 const lr: ?moe.LowRankWeights = if (m.lowrank) |r| .{ .a = r.a, .b = r.b, .mid = ws.lowrank_mid, .rank_local = r.rank_local } else null;
                 if (m.lowrank) |r| if (r.rank_local > state.lowrank_max) return error.LowRankTooWide;
@@ -2756,14 +3167,19 @@ pub const Forward = struct {
                 // f.slot(n) put rank 1's at gathered + 4*n*hidden, the same address as moe_out, and the combine kernel
                 // (reads fp32 routed[i], writes bf16 out[i]) then overwrote its own input on rank 1: nondeterministic text.
                 const routed_out = f.gatherBuffer();
-                const side_on = mode == .decode and p.end - p.start <= side_max_rows and f.decodeSideEnabled() and f.ablate == null and !megakernelSwitch();
+                const side_on = mode == .decode and p.end - p.start <= side_max_rows and f.decodeSideEnabled() and !megakernelSwitch();
                 if (side_on) {
                     const side = f.st.side orelse return error.MissingDecodeSideStream;
                     try (f.st.fork2 orelse return error.MissingDecodeSideEvents).record(s);
                     try side.wait(f.st.fork2.?);
                     // Side MLP uses the ordinary MLP scratch: the main route and EXL3 expert path touch router,
                     // pick, expert and routed-output regions, which are disjoint from gate_up/activation/lane_part.
-                    try moe.route(k.router(), s, xn, hidden, m.router, m.bias, ws.router_logits, ws.router_part, ws.picks, ws.wts, n);
+                    if (f.route_compact) {
+                        try moe.routeCompact(k.router(), s, xn, hidden, m.router, m.bias, ws.router_logits, ws.router_part, ws.picks8, ws.wts8, n);
+                        routed.compact = true;
+                    } else {
+                        try moe.route(k.router(), s, xn, hidden, m.router, m.bias, ws.router_logits, ws.router_part, ws.picks, ws.wts, n);
+                    }
                     try runRouted(&routed, s, xn, hidden, ws.picks, ws.wts, n, routed_out);
                     try mlp.block(mlp_k, side, m.shared, scratch, xn, n, mlp.shared_width, ws.shared_out);
                     // The low-rank partial/reduce that moe.block runs (review of 2b9a090e: without it blockPost combined
@@ -2781,13 +3197,17 @@ pub const Forward = struct {
                     lowrank_k.decode_fast = f.lowrank_decode and mode == .decode;
                     try moe.blockWithHooks(lowrank_k, k.router(), mlp_k, s, m.shared, scratch, &routed, runRouted, xn, hidden, m.router, m.bias, ws.router_logits, ws.router_part, ws.picks, ws.wts, ws.shared_out, n, routed_out, moe_out, lr, hooks);
                 }
-                try f.reduce(p, .moe_partial, moe_out, true, null, 0, .{ .mode = mode, .layer = l.index, .stage = .moe_comm });
+                if (mode == .decode) if (f.l2pf) |pf| try pf.fork(f.stream, l.index, .n);
+                if (next_norm) |norm_w| {
+                    try f.reduceAddNorm(p, moe_out, norm_w, .{ .mode = mode, .layer = l.index, .stage = .moe_comm });
+                } else try f.reduce(p, .moe_partial, moe_out, true, null, 0, .{ .mode = mode, .layer = l.index, .stage = .moe_comm });
                 if (f.tbo_half == null) if (f.ablate) |ab| if (ab.vec(l.index, .ffn)) |v| try ab.launch(f.k.ablate.?, f.stream, ws.x + p.start * hidden * 2, ws.gathered, .bf16_parts, v, n, 0, 0, f.w.config.eps);
                 return;
             },
         }
         if (dense) try f.profileEnd(mode, l.index, .dense_mlp);
-        try f.reduce(p, .moe_partial, out, false, null, 0, if (dense) .{ .mode = mode, .layer = l.index, .stage = .dense_comm } else null);
+        if (mode == .decode) if (f.l2pf) |pf| try pf.fork(f.stream, l.index, .n);
+        try f.reduce(p, .moe_partial, out, false, next_norm, 0, if (dense) .{ .mode = mode, .layer = l.index, .stage = .dense_comm } else null);
         if (f.tbo_half == null) if (f.ablate) |ab| if (ab.vec(l.index, .ffn)) |v| try ab.launch(f.k.ablate.?, f.stream, ws.x + p.start * hidden * 2, ws.gathered, .f32_parts, v, n, 0, 0, f.w.config.eps);
     }
 
@@ -2797,15 +3217,19 @@ pub const Forward = struct {
     fn runRouted(ctx: *anyopaque, stream: cuda.Stream, x: u64, x_stride: usize, picks: u64, wts: u64, rows: usize, out: u64) anyerror!void {
         const r: *const Routed = @ptrCast(@alignCast(ctx));
         const f = r.f;
+        if (f.moe_ep and r.mode != .decode) return error.MoeEpUnsupported;
         const ws = &f.st.ws;
-        try copyRows(stream, ws.picks8, state.routed_slots * 4, picks, state.route_slots * 4, state.routed_slots * 4, rows, "GLM-5.3 compact route picks");
-        try copyRows(stream, ws.wts8, state.routed_slots * 4, wts, state.route_slots * 4, state.routed_slots * 4, rows, "GLM-5.3 compact route weights");
+        if (!r.compact) {
+            try copyRows(stream, ws.picks8, state.routed_slots * 4, picks, state.route_slots * 4, state.routed_slots * 4, rows, "GLM-5.3 compact route picks");
+            try copyRows(stream, ws.wts8, state.routed_slots * 4, wts, state.route_slots * 4, state.routed_slots * 4, rows, "GLM-5.3 compact route weights");
+        }
         const l = r.layer.layer();
         const prompt_tiles_eligible = cuda.exl3_experts.prompt.eligibleTiles(l);
         const prompt_wide_eligible = cuda.exl3_experts.prompt.eligible(l);
         if (r.mode == .prefill and f.promptExpertsEnabled() and prompt_tiles_eligible) {
             try state.validatePromptExpertsCarveForLayer(true, ws, l);
-            const router = f.k.experts.router;
+            var router = f.k.experts.router;
+            router.allow_negative = f.moe_ep;
             const prompt_plan = promptPlan(ws.prompt_plan, ws.expert_rows, state.routed_slots, state.routed_experts);
             const prompt_scratch = try cuda.exl3_experts.prompt.scratch(ws.prompt_experts, l, ws.expert_rows, state.routed_slots, ws.scratch_overlay);
             const wide = f.promptExpertsWide() and prompt_wide_eligible;
@@ -2834,13 +3258,23 @@ pub const Forward = struct {
         }
         if (ws.adapt_big) return error.ExpertRowsAdaptGenericPath;
         const generic_rows = ws.generic_rows;
+        if (f.moe_ep and ws.sizes.experts < @as(u64, @intCast(try cuda.exl3_experts.scratchBytes(l, generic_rows, state.routed_slots)))) return error.MoeEpWorkspace;
         const sc = try cuda.exl3_experts.scratch(ws.experts, l, generic_rows, state.routed_slots);
         var at: usize = 0;
         while (at < rows) : (at += generic_rows) {
             const n = @min(generic_rows, rows - at);
+            const piece_picks = ws.picks8 + at * state.routed_slots * 4;
             // MK8 flush point: the EXL3 runner may clear its counters with a stream memset.
             try stream.flushDeferred();
-            try f.k.experts.run(stream, l, x + at * x_stride * 2, x_stride, .bf16, ws.picks8 + at * state.routed_slots * 4, ws.wts8 + at * state.routed_slots * 4, n, out + at * hidden * 4, sc);
+            const routed_picks = if (f.moe_ep) blk: {
+                if (@as(u64, @intCast(n * state.routed_slots * 4)) > ws.sizes.picks_local) return error.MoeEpWorkspace;
+                try f.k.experts.router.localize(stream, piece_picks, ws.picks_local, n * state.routed_slots, f.rank);
+                // tf_exl3_down_combine reads sc.y on negative picks so combinePrompt can share the kernel.
+                try stream.flushDeferred();
+                try stream.d.check(stream.d.api.cuMemsetD32Async(sc.y, 0, n * state.routed_slots * l.dims, stream.handle), "clear EP expert slot outputs");
+                break :blk ws.picks_local;
+            } else piece_picks;
+            try f.k.experts.run(stream, l, x + at * x_stride * 2, x_stride, .bf16, routed_picks, ws.wts8 + at * state.routed_slots * 4, n, out + at * hidden * 4, sc);
         }
     }
 
@@ -2853,21 +3287,26 @@ pub const Forward = struct {
         const prompt_wide_eligible = cuda.exl3_experts.prompt.eligible(layer);
         if (f.promptExpertsEnabled() and prompt_tiles_eligible) {
             try state.validatePromptExpertsCarveForLayer(true, ws, layer);
-            const router = f.k.experts.router;
+            var router = f.k.experts.router;
+            router.allow_negative = f.moe_ep;
             const prompt_plan = promptPlan(ws.prompt_plan, ws.expert_rows, state.routed_slots, state.routed_experts);
             const prompt_scratch = try cuda.exl3_experts.prompt.scratch(ws.prompt_experts, layer, ws.expert_rows, state.routed_slots, ws.scratch_overlay);
             try stream.flushDeferred();
+            const routed_picks = if (f.moe_ep) blk: {
+                try router.localize(stream, picks, ws.picks_local, rows * state.routed_slots, f.rank);
+                break :blk ws.picks_local;
+            } else picks;
             if (f.promptExpertsP5a() and f.promptExpertsPmx() and cuda.exl3_experts.pmx.eligible(layer)) {
                 const pmx_kernels = f.k.experts.pmx orelse return error.PromptExpertsPmxKernelsMissing;
                 const p5a_kernels = f.k.experts.p5a orelse return error.PromptExpertsP5aKernelsMissing;
-                try f.k.experts.prompt.runP5a(&pmx_kernels, &p5a_kernels, f.k.experts, router, stream, layer, x, hidden, picks, rows, prompt_scratch, prompt_plan);
+                try f.k.experts.prompt.runP5a(&pmx_kernels, &p5a_kernels, f.k.experts, router, stream, layer, x, hidden, routed_picks, rows, prompt_scratch, prompt_plan);
             } else if (f.promptExpertsPmx() and cuda.exl3_experts.pmx.eligible(layer)) {
                 const pmx_kernels = f.k.experts.pmx orelse return error.PromptExpertsPmxKernelsMissing;
-                try f.k.experts.prompt.runPmx(&pmx_kernels, f.k.experts, router, stream, layer, x, hidden, picks, rows, prompt_scratch, prompt_plan);
+                try f.k.experts.prompt.runPmx(&pmx_kernels, f.k.experts, router, stream, layer, x, hidden, routed_picks, rows, prompt_scratch, prompt_plan);
             } else if (f.promptExpertsWide() and prompt_wide_eligible) {
-                try f.k.experts.prompt.runWide(f.k.experts, router, stream, layer, x, hidden, picks, rows, prompt_scratch, prompt_plan);
+                try f.k.experts.prompt.runWide(f.k.experts, router, stream, layer, x, hidden, routed_picks, rows, prompt_scratch, prompt_plan);
             } else {
-                try f.k.experts.prompt.runTile(f.k.experts, router, stream, layer, x, hidden, picks, rows, prompt_scratch, prompt_plan, cuda.exl3_experts.prompt.tile);
+                try f.k.experts.prompt.runTile(f.k.experts, router, stream, layer, x, hidden, routed_picks, rows, prompt_scratch, prompt_plan, cuda.exl3_experts.prompt.tile);
             }
             if (f.moe_post) return prompt_scratch.y;
             try f.k.experts.combinePrompt(stream, layer, prompt_scratch.y, wts, rows, state.routed_slots, out, prompt_scratch.ids);
@@ -2981,6 +3420,11 @@ test "decode and prefill exchange plans: per-row bytes, gather-on-prefill and th
     try std.testing.expect(fused.of(.attention_partial).all_gather);
     try std.testing.expectEqual(decode.of(.attention_partial).calls, fused.of(.attention_partial).calls);
     try std.testing.expectEqual(decode.of(.index_candidates).calls, fused.of(.index_candidates).calls);
+    const one_gather = try plan(.{ .mode = .decode, .positions = &.{ 100, 3000 }, .layers = &layers, .head_rows = 2, .q_one_gather = true });
+    try std.testing.expectEqual(@as(usize, 2), one_gather.of(.absorbed_query).calls);
+    try std.testing.expectEqual(decode.of(.absorbed_query).bytes, one_gather.of(.absorbed_query).bytes);
+    try std.testing.expect(!one_gather.of(.attention_partial).all_gather);
+    try std.testing.expectEqual(decode.of(.attention_partial).calls, one_gather.of(.attention_partial).calls);
     var rows: [4096]usize = undefined;
     for (&rows, 0..) |*p, i| p.* = 4096 + i;
     const prefill = try plan(.{ .mode = .prefill, .positions = &rows, .layers = &layers, .head_rows = 1 });
@@ -2998,6 +3442,19 @@ test "decode and prefill exchange plans: per-row bytes, gather-on-prefill and th
     try std.testing.expectEqual(Chunk{ .start = 0, .end = 24 }, pieceAt(.prefill, &tail, 1024, 0));
     try std.testing.expectEqual(Chunk{ .start = 24, .end = 1048 }, pieceAt(.prefill, &tail, 1024, 24));
     try std.testing.expectEqual(Chunk{ .start = 0, .end = 1100 }, pieceAt(.decode, &tail, 1024, 0));
+}
+
+test "partial RoCE plans attention gather without fusing the absorbed query" {
+    const layers = [_]Layer{.{ .index = 0, .kind = .dense, .index_full = false }};
+    for (0..world) |rank| {
+        const partial_roce = try plan(.{ .mode = .decode, .positions = &.{100}, .layers = &layers, .rank = rank, .partial_roce = true });
+        const nccl = try plan(.{ .mode = .decode, .positions = &.{100}, .layers = &layers, .rank = rank });
+        try std.testing.expect(partial_roce.of(.attention_partial).all_gather);
+        try std.testing.expectEqual(nccl.of(.attention_partial).bytes, partial_roce.of(.attention_partial).bytes);
+        try std.testing.expectEqual(nccl.of(.attention_partial).calls, partial_roce.of(.attention_partial).calls);
+        try std.testing.expectEqual(@as(usize, 2), partial_roce.of(.absorbed_query).calls);
+        try std.testing.expectEqual(nccl.of(.absorbed_query).calls, partial_roce.of(.absorbed_query).calls);
+    }
 }
 
 test "piece ordinals follow pieces for aligned and unaligned groups" {
@@ -3035,6 +3492,16 @@ test "packed query pair layout preserves byte-identical QA and QPE views" {
     const rank_one = layout.rankBase(1);
     try std.testing.expectEqualSlices(u8, &qa, gathered[rank_one + layout.qa ..][0..qa.len]);
     try std.testing.expectEqualSlices(u8, &qpe, gathered[rank_one + layout.qpe ..][0..qpe.len]);
+}
+
+test "packed query pair host bytes match the decode device rank stride" {
+    const qa_bytes = 8 * state.local_heads * mla.latent_dim * 2;
+    const qpe_bytes = 8 * state.local_heads * mla.rope_dim * 2;
+    const layout = QueryPairLayout.init(qa_bytes, qpe_bytes);
+    try std.testing.expectEqual(@as(usize, 8 * 36864), layout.rank_bytes);
+    try std.testing.expectEqual(@as(usize, 8 * 36864), layout.rankBase(1));
+    try std.testing.expectEqual(@as(usize, 0), layout.qa);
+    try std.testing.expectEqual(qa_bytes, layout.qpe);
 }
 
 test "rope rows follow each row's absolute position and dense_len marks rows below 2048" {

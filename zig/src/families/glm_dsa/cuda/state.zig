@@ -354,6 +354,7 @@ pub const Geometry = struct {
     score_rows: usize = 64,
     /// Index MMA query rows grouped into one CTA (4, 8, or 16), captured once at setup.
     index_mma_rows: usize = 4,
+    index_qs: u8 = 0,
     /// Routed-expert rows per WP4 grouped call (EXL3 scratch scales with it).
     expert_rows: usize = 128,
     /// Borrowed KV tails temporarily host larger prompt expert batches; zero disables it.
@@ -371,14 +372,21 @@ pub const Geometry = struct {
     /// Reserve two half-piece collective destinations and the ordered communication stream for opt-in TBO.
     tbo: bool = false,
     shard_qkv_a: bool = false,
+    /// TF_GLM53_QA_SHARD=1: carve sh_q (this rank's [piece][1024] q_a half, the gather source); ws.q_a holds the gathered [2][piece][1024].
+    qa_shard: bool = false,
     /// Overlap grouped-prefill attention gathers with the next piece's attention.
     piece_pipe: bool = false,
+    /// Run deferred grouped-prefill shared expert MLPs while the final attention gather runs.
+    gather_ovl: u8 = 0,
     /// Overlap grouped-prefill MoE all-gathers on the communication stream.
     moe_pipe: bool = false,
+    /// Number of in-flight MoE gather slots. Two preserves the original workspace layout.
+    moe_ring: u8 = 2,
     /// Trim generic expert scratch to decode rows and carve dedicated prompt scratch.
     ws_trim: bool = false,
     /// Fuse grouped prompt combine into the MoE communication pack.
     moe_post: bool = false,
+    moe_ep: bool = false,
     /// Use highest CUDA priority for the communication stream.
     comm_prio: bool = false,
     /// TF_GLM53_INDEX_MERGE=2 selects the exact linear candidate merge.
@@ -399,6 +407,9 @@ pub const Geometry = struct {
     /// TF_GLM53_PREFILL_W8A8=1 captured once during setup and carried into Forward (prefill o_proj in W8A8).
     /// It does not change allocation geometry: the e4m3 rows and scales reuse the attention partials (`part`).
     prefill_w8a8: bool = false,
+    /// TF_GLM53_PREFILL_W8A8=2. Carves w8a8_scratch after prefill_weight. Off carves a zero-length region.
+    prefill_w8a8_all: bool = false,
+    qmmf_var: u8 = 0,
     /// no workspace effect; carried to Forward
     pre_fuse: PreFuse = .off,
     /// no workspace effect; carried to Forward
@@ -419,6 +430,22 @@ pub const Geometry = struct {
     prompt_experts: bool = false,
     /// Reserve a decode-only packed query staging region for TF_GLM53_COLL_FUSE=1.
     coll_fuse: bool = false,
+    /// Select the bit-identical short-sort candidate partition kernel.
+    cand_fast: bool = false,
+    /// TF_GLM53_CAND_V2=1: bit-identical histogram-threshold candidate kernels; no workspace effect.
+    cand_v2: bool = false,
+    /// Write decode side-route picks and weights directly into their eight-slot workspace rows.
+    route_compact: bool = false,
+    /// TF_GLM53_ADD_NORM_FUSE=1 (decode residual add + next input norm); no workspace effect.
+    add_norm_fuse: bool = false,
+    /// TF_GLM53_QPE_ABSORB_FUSE=1; no workspace effect.
+    qpe_absorb_fuse: bool = false,
+    /// TF_GLM53_L2PF=1 (decode L2 prefetch side stream); carried for the rank handshake and logs only.
+    l2pf: bool = false,
+    own_attend: bool = false,
+    q_one_gather: bool = false,
+    /// Reserve attention-partial exchange scratch for TF_GLM53_PARTIAL_ROCE=1.
+    partial_roce: bool = false,
     /// TF_GLM53_PROMPT_EXPERTS=2 at startup: the prompt path runs the 128-member wide kernels (same carve and bits).
     prompt_experts_wide: bool = false,
     prompt_experts_pmx: bool = false,
@@ -430,6 +457,7 @@ pub const Geometry = struct {
 };
 
 pub fn validateMoePipeGeometry(g: Geometry) !void {
+    if (g.moe_ring < 2 or g.moe_ring > Workspace.max_moe_pipe_ring_slots) return error.BadMoeRing;
     if (!g.moe_pipe) return;
     const pr: u64 = @intCast(@max(@min(g.piece_rows, @max(g.chunk_rows, g.decode_rows)), g.decode_rows));
     if (!groupedExperts(g.expert_rows, @intCast(pr))) return error.MoePipeRequiresGroupedExperts;
@@ -437,7 +465,7 @@ pub fn validateMoePipeGeometry(g: Geometry) !void {
     if (pieces > Workspace.max_moe_pipe_pieces) return error.MoePipeTooManyPieces;
     const stride = std.math.mul(u64, pr, hidden * 2) catch return error.MoePipeRingTooLarge;
     const slot_bytes = std.math.mul(u64, stride, if (g.moe_post) dcp_world else 1 + dcp_world) catch return error.MoePipeRingTooLarge;
-    _ = std.math.mul(u64, slot_bytes, Workspace.moe_pipe_ring_slots) catch return error.MoePipeRingTooLarge;
+    _ = std.math.mul(u64, slot_bytes, @as(u64, g.moe_ring)) catch return error.MoePipeRingTooLarge;
 }
 
 /// Device allocations are made in a few arenas (weights by class, KV planes, stage, workspace), each rounded once
@@ -655,7 +683,7 @@ pub fn adaptNeedBytes(g: Geometry, context: usize) u64 {
     gb.prompt_experts = true;
     const ref = workspaceLayout(gb, context);
     const lowrank_mid_big = @as(u64, @intCast(8 * g.expert_rows_adapt * lowrank_max * 4));
-    const sizes = [_]u64{ ref.sizes.xn, ref.sizes.picks8, ref.sizes.wts8, ref.sizes.shared_out, ref.sizes.routed_out, lowrank_mid_big, promptPlanBytes(g.expert_rows_adapt, routed_slots, routed_experts), cuda.exl3_experts.prompt.bytes(expertShape(), g.expert_rows_adapt, routed_slots, false) catch unreachable };
+    const sizes = [_]u64{ ref.sizes.xn, ref.sizes.picks8, ref.sizes.wts8, ref.sizes.picks_local, ref.sizes.shared_out, ref.sizes.routed_out, lowrank_mid_big, promptPlanBytes(g.expert_rows_adapt, routed_slots, routed_experts), cuda.exl3_experts.prompt.bytes(promptShape(gb), g.expert_rows_adapt, routed_slots, false) catch unreachable };
     var total: u64 = 0;
     for (sizes) |n| total += Workspace.align256(n);
     return total;
@@ -875,8 +903,47 @@ pub fn parseSampleK(raw: ?[]const u8) !usize {
 }
 
 /// Routed-expert shape for WP4 scratch sizing (this rank's 1024-wide halves of 256 experts).
+/// Prompt-expert scratch shape: expert-parallel ranks hold whole experts, so the local width is the full width.
+fn promptShape(g: Geometry) cuda.exl3_experts.Layer {
+    var shape = expertShape();
+    if (g.moe_ep) shape.width *= 2;
+    return shape;
+}
+
 pub fn expertShape() cuda.exl3_experts.Layer {
     return .{ .gate = 0, .up = 0, .down = 0, .gate_k2 = 0, .up_k2 = 0, .down_k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .experts = routed_experts, .dims = hidden, .width = expert_width, .codebook = .mcg_e4m3, .widths_ok = true };
+}
+
+/// Generic/decode EXL3 expert scratch shape; EP ranks hold 128 whole experts at full intermediate width.
+pub fn decodeExpertShape(moe_ep: bool) cuda.exl3_experts.Layer {
+    var shape = expertShape();
+    if (moe_ep) {
+        shape.experts = routed_experts / dcp_world;
+        shape.width *= dcp_world;
+    }
+    return shape;
+}
+
+test "EP decode expert scratch sizes full-width local experts while leaving EP off unchanged" {
+    const off_shape = decodeExpertShape(false);
+    const ep_shape = decodeExpertShape(true);
+    try std.testing.expectEqual(@as(usize, routed_experts), off_shape.experts);
+    try std.testing.expectEqual(@as(usize, expert_width), off_shape.width);
+    try std.testing.expectEqual(@as(usize, 128), ep_shape.experts);
+    try std.testing.expectEqual(@as(usize, 2 * expert_width), ep_shape.width);
+
+    const base: Geometry = .{ .expert_rows = 2048, .chunk_rows = 4096, .prompt_experts = true, .ws_trim = true };
+    var ep = base;
+    ep.moe_ep = true;
+    const ws_off = workspaceLayout(base, 32768);
+    const ws_ep = workspaceLayout(ep, 32768);
+    try std.testing.expectEqual(@as(u64, @intCast(cuda.exl3_experts.scratchBytes(off_shape, ws_off.generic_rows, routed_slots) catch unreachable)), ws_off.sizes.experts);
+    try std.testing.expectEqual(@as(u64, @intCast(cuda.exl3_experts.scratchBytes(ep_shape, ws_ep.generic_rows, routed_slots) catch unreachable)), ws_ep.sizes.experts);
+    try std.testing.expect(ws_ep.sizes.experts > ws_off.sizes.experts);
+    try std.testing.expect(ws_ep.sizes.picks_local >= @as(u64, @intCast(ws_ep.decode_rows * routed_slots * 4)));
+
+    const ungrouped_ep = workspaceLayout(.{ .expert_rows = 128, .chunk_rows = 4096, .moe_ep = true }, 32768);
+    try std.testing.expect(ungrouped_ep.sizes.picks_local >= @as(u64, @intCast(ungrouped_ep.decode_rows * routed_slots * 4)));
 }
 
 /// Every forward buffer of one rank, carved from one allocation. Persistent regions live across a forward step;
@@ -884,6 +951,7 @@ pub fn expertShape() cuda.exl3_experts.Layer {
 pub const Workspace = struct {
     pub const max_moe_pipe_pieces = 16;
     pub const moe_pipe_ring_slots = 2;
+    pub const max_moe_pipe_ring_slots = 8;
     pub const max_index_blocks = 64;
     rows: usize,
     piece_rows: usize,
@@ -904,8 +972,8 @@ pub const Workspace = struct {
     tbo_gathered: [2]u64,
     pipe_src: [2]u64,
     pipe_gather: [2]u64,
-    moe_pipe_src: [moe_pipe_ring_slots]u64,
-    moe_pipe_gather: [moe_pipe_ring_slots]u64,
+    moe_pipe_src: [max_moe_pipe_ring_slots]u64,
+    moe_pipe_gather: [max_moe_pipe_ring_slots]u64,
     moe_pipe_slots: usize,
     moe_pipe: u64,
     global_tokens: u64,
@@ -958,6 +1026,7 @@ pub const Workspace = struct {
     wts: u64,
     picks8: u64,
     wts8: u64,
+    picks_local: u64 = 0,
     shared_out: u64,
     routed_out: u64,
     lowrank_mid: u64,
@@ -974,6 +1043,8 @@ pub const Workspace = struct {
     head_gather: u64,
     /// Reused BF16 dequant destination for one backbone projection (kept live through its cuBLASLt GEMM).
     prefill_weight: u64,
+    /// Level-2 W8A8 activation scratch (e4m3 rows then fp32 scales). Zero-sized unless Geometry.prefill_w8a8_all.
+    w8a8_scratch: u64 = 0,
     /// Bytes from the base to the end of the last region.
     bytes: u64,
     /// Start and extent of the phase union, also the drafter's safe overlay area.
@@ -1037,6 +1108,7 @@ pub const Workspace = struct {
         wts: u64 = 0,
         picks8: u64 = 0,
         wts8: u64 = 0,
+        picks_local: u64 = 0,
         shared_out: u64 = 0,
         routed_out: u64 = 0,
         lowrank_mid: u64 = 0,
@@ -1051,6 +1123,7 @@ pub const Workspace = struct {
         cand_scratch: u64 = 0,
         head_gather: u64 = 0,
         prefill_weight: u64 = 0,
+        w8a8_scratch: u64 = 0,
     };
 
     pub fn align256(n: u64) u64 {
@@ -1134,7 +1207,7 @@ pub const Workspace = struct {
         }
         w.moe_pipe_slots = 0;
         if (g.moe_pipe) {
-            const moe_slots: usize = Workspace.moe_pipe_ring_slots;
+            const moe_slots: usize = @intCast(g.moe_ring);
             const stride = pr * hidden * 2;
             const slot_bytes = stride * @as(u64, if (g.moe_post) dcp_world else 1 + dcp_world);
             const ring_bytes = @as(u64, @intCast(moe_slots)) * slot_bytes;
@@ -1189,6 +1262,8 @@ pub const Workspace = struct {
             w.picks8 = take(&at, w.sizes.picks8);
             w.sizes.wts8 = batch_rows * routed_slots * 4;
             w.wts8 = take(&at, w.sizes.wts8);
+            w.sizes.picks_local = if (g.moe_ep) batch_rows * routed_slots * 4 else 0;
+            w.picks_local = take(&at, w.sizes.picks_local);
             w.sizes.shared_out = batch_rows * hidden * 4;
             w.shared_out = take(&at, w.sizes.shared_out);
             w.sizes.routed_out = if (g.moe_post) 0 else if (g.expert_rows > @as(usize, @intCast(pr))) batch_rows * hidden * 4 else 0;
@@ -1200,8 +1275,8 @@ pub const Workspace = struct {
         // attention phase
         w.sizes.q_a = pr * q_lora * 2;
         w.q_a = take(&at, w.sizes.q_a);
-        w.sizes.sh_q = if (g.shard_qkv_a) pr * 1024 * 2 else 0;
-        w.sh_q = if (g.shard_qkv_a) take(&at, w.sizes.sh_q) else at;
+        w.sizes.sh_q = if (g.shard_qkv_a or g.qa_shard) pr * 1024 * 2 else 0;
+        w.sh_q = if (g.shard_qkv_a or g.qa_shard) take(&at, w.sizes.sh_q) else at;
         w.sizes.sh_kv = if (g.shard_qkv_a) pr * 320 * 2 else 0;
         w.sh_kv = if (g.shard_qkv_a) take(&at, w.sizes.sh_kv) else at;
         w.sizes.sh_mine = if (g.shard_qkv_a) pr * 2688 else 0;
@@ -1226,10 +1301,11 @@ pub const Workspace = struct {
         w.qa = take(&at, w.sizes.qa);
         w.sizes.qpe = @max(dcp_world * dr * local_heads * mla.rope_dim * 2, pr * local_heads * mla.rope_dim * 2);
         w.qpe = take(&at, w.sizes.qpe);
-        w.sizes.fused_queries = if (g.coll_fuse) dcp_world * dr * local_heads * (mla.latent_dim + mla.rope_dim) * 2 else 0;
+        w.sizes.fused_queries = if (g.coll_fuse or g.q_one_gather) dcp_world * dr * local_heads * (mla.latent_dim + mla.rope_dim) * 2 else 0;
         w.fused_queries = take(&at, w.sizes.fused_queries);
-        // Decode computes both 32-head groups locally (2 blocks) and receives only the peer's matching block.
-        w.sizes.part = @max((dcp_world + 1) * dr * decode_partial_row_bytes, pr * local_heads * (mla.latent_dim * 2 + 4));
+        // Partial RoCE keeps the local partials plus a two-rank gathered pair in this buffer.
+        const decode_part_blocks: u64 = if (g.partial_roce) dcp_world + 3 else dcp_world + 1;
+        w.sizes.part = @max(decode_part_blocks * dr * decode_partial_row_bytes, pr * local_heads * (mla.latent_dim * 2 + 4));
         w.part = take(&at, w.sizes.part);
         w.sizes.ol = dr * local_heads * mla.latent_dim * 2;
         w.ol = take(&at, w.sizes.ol);
@@ -1275,6 +1351,8 @@ pub const Workspace = struct {
             w.picks8 = take(&at, w.sizes.picks8);
             w.sizes.wts8 = batch_rows * routed_slots * 4;
             w.wts8 = take(&at, w.sizes.wts8);
+            w.sizes.picks_local = if (g.moe_ep) batch_rows * routed_slots * 4 else 0;
+            w.picks_local = take(&at, w.sizes.picks_local);
             w.sizes.shared_out = batch_rows * hidden * 4;
             w.shared_out = take(&at, w.sizes.shared_out);
             w.sizes.routed_out = if (g.moe_post) 0 else if (g.expert_rows > @as(usize, @intCast(pr))) batch_rows * hidden * 4 else 0;
@@ -1287,7 +1365,7 @@ pub const Workspace = struct {
         w.sizes.mlp_act = pr * dense_width * 2;
         w.mlp_act = take(&at, w.sizes.mlp_act);
         const generic_rows: usize = if (trim_generic) @max(g.decode_rows, 16) else er;
-        w.sizes.experts = cuda.exl3_experts.scratchBytes(expertShape(), generic_rows, routed_slots) catch unreachable;
+        w.sizes.experts = cuda.exl3_experts.scratchBytes(decodeExpertShape(g.moe_ep), generic_rows, routed_slots) catch unreachable;
         w.experts = take(&at, w.sizes.experts);
         // Lifetime check for the ws.experts/prompt_experts overlay, in per-layer stream order:
         // 1. The prompt plan is written at the head of ws.experts by router.route; prompt rotate writes xg/xu.
@@ -1304,10 +1382,10 @@ pub const Workspace = struct {
         if (g.ws_trim and g.prompt_experts) {
             w.sizes.prompt_plan = promptPlanBytes(er, routed_slots, routed_experts);
             w.prompt_plan = take(&at, w.sizes.prompt_plan);
-            w.sizes.prompt_experts = cuda.exl3_experts.prompt.bytes(expertShape(), er, routed_slots, false) catch unreachable;
+            w.sizes.prompt_experts = cuda.exl3_experts.prompt.bytes(promptShape(g), er, routed_slots, false) catch unreachable;
             w.prompt_experts = take(&at, w.sizes.prompt_experts);
         } else if (g.prompt_experts) {
-            w.sizes.prompt_experts = cuda.exl3_experts.prompt.bytes(expertShape(), er, routed_slots, g.scratch_overlay) catch unreachable;
+            w.sizes.prompt_experts = cuda.exl3_experts.prompt.bytes(promptShape(g), er, routed_slots, g.scratch_overlay) catch unreachable;
             if (g.scratch_overlay) {
                 const offset = align256(promptPlanBytes(er, routed_slots, routed_experts));
                 w.prompt_experts = w.experts + offset;
@@ -1348,6 +1426,8 @@ pub const Workspace = struct {
         if (g.drafter_share_bytes != 0) at = @max(at, phase + g.drafter_share_bytes);
         w.sizes.prefill_weight = if (g.prefill_bf16) prefill_weight_scratch_bytes else 0;
         w.prefill_weight = take(&at, w.sizes.prefill_weight);
+        w.sizes.w8a8_scratch = if (g.prefill_w8a8_all) @as(u64, @intCast(cuda.w8a8.scratchBytes(g.piece_rows, cuda.w8a8.level2_k))) else 0;
+        w.w8a8_scratch = take(&at, w.sizes.w8a8_scratch);
         w.bytes = at - base;
         w.phase = phase;
         w.phase_bytes = @max(phase_bytes, g.drafter_share_bytes);
@@ -1366,13 +1446,14 @@ pub fn adaptWorkspace(base: Workspace, b: u64, g: Geometry, context: usize) Work
     w.xn = Workspace.take(&at, ref.sizes.xn); w.sizes.xn = ref.sizes.xn;
     w.picks8 = Workspace.take(&at, ref.sizes.picks8); w.sizes.picks8 = ref.sizes.picks8;
     w.wts8 = Workspace.take(&at, ref.sizes.wts8); w.sizes.wts8 = ref.sizes.wts8;
+    w.picks_local = Workspace.take(&at, ref.sizes.picks_local); w.sizes.picks_local = ref.sizes.picks_local;
     w.shared_out = Workspace.take(&at, ref.sizes.shared_out); w.sizes.shared_out = ref.sizes.shared_out;
     w.routed_out = Workspace.take(&at, ref.sizes.routed_out); w.sizes.routed_out = ref.sizes.routed_out;
     w.sizes.lowrank_mid = Workspace.align256(@intCast(8 * g.expert_rows_adapt * lowrank_max * 4));
     w.lowrank_mid = Workspace.take(&at, w.sizes.lowrank_mid);
     w.sizes.prompt_plan = promptPlanBytes(g.expert_rows_adapt, routed_slots, routed_experts);
     w.prompt_plan = Workspace.take(&at, w.sizes.prompt_plan);
-    w.sizes.prompt_experts = cuda.exl3_experts.prompt.bytes(expertShape(), g.expert_rows_adapt, routed_slots, false) catch unreachable;
+    w.sizes.prompt_experts = cuda.exl3_experts.prompt.bytes(promptShape(g), g.expert_rows_adapt, routed_slots, false) catch unreachable;
     w.prompt_experts = Workspace.take(&at, w.sizes.prompt_experts);
     w.expert_rows = g.expert_rows_adapt;
     w.scratch_overlay = false;
@@ -1382,7 +1463,7 @@ pub fn adaptWorkspace(base: Workspace, b: u64, g: Geometry, context: usize) Work
 
 /// RoCE gathers read and write these as plain device operands; RoCE registers only its own pinned host region.
 pub fn adaptRoceAligned(w: Workspace) bool {
-    const pointers = [_]u64{ w.xn, w.picks8, w.wts8, w.shared_out, w.routed_out, w.lowrank_mid, w.prompt_plan, w.prompt_experts };
+    const pointers = [_]u64{ w.xn, w.picks8, w.wts8, w.picks_local, w.shared_out, w.routed_out, w.lowrank_mid, w.prompt_plan, w.prompt_experts };
     for (pointers) |ptr| {
         if (ptr % 16 != 0) return false;
     }
@@ -1459,14 +1540,16 @@ pub const State = struct {
     kv: ?cuda.Event = null,
     fork2: ?cuda.Event = null,
     shared: ?cuda.Event = null,
+    attn_fork: ?cuda.Event = null,
+    attn_done: ?cuda.Event = null,
     /// TBO communication stream and per-half ready/done events. Collectives remain ordered on this one stream.
     tbo_stream: ?cuda.Stream = null,
     tbo_ready: [2]?cuda.Event = .{ null, null },
     tbo_done: [2]?cuda.Event = .{ null, null },
     pipe_ready: [2]?cuda.Event = .{ null, null },
     pipe_done: [2]?cuda.Event = .{ null, null },
-    moe_pipe_ready: [Workspace.moe_pipe_ring_slots]?cuda.Event = @splat(null),
-    moe_pipe_done: [Workspace.moe_pipe_ring_slots]?cuda.Event = @splat(null),
+    moe_pipe_ready: [Workspace.max_moe_pipe_ring_slots]?cuda.Event = @splat(null),
+    moe_pipe_done: [Workspace.max_moe_pipe_ring_slots]?cuda.Event = @splat(null),
     moe_pipe_pdone: [Workspace.max_moe_pipe_pieces]?cuda.Event = @splat(null),
     index_pipe_ready: [Workspace.max_index_blocks]?cuda.Event = @splat(null),
     index_pipe_done: ?cuda.Event = null,
@@ -1591,6 +1674,10 @@ pub const State = struct {
             out.kv = try cuda.Event.init(driver, false);
             out.fork2 = try cuda.Event.init(driver, false);
             out.shared = try cuda.Event.init(driver, false);
+            if (geometry.own_attend) {
+                out.attn_fork = try cuda.Event.init(driver, false);
+                out.attn_done = try cuda.Event.init(driver, false);
+            }
         }
         if (geometry.tbo or geometry.piece_pipe or geometry.moe_pipe or geometry.index_pipe) {
             out.tbo_stream = if (geometry.comm_prio) try cuda.Stream.initPriority(driver, .highest) else try cuda.Stream.init(driver, true);
@@ -1608,9 +1695,11 @@ pub const State = struct {
             }
         }
         if (geometry.moe_pipe) {
-            for (0..Workspace.moe_pipe_ring_slots) |slot| {
-                out.moe_pipe_ready[slot] = try cuda.Event.init(driver, false);
-                out.moe_pipe_done[slot] = try cuda.Event.init(driver, false);
+            for (0..Workspace.max_moe_pipe_ring_slots) |slot| {
+                if (slot < @as(usize, geometry.moe_ring)) {
+                    out.moe_pipe_ready[slot] = try cuda.Event.init(driver, false);
+                    out.moe_pipe_done[slot] = try cuda.Event.init(driver, false);
+                }
             }
             for (0..Workspace.max_moe_pipe_pieces) |piece| out.moe_pipe_pdone[piece] = try cuda.Event.init(driver, false);
         }
@@ -1648,7 +1737,7 @@ pub const State = struct {
             if (s.pipe_ready[slot]) |*event| event.deinit();
             if (s.pipe_done[slot]) |*event| event.deinit();
         }
-        for (0..Workspace.moe_pipe_ring_slots) |slot| {
+        for (0..Workspace.max_moe_pipe_ring_slots) |slot| {
             if (s.moe_pipe_ready[slot]) |*event| event.deinit();
             if (s.moe_pipe_done[slot]) |*event| event.deinit();
         }
@@ -1665,6 +1754,8 @@ pub const State = struct {
         if (s.kv) |*event| event.deinit();
         if (s.fork2) |*event| event.deinit();
         if (s.shared) |*event| event.deinit();
+        if (s.attn_fork) |*event| event.deinit();
+        if (s.attn_done) |*event| event.deinit();
         if (s.side) |*stream| stream.deinit();
         if (s.dequant_ready) |*event| event.deinit();
         if (s.dequant_consumed) |*event| event.deinit();
@@ -1830,7 +1921,8 @@ test "adaptive workspace only replaces prompt batch regions" {
     try std.testing.expectEqual(ref.sizes.wts8, w.sizes.wts8);
     try std.testing.expectEqual(ref.sizes.shared_out, w.sizes.shared_out);
     try std.testing.expectEqual(ref.sizes.routed_out, w.sizes.routed_out);
-    try std.testing.expect(w.sizes.prompt_experts >= cuda.exl3_experts.prompt.bytes(expertShape(), 2048, routed_slots, false) catch unreachable);
+    try std.testing.expectEqual(@as(u64, 0), w.sizes.picks_local);
+    try std.testing.expectEqual(@as(u64, @intCast(cuda.exl3_experts.prompt.bytes(expertShape(), 2048, routed_slots, false) catch unreachable)), w.sizes.prompt_experts);
     try std.testing.expect(w.xn >= b and w.xn + w.sizes.xn <= b + adaptNeedBytes(g, 262144));
     try std.testing.expectEqual(base.x, w.x);
     try std.testing.expectEqual(base.gathered, w.gathered);
@@ -1846,6 +1938,28 @@ test "adaptive workspace only replaces prompt batch regions" {
             try std.testing.expect(starts[i] + Workspace.align256(lens[i]) <= starts[j] or starts[j] + Workspace.align256(lens[j]) <= starts[i]);
         }
     }
+}
+
+test "adaptive EP workspace sizes local picks and full width prompt scratch" {
+    const g: Geometry = .{ .expert_rows = 1024, .chunk_rows = 4096, .piece_rows = 512, .expert_rows_adapt = 4096, .moe_ep = true };
+    var off = g;
+    off.moe_ep = false;
+    const off_need = adaptNeedBytes(off, 262144);
+    const ep_need = adaptNeedBytes(g, 262144);
+    const plan = try planAdapt(std.testing.allocator, g, 262144, 2 << 20);
+    defer std.testing.allocator.free(plan.tails);
+    const base = workspaceLayout(g, 262144);
+    const w = adaptWorkspace(base, 0x100000000, g, 262144);
+    const ep_shape = promptShape(g);
+    const off_shape = promptShape(off);
+    const ep_prompt = cuda.exl3_experts.prompt.bytes(ep_shape, 4096, routed_slots, false) catch unreachable;
+    const off_prompt = cuda.exl3_experts.prompt.bytes(off_shape, 4096, routed_slots, false) catch unreachable;
+    try std.testing.expectEqual(@as(u64, 4096 * routed_slots * 4), w.sizes.picks_local);
+    try std.testing.expectEqual(@as(u64, @intCast(ep_prompt)), w.sizes.prompt_experts);
+    try std.testing.expectEqual(@as(u64, 67_239_936), ep_need - off_need);
+    try std.testing.expectEqual(ep_need, plan.need);
+    try std.testing.expect(plan.pool >= plan.need);
+    try std.testing.expectEqual(@as(u64, 67_108_864), @as(u64, @intCast(ep_prompt - off_prompt)));
 }
 
 test "adaptive workspace is RoCE-aligned for production geometries" {
@@ -1955,6 +2069,11 @@ test "workspace regions are aligned, inside the allocation, and phases share one
     try std.testing.expectEqual(@as(u64, 4), w.sizes.lane_part_side);
     const decode_scratch = Workspace.carve(0x20000, .{ .decode_rows = 8, .piece_rows = 512, .lane_clusters = false }, 8192);
     try std.testing.expectEqual(lanePartBytes(8, false), decode_scratch.sizes.lane_part_side);
+    const partial_roce = Workspace.carve(0x20000, .{ .decode_rows = 16, .piece_rows = 16, .chunk_rows = 16, .partial_roce = true }, 16);
+    const partial_block = @as(u64, 16) * decode_partial_row_bytes;
+    try std.testing.expectEqual(@as(u64, 526336), partial_block);
+    try std.testing.expect(partial_roce.sizes.part >= 5 * partial_block);
+    try std.testing.expect(partial_block % 16 == 0 and partial_block <= 4 << 20);
     // Per-piece reduce, fused-selection slots/counts, chunk-wide token list and row inputs.
     try std.testing.expectEqual(@as(u64, 2 * 512 * 6144 * 4), w.sizes.gathered);
     try std.testing.expectEqual(@as(u64, 4096 * 2048 * 4), w.sizes.local_slots);
@@ -1966,6 +2085,16 @@ test "workspace regions are aligned, inside the allocation, and phases share one
     try std.testing.expectEqual(@as(u64, 0x10000) + bf16.bytes, bf16.prefill_weight + bf16.sizes.prefill_weight);
     try std.testing.expectEqual(@as(u64, 150_994_944), prefill_weight_scratch_bytes);
     try std.testing.expectEqual(@as(usize, 32_896), decode_partial_row_bytes);
+    try std.testing.expectEqual(@as(u64, 0), w.sizes.w8a8_scratch);
+    var level2_g = g;
+    level2_g.prefill_w8a8_all = true;
+    const level2_ws = Workspace.carve(0x10000, level2_g, 262144);
+    try std.testing.expectEqual(w.part, level2_ws.part);
+    try std.testing.expectEqual(w.prefill_weight, level2_ws.prefill_weight);
+    try std.testing.expectEqual(w.bytes + level2_ws.sizes.w8a8_scratch, level2_ws.bytes);
+    try std.testing.expectEqual(@as(u64, 3_244_032), level2_ws.sizes.w8a8_scratch);
+    try std.testing.expectEqual(level2_ws.sizes.w8a8_scratch, @as(u64, @intCast(cuda.w8a8.scratchBytes(512, cuda.w8a8.level2_k))));
+    try std.testing.expectEqual(w.bytes + 0x10000, level2_ws.w8a8_scratch);
 }
 
 test "drafter overlay extends only the phase union when larger than it" {
@@ -2398,18 +2527,53 @@ test "MoE pipe ring stays outside the phase union and costs zero when disabled" 
             const off = workspaceLayout(.{ .expert_rows = rows, .chunk_rows = rows, .piece_rows = piece_rows }, context);
             const on = workspaceLayout(.{ .expert_rows = rows, .chunk_rows = rows, .piece_rows = piece_rows, .moe_pipe = true }, context);
             const stride = @as(u64, @intCast(piece_rows)) * hidden * 2;
-            const bytes = Workspace.moe_pipe_ring_slots * stride * (1 + dcp_world);
-            const ring_end = on.moe_pipe + on.sizes.moe_pipe;
-            const phase_end = on.phase + on.phase_bytes;
             try std.testing.expectEqual(@as(u64, 0), off.sizes.moe_pipe);
-            try std.testing.expectEqual(bytes, on.sizes.moe_pipe);
-            try std.testing.expect(ring_end <= on.phase or on.moe_pipe >= phase_end);
-            try std.testing.expectEqual(Workspace.moe_pipe_ring_slots, on.moe_pipe_slots);
-            try std.testing.expectEqual(on.moe_pipe, on.moe_pipe_src[0]);
-            try std.testing.expectEqual(on.moe_pipe_src[0] + stride, on.moe_pipe_gather[0]);
-            try std.testing.expect(on.moe_pipe_gather[1] + dcp_world * stride <= ring_end);
+            for ([_]u8{ 2, 8 }) |ring| {
+                var geometry: Geometry = .{ .expert_rows = rows, .chunk_rows = rows, .piece_rows = piece_rows, .moe_pipe = true };
+                geometry.moe_ring = ring;
+                const layout = workspaceLayout(geometry, context);
+                const slot_bytes = stride * (1 + dcp_world);
+                const ring_end = layout.moe_pipe + layout.sizes.moe_pipe;
+                const phase_end = layout.phase + layout.phase_bytes;
+                try std.testing.expectEqual(@as(u64, ring) * slot_bytes, layout.sizes.moe_pipe);
+                try std.testing.expect(ring_end <= layout.phase or layout.moe_pipe >= phase_end);
+                try std.testing.expectEqual(@as(usize, ring), layout.moe_pipe_slots);
+                try std.testing.expectEqual(layout.moe_pipe, layout.moe_pipe_src[0]);
+                try std.testing.expectEqual(layout.moe_pipe_src[0] + stride, layout.moe_pipe_gather[0]);
+                for (0..@as(usize, ring)) |slot| {
+                    const slot_start = layout.moe_pipe + @as(u64, @intCast(slot)) * slot_bytes;
+                    try std.testing.expectEqual(slot_start, layout.moe_pipe_src[slot]);
+                    try std.testing.expectEqual(slot_start + stride, layout.moe_pipe_gather[slot]);
+                    try std.testing.expect(layout.moe_pipe_gather[slot] + dcp_world * stride <= slot_start + slot_bytes);
+                    if (slot + 1 < @as(usize, ring)) try std.testing.expect(slot_start + slot_bytes <= layout.moe_pipe_src[slot + 1]);
+                }
+                try std.testing.expect(layout.moe_pipe_src[0] != layout.moe_pipe_src[1]);
+                if (ring == 8) {
+                    try std.testing.expectEqual(on.x, layout.x);
+                    try std.testing.expectEqual(on.xn, layout.xn);
+                    try std.testing.expectEqual(on.gathered, layout.gathered);
+                    try std.testing.expectEqual(on.sizes.x, layout.sizes.x);
+                    try std.testing.expectEqual(on.sizes.xn, layout.sizes.xn);
+                    try std.testing.expectEqual(on.sizes.gathered, layout.sizes.gathered);
+                    try std.testing.expectEqual(on.tbo_gathered, layout.tbo_gathered);
+                    try std.testing.expectEqual(on.sizes.tbo_gathered, layout.sizes.tbo_gathered);
+                    try std.testing.expectEqual(on.pipe_src, layout.pipe_src);
+                    try std.testing.expectEqual(on.sizes.pipe_src, layout.sizes.pipe_src);
+                    try std.testing.expectEqual(on.pipe_gather, layout.pipe_gather);
+                    try std.testing.expectEqual(on.sizes.pipe_gather, layout.sizes.pipe_gather);
+                    try std.testing.expectEqual(on.moe_pipe, layout.moe_pipe);
+                }
+            }
         }
     }
+}
+
+test "MoE pipe geometry validates ring bounds even when the pipe is disabled" {
+    try validateMoePipeGeometry(.{ .moe_ring = 2 });
+    try validateMoePipeGeometry(.{ .moe_ring = 8 });
+    try std.testing.expectError(error.BadMoeRing, validateMoePipeGeometry(.{ .moe_ring = 1 }));
+    try std.testing.expectError(error.BadMoeRing, validateMoePipeGeometry(.{ .moe_ring = 9 }));
+    try validateMoePipeGeometry(.{ .expert_rows = 4096, .chunk_rows = 4096, .piece_rows = 512, .moe_pipe = true, .moe_ring = 8 });
 }
 
 test "SMLA-P3 union table: off carves nothing; on adds one attention-phase region and moves nothing else" {
@@ -2565,4 +2729,19 @@ test "MoE post removes routed output and stores in-place gather rows" {
     try std.testing.expectEqual(on.moe_pipe, on.moe_pipe_gather[0]);
     try std.testing.expectEqual(on.moe_pipe + stride * dcp_world, on.moe_pipe_gather[1]);
     try std.testing.expectEqual(off.bytes - 2048 * hidden * 4 - 2 * stride, on.bytes);
+    var ring_eight = enabled;
+    ring_eight.moe_ring = 8;
+    const ring_eight_layout = workspaceLayout(ring_eight, context);
+    const ring_eight_slot_bytes = stride * dcp_world;
+    const ring_eight_end = ring_eight_layout.moe_pipe + ring_eight_layout.sizes.moe_pipe;
+    const ring_eight_phase_end = ring_eight_layout.phase + ring_eight_layout.phase_bytes;
+    try std.testing.expectEqual(@as(u64, 8) * ring_eight_slot_bytes, ring_eight_layout.sizes.moe_pipe);
+    try std.testing.expectEqual(@as(usize, 8), ring_eight_layout.moe_pipe_slots);
+    try std.testing.expect(ring_eight_end <= ring_eight_layout.phase or ring_eight_layout.moe_pipe >= ring_eight_phase_end);
+    for (0..8) |slot| {
+        const slot_start = ring_eight_layout.moe_pipe + @as(u64, @intCast(slot)) * ring_eight_slot_bytes;
+        try std.testing.expectEqual(slot_start, ring_eight_layout.moe_pipe_gather[slot]);
+        try std.testing.expect(ring_eight_layout.moe_pipe_gather[slot] + ring_eight_slot_bytes <= slot_start + ring_eight_slot_bytes);
+        if (slot + 1 < 8) try std.testing.expect(slot_start + ring_eight_slot_bytes <= ring_eight_layout.moe_pipe_gather[slot + 1]);
+    }
 }

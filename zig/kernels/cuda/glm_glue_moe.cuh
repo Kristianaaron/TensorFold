@@ -88,8 +88,9 @@ extern "C" __global__ void __launch_bounds__(128)
 }
 
 // glue._topk, a warp a row: top_k by sigmoid + bias (ties to lower id), normed if `norm`, x scale; then shared expert.
-__device__ __forceinline__ void tf_glm_topk_task(const float* logits, const float* bias, int* pick, float* wts,
-                                                 float scale, int ne, int top_k, int norm) {
+__device__ __forceinline__ void tf_glm_topk_strided_task(const float* logits, const float* bias, int* pick, float* wts,
+                                                         float scale, int ne, int top_k, int norm, int stride,
+                                                         bool shared_slot) {
   constexpr int MAXE = 16;  // 512 experts a row
   const int64_t r = TF_VBID.x;
   const int lane = threadIdx.x;
@@ -124,17 +125,31 @@ __device__ __forceinline__ void tf_glm_topk_task(const float* logits, const floa
   }
   if (lane < top_k) {
     const float v = norm ? div_full(mine, total + 1e-20f) : mine;
-    pick[r * (top_k + 1) + lane] = mine_id;
-    wts[r * (top_k + 1) + lane] = __fmul_rn(v, scale);
-  } else if (lane == top_k) {
-    pick[r * (top_k + 1) + lane] = ne;
-    wts[r * (top_k + 1) + lane] = 1.0f;
+    pick[r * stride + lane] = mine_id;
+    wts[r * stride + lane] = __fmul_rn(v, scale);
   }
+  if (shared_slot && lane == top_k) {
+    pick[r * stride + lane] = ne;
+    wts[r * stride + lane] = 1.0f;
+  }
+}
+
+// The original task, kept for the megakernel dispatch (mk_dispatch_moe.cuh): stride top_k + 1 with the shared slot.
+__device__ __forceinline__ void tf_glm_topk_task(const float* logits, const float* bias, int* pick, float* wts,
+                                                 float scale, int ne, int top_k, int norm) {
+  tf_glm_topk_strided_task(logits, bias, pick, wts, scale, ne, top_k, norm, top_k + 1, true);
 }
 
 extern "C" __global__ void __launch_bounds__(32)
     tf_glm_topk(const float* logits, const float* bias, int* pick, float* wts, float scale, int ne, int top_k,
                 int norm) {
     TF_VBLOCK_ENTER();
-  tf_glm_topk_task(logits, bias, pick, wts, scale, ne, top_k, norm);
+  tf_glm_topk_strided_task(logits, bias, pick, wts, scale, ne, top_k, norm, top_k + 1, true);
+}
+
+extern "C" __global__ void __launch_bounds__(32)
+    tf_glm_topk_compact(const float* logits, const float* bias, int* pick, float* wts, float scale, int ne,
+                        int top_k, int norm) {
+    TF_VBLOCK_ENTER();
+  tf_glm_topk_strided_task(logits, bias, pick, wts, scale, ne, top_k, norm, top_k, false);
 }

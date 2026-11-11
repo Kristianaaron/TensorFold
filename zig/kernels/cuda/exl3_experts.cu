@@ -30,7 +30,7 @@ struct GroupedArgs {
 };
 
 // One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc: per-lane loads and the shared decode (same bits).
-template <int CB, int K2, int NT>
+template <int CB, int K2, int NT, bool NOALLOC = false>
 __device__ __forceinline__ void warp_tiles(const uint32_t* T, int ntiles, int kt0, int nkt, int nt0, const half* x0,
                                            const half* x1, bool ok0, bool ok1, int lane, float (&acc)[NT][2][4], int l2d) {
     // L2 read-ahead after MiaAI-Lab GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold patch 0128-glm-full-expert-prefetch (Apache-2.0, Copyright 2026 Mia's AI Lab); independent CUDA. Changes: depth argument, GLM-only default.
@@ -50,7 +50,10 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* T, int ntiles, int kt
             prefetch_l2(T + (size_t)(kt0 + i + l2d) * kstride + (size_t)nt0 * TW + (size_t)lane * 32);
         uint32_t w[NT][LW];
 #pragma unroll
-        for (int j = 0; j < NT; ++j) ldg_lane_words<K2>(t0 + j * TW, lane, w[j]);
+        for (int j = 0; j < NT; ++j) {
+            if constexpr (NOALLOC) ldg_lane_words_noalloc<K2>(t0 + j * TW, lane, w[j]);
+            else ldg_lane_words<K2>(t0 + j * TW, lane, w[j]);
+        }
         const int k = (kt0 + i) * 16;
         const uint32_t a[4] = {ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k) : 0u,
                                ok1 ? *reinterpret_cast<const uint32_t*>(x1 + k) : 0u,
@@ -67,7 +70,7 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* T, int ntiles, int kt
 }
 
 // Program (expert u, n block, split, member tile): 16 members times W_q over the split's K range, summed in warp order.
-template <int CB, int NT, int W>
+template <int CB, int NT, int W, bool NOALLOC = false>
 __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nblock, int zz) {
     if (u >= a.ucount[0]) return;
     const int MT = (a.maxm + 15) / 16;
@@ -112,7 +115,7 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
     switch (k2) {
 #define TF_EXL3X_CASE(K2_)                                                                                   \
     case K2_:                                                                                                \
-        warp_tiles<CB, K2_, NT>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc, a.l2d);  \
+        warp_tiles<CB, K2_, NT, NOALLOC>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc, a.l2d);  \
         break;
         TF_EXL3X_CASE(2)
         TF_EXL3X_CASE(3)
@@ -183,6 +186,15 @@ __device__ __forceinline__ void tf_exl3_grouped_3_task(tf_exl3::GroupedArgs a) {
 }
 extern "C" __global__ void __launch_bounds__(128) tf_exl3_grouped_3(tf_exl3::GroupedArgs a) {
     TF_VBLOCK_ENTER(); tf_exl3_grouped_3_task(a); }
+
+#define TF_EXL3_NOALLOC_KERNEL(CB_) \
+extern "C" __global__ void __launch_bounds__(128) tf_exl3_grouped_noalloc_##CB_(tf_exl3::GroupedArgs a) { \
+    TF_VBLOCK_ENTER(); tf_exl3::grouped_body<CB_, 8, 4, true>(a, TF_VBID.x, TF_VBID.y, TF_VBID.z); }
+TF_EXL3_NOALLOC_KERNEL(0)
+TF_EXL3_NOALLOC_KERNEL(1)
+TF_EXL3_NOALLOC_KERNEL(2)
+TF_EXL3_NOALLOC_KERNEL(3)
+#undef TF_EXL3_NOALLOC_KERNEL
 
 // Small parity entry points use the exact decoder template that grouped_3 calls.
 template <int K2>

@@ -56,7 +56,7 @@ fn mockLowRankPartialWrite(buffer: []f32, rows: usize, rank_width: usize) !void 
 
 pub const Route = struct { pick: [top_k]u16, weights: [top_k]f32 };
 
-pub const RouterKernels = struct { router_part: cuda.Function, router_tile: cuda.Function, topk: cuda.Function, slice_sum: cuda.Function };
+pub const RouterKernels = struct { router_part: cuda.Function, router_tile: cuda.Function, topk: cuda.Function, topk_compact: cuda.Function, slice_sum: cuda.Function };
 
 /// Reuse Flash's captured router kernels; GLM-5.3 uses the same sigmoid,
 /// correction-bias choice, unbiased normalized scores and lower-id tie rule.
@@ -73,6 +73,21 @@ pub fn route(k: RouterKernels, stream: cuda.Stream, x: u64, x_stride: usize, rou
     var top: cuda.Args = .{};
     inline for (.{ logits, bias, pick, weights, @as(f32, 2.5), @as(c_int, experts), @as(c_int, top_k), @as(c_int, 1) }) |v| top.add(v);
     try cuda.launch.launch(k.topk, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 32 } }, stream, &top);
+}
+
+pub fn routeCompact(k: RouterKernels, stream: cuda.Stream, x: u64, x_stride: usize, router: u64, bias: u64, logits: u64, partials: u64, pick: u64, weights: u64, rows: usize) !void {
+    var dot: cuda.Args = .{};
+    inline for (.{ x, router, partials, @as(i64, @intCast(rows)), @as(i64, @intCast(x_stride)), @as(i64, @intCast(hidden)), @as(i64, @intCast(experts)), @as(c_int, 8) }) |v| dot.add(v);
+    const tile = x % 16 == 0 and x_stride % 8 == 0;
+    const rf = if (tile) k.router_tile else k.router_part;
+    const gx: u32 = if (tile) @intCast((rows + 63) / 64) else @intCast((rows + 15) / 16);
+    try cuda.launch.launch(rf, .{ .grid = .{ .x = gx, .y = 8, .z = 8 }, .block = .{ .x = 128 }, .shared = if (tile) 27_648 else 0 }, stream, &dot);
+    var reduce: cuda.Args = .{};
+    inline for (.{ partials, logits, @as(i64, @intCast(rows * experts)), @as(c_int, 8), @as(c_int, 1) }) |v| reduce.add(v);
+    try cuda.launch.launch(k.slice_sum, .{ .grid = .{ .x = @intCast((rows * experts + 1023) / 1024) }, .block = .{ .x = 128 } }, stream, &reduce);
+    var top: cuda.Args = .{};
+    inline for (.{ logits, bias, pick, weights, @as(f32, 2.5), @as(c_int, @intCast(experts)), @as(c_int, @intCast(top_k)), @as(c_int, 1) }) |v| top.add(v);
+    try cuda.launch.launch(k.topk_compact, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 32 } }, stream, &top);
 }
 
 /// Host reference for tf_glm_topk: choice uses sigmoid(logit)+bias, but weights
@@ -112,6 +127,7 @@ pub const Kernels = struct {
     lowrank_combine_bf16: cuda.Function,
     lowrank_combine_bf16_decode: cuda.Function,
     moe_post: ?cuda.Function = null,
+    moe_post_ep: ?cuda.Function = null,
     residual_add_bf16: cuda.Function,
 
     pub fn load(module: cuda.Module) !Kernels {
@@ -121,6 +137,7 @@ pub const Kernels = struct {
             .lowrank_combine_bf16 = try module.function("tf_glm53_lowrank_combine_bf16"),
             .lowrank_combine_bf16_decode = try module.function("tf_glm53_lowrank_combine_bf16_decode"),
             .moe_post = try module.function("tf_glm53_moe_post"),
+            .moe_post_ep = try module.function("tf_glm53_moe_post_ep"),
             .residual_add_bf16 = try module.function("tf_glm53_moe_residual_add"),
         };
     }
@@ -261,6 +278,22 @@ pub fn postPrompt(k: Kernels, stream: cuda.Stream, y: u64, weights: u64, shared_
     try cuda.launch.launch(kernel, .{ .grid = .{ .x = @intCast((rows * hidden + 255) / 256) }, .block = .{ .x = 256 } }, stream, &args);
 }
 
+pub fn postPromptEp(k: Kernels, stream: cuda.Stream, y: u64, weights: u64, picks: u64, shared_out: u64, lowrank_weights: ?LowRankWeights, rows: usize, moe_out: u64) !void {
+    var b: u64 = 0;
+    var mid: u64 = 0;
+    var rank: usize = 0;
+    if (lowrank_weights) |lr| {
+        if (rows == 0 or lr.rank_local == 0 or lr.rank_local > lowrank) return error.LowRankShape;
+        b = lr.b;
+        mid = lr.mid;
+        rank = lr.rank_local;
+    }
+    const kernel = k.moe_post_ep orelse return error.MoePostKernelMissing;
+    var args: cuda.Args = .{};
+    inline for (.{ y, weights, picks, shared_out, b, mid, moe_out, @as(c_int, @intCast(rows)), @as(c_int, @intCast(hidden)), @as(c_int, @intCast(rank)), @as(c_int, @intCast(hidden)) }) |v| args.add(v);
+    try cuda.launch.launch(kernel, .{ .grid = .{ .x = @intCast((rows * hidden + 255) / 256) }, .block = .{ .x = 256 } }, stream, &args);
+}
+
 /// Round-to-nearest-even BF16, matching CUDA's `__float2bfloat16_rn`.
 pub fn bf16Bits(value: f32) u16 {
     const bits: u32 = @bitCast(value);
@@ -377,7 +410,7 @@ test "MoE null profile hooks preserve launches around routed work" {
     var d: cuda.Driver = undefined;
     d.api.cuLaunchKernel = Recording.launch;
     const stream: cuda.Stream = .{ .d = &d, .handle = null };
-    const route_k: RouterKernels = .{ .router_part = Recording.function(&d, 1), .router_tile = Recording.function(&d, 1), .topk = Recording.function(&d, 3), .slice_sum = Recording.function(&d, 2) };
+    const route_k: RouterKernels = .{ .router_part = Recording.function(&d, 1), .router_tile = Recording.function(&d, 1), .topk = Recording.function(&d, 3), .topk_compact = Recording.function(&d, 3), .slice_sum = Recording.function(&d, 2) };
     var lane: cuda.qmmf.Lane = undefined;
     const mlp_k: mlp.Kernels = .{ .linear = &lane, .swiglu_plain = Recording.function(&d, 4), .project_ctx = null, .project_fn = RecordingProject.run };
     const w: mlp.Weights = .{

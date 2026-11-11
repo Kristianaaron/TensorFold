@@ -32,14 +32,28 @@ pub const Router = struct {
     plan_rank: Function,
     plan_offsets: Function,
     plan_scatter: Function,
+    plan_small_ep: Function = undefined,
+    plan_rank_ep: Function = undefined,
+    plan_scatter_ep: Function = undefined,
+    localize_picks: Function = undefined,
+    allow_negative: bool = false,
 
     /// The plan kernels from a loaded experts module (kernels.experts).
     pub fn resolve(mod: Module) !Router {
-        return .{ .plan_small = try mod.function(symbols.plan), .plan_rank = try mod.function(symbols.rank), .plan_offsets = try mod.function(symbols.offsets), .plan_scatter = try mod.function(symbols.scatter) };
+        return .{ .plan_small = try mod.function(symbols.plan), .plan_rank = try mod.function(symbols.rank), .plan_offsets = try mod.function(symbols.offsets), .plan_scatter = try mod.function(symbols.scatter), .plan_small_ep = try mod.function("tf_experts_plan_small_ep"), .plan_rank_ep = try mod.function("tf_experts_plan_rank_ep"), .plan_scatter_ep = try mod.function("tf_experts_plan_scatter_ep"), .localize_picks = try mod.function("tf_moe_localize_picks") };
     }
 
     fn go(f: Function, s: Stream, grid: usize, block: u32, a: *launch_.Args) !void {
         try launch_.launch(f, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = block } }, s, a);
+    }
+
+    pub fn localize(r: Router, s: Stream, picks: u64, localized: u64, pairs: usize, rank: usize) !void {
+        var a: launch_.Args = .{};
+        a.add(picks);
+        a.add(localized);
+        a.add(@as(c_int, @intCast(pairs)));
+        a.add(@as(c_int, @intCast(rank)));
+        try go(r.localize_picks, s, (pairs + 255) / 256, 256, &a);
     }
 
     /// experts.route: `pairs` int32 expert ids at `picks` grouped into items of at most `tile` pairs (16 decode).
@@ -49,7 +63,7 @@ pub const Router = struct {
             a.add(picks);
             for ([_]usize{ pairs, count, tile }) |v| a.add(@as(c_int, @intCast(v)));
             for ([_]u64{ p.members, p.items, p.counts }) |v| a.add(v);
-            return go(r.plan_small, s, 1, 1024, &a);
+            return go(if (r.allow_negative) r.plan_small_ep else r.plan_small, s, 1, 1024, &a);
         }
         const nblk = (pairs + 1023) / 1024;
         a.add(picks);
@@ -57,7 +71,7 @@ pub const Router = struct {
         a.add(@as(c_int, @intCast(count)));
         a.add(p.rank);
         a.add(p.hist);
-        try go(r.plan_rank, s, nblk, 1024, &a);
+        try go(if (r.allow_negative) r.plan_rank_ep else r.plan_rank, s, nblk, 1024, &a);
         var b: launch_.Args = .{};
         for ([_]usize{ nblk, count, tile }) |v| b.add(@as(c_int, @intCast(v)));
         for ([_]u64{ p.hist, p.items, p.counts }) |v| b.add(v);
@@ -67,7 +81,7 @@ pub const Router = struct {
         c.add(@as(c_int, @intCast(pairs)));
         c.add(@as(c_int, @intCast(count)));
         for ([_]u64{ p.rank, p.hist, p.members }) |v| c.add(v);
-        try go(r.plan_scatter, s, (pairs + 255) / 256, 256, &c);
+        try go(if (r.allow_negative) r.plan_scatter_ep else r.plan_scatter, s, (pairs + 255) / 256, 256, &c);
     }
 };
 

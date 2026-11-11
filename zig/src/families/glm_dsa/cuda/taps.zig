@@ -3,6 +3,13 @@
 //! GLM-5.3 DSA taps: copy selected residual hidden rows into the drafter buffer.
 const cuda = @import("cuda");
 
+/// TF_GLM53_DRAFT_INGEST_SIDE: the drafter's verify ingest, forked after the last tap layer, joined after the head.
+pub const Ingest = struct {
+    ctx: *anyopaque,
+    fork_fn: *const fn (ctx: *anyopaque, s: cuda.Stream, positions: u64, rows: usize) anyerror!void,
+    join_fn: *const fn (ctx: *anyopaque, s: cuda.Stream) anyerror!void,
+};
+
 pub const default_layers = [_]usize{ 5, 19, 33, 47, 61, 75 };
 
 pub const Taps = struct {
@@ -12,6 +19,7 @@ pub const Taps = struct {
     layers: []const usize = &default_layers,
     from: usize = 0,
     cap_rows: usize,
+    ingest: ?Ingest = null,
 };
 
 pub fn at(t: Taps, s: cuda.Stream, layer: usize, x: u64, first: usize, rows: usize) !void {

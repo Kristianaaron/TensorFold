@@ -127,6 +127,131 @@ pub const GroupSegAbi = extern struct { w: u64 = 0, bs: u64 = 0, out: u64 = 0, s
 pub const GroupArgsAbi = extern struct { x: u64, prefetch: u64, prefetch_bytes: i64, m: i32, k: i32, ldx: i32, band: i32, count: i32, pad: u32 = 0, seg: [max_group]GroupSegAbi };
 comptime { std.debug.assert(@sizeOf(GroupSegAbi) == 48 and @sizeOf(GroupArgsAbi) == 240 and @offsetOf(GroupArgsAbi, "seg") == 48); }
 
+/// Schedule variants of the release FP8B kernel. Each variant uses the same qmmf_task arithmetic.
+pub const Variant = enum { release, s2, w2, w2s2, b128 };
+
+/// FP8B entry points from qmmf2.cu. The module stays alive for the lifetime of this value.
+pub const VariantFns = struct {
+    mod: Module,
+    entries: [4][2][2]Function,
+    groups: [4]Function,
+
+    fn index(v: Variant) usize {
+        return switch (v) {
+            .release => unreachable,
+            .s2 => 0,
+            .w2 => 1,
+            .w2s2 => 2,
+            .b128 => 3,
+        };
+    }
+
+    fn bm(v: Variant) usize {
+        return if (v == .b128) 128 else 64;
+    }
+
+    fn block(v: Variant) u32 {
+        return if (v == .s2) 128 else 256;
+    }
+
+    fn shared(v: Variant) u32 {
+        return switch (v) {
+            .release => unreachable,
+            .s2, .w2s2 => 24576,
+            .w2 => 49152,
+            .b128 => 40960,
+        };
+    }
+
+    pub fn load(d: *const Driver) !VariantFns {
+        var mod = try Module.load(d, kernels.qmmf2);
+        errdefer mod.unload();
+        var vf: VariantFns = .{ .mod = mod, .entries = undefined, .groups = undefined };
+        inline for (.{ Variant.s2, Variant.w2, Variant.w2s2, Variant.b128 }, 0..) |v, vi| {
+            const labels = [2][2][:0]const u8{
+                .{ std.fmt.comptimePrint("tf_qmmf2_{s}_p_b16", .{@tagName(v)}), std.fmt.comptimePrint("tf_qmmf2_{s}_p_f32", .{@tagName(v)}) },
+                .{ std.fmt.comptimePrint("tf_qmmf2_{s}_f_b16", .{@tagName(v)}), std.fmt.comptimePrint("tf_qmmf2_{s}_f_f32", .{@tagName(v)}) },
+            };
+            for (labels, 0..) |pair, fi| for (pair, 0..) |name, oi| {
+                const f = try mod.function(name);
+                try f.allowDynamicShared(shared(v));
+                vf.entries[vi][fi][oi] = f;
+            };
+            const group_fn = try mod.function(std.fmt.comptimePrint("tf_qmmf2_group_{s}", .{@tagName(v)}));
+            try group_fn.allowDynamicShared(shared(v));
+            vf.groups[vi] = group_fn;
+        }
+        return vf;
+    }
+
+    pub fn deinit(vf: *VariantFns) void {
+        vf.mod.unload();
+    }
+};
+
+/// Use the selected schedule only where its kernel has the release plan's bitwise-compatible form.
+pub fn matmulOutVariant(l: Lane, vf: *const VariantFns, v: Variant, s: Stream, x: u64, ldx: usize, m: usize, w: Weight, y: u64, out: Out, part: u64) !void {
+    const p = planForMode(m, w.n, w.k, l.clusters, w.mode);
+    if (v == .release or w.mode != .fp8b or p.reduce or p.cluster or !(p.fused or (p.sk == 1 and p.bm == 64)))
+        return l.matmulOut(s, x, ldx, m, w, y, out, part);
+
+    const vi = VariantFns.index(v);
+    const fused_i = @intFromBool(p.fused);
+    const out_i = @intFromBool(out == .f32);
+    const f = vf.entries[vi][fused_i][out_i];
+    const bm_v = VariantFns.bm(v);
+    const rows_t = (m + bm_v - 1) / bm_v;
+    const band = @max(1, @min(rows_t, (12 << 20) / (bm_v * w.k * 2)));
+    var args: launch_.Args = .{};
+    args.add(x);
+    args.add(w.codes);
+    args.add(w.scales);
+    args.add(w.scale);
+    args.add(y);
+    args.add(@as(u64, 0)); // release passes part only when p.reduce, which falls back above
+    args.add(@as(i32, @intCast(m)));
+    args.add(@as(i32, @intCast(w.n)));
+    args.add(@as(i32, @intCast(w.k)));
+    args.add(@as(i32, @intCast(p.sk)));
+    args.add(@as(i32, @intCast(w.npad)));
+    args.add(@as(i32, @intCast(if (m == 1) w.k else ldx)));
+    args.add(@as(i32, @intCast(band)));
+    try launch_.launch(f, .{
+        .grid = .{ .x = @intCast(rows_t * ((w.n + bn - 1) / bn)), .y = 1, .z = 1 },
+        .block = .{ .x = VariantFns.block(v), .y = 1, .z = 1 },
+        .shared = VariantFns.shared(v),
+    }, s, &args);
+}
+
+/// Use the s2 fused group entry only when every segment uses the release fused plan.
+pub fn matmulGroupVariant(l: Lane, vf: *const VariantFns, s: Stream, x: u64, ldx: usize, m: usize, outs: []const GroupOut, options: GroupOptions) !void {
+    if (options.split or options.prefetch != 0 or outs.len == 0) return l.matmulGroup(s, x, ldx, m, outs, options);
+    const k: usize = outs[0].w.k;
+    for (outs) |o| {
+        if (o.w.mode != .fp8b or !planForMode(m, o.w.n, k, l.clusters, .fp8b).fused)
+            return l.matmulGroup(s, x, ldx, m, outs, options);
+    }
+    if (outs.len > max_group or m == 0 or k == 0 or k % group != 0) return l.matmulGroup(s, x, ldx, m, outs, options);
+    const rows_t = (m + 63) / 64;
+    const band = @max(1, @min(rows_t, (12 << 20) / (64 * k * 2)));
+    var a: GroupArgsAbi = .{ .x = x, .prefetch = 0, .prefetch_bytes = 0, .m = @intCast(m), .k = @intCast(k), .ldx = @intCast(if (m == 1) k else ldx), .band = @intCast(band), .count = @intCast(outs.len), .seg = @splat(.{}) };
+    var total: usize = 0;
+    for (outs, 0..) |o, i| {
+        if (o.w.k != k or o.w.n == 0 or o.w.npad < o.w.n or o.y == 0 or o.w.codes == 0 or o.w.scales == 0) return l.matmulGroup(s, x, ldx, m, outs, options);
+        const p = planForMode(m, o.w.n, k, l.clusters, .fp8b);
+        const blocks = rows_t * ((o.w.n + bn - 1) / bn);
+        a.seg[i] = .{ .w = o.w.codes, .bs = o.w.scales, .out = o.y, .scale = o.w.scale, .n = @intCast(o.w.n), .npad = @intCast(o.w.npad), .sk = @intCast(p.sk), .blocks = @intCast(blocks) };
+        total += blocks;
+    }
+    var args: launch_.Args = .{};
+    args.add(a);
+    try launch_.launch(vf.groups[VariantFns.index(.s2)], .{
+        .grid = .{ .x = @intCast(total), .y = 1, .z = 1 },
+        .block = .{ .x = VariantFns.block(.s2), .y = 1, .z = 1 },
+        .shared = VariantFns.shared(.s2),
+    }, s, &args);
+}
+
 pub fn splitPlan(m: usize, n: usize, k: usize, clusters: bool, mode: Mode) Plan {
     const sk = if (mode == .fp8b) b16SplitK(n, k) else splitK(n, k);
     return .{ .bm = bucket(m), .sk = sk, .fused = false, .cluster = sk > 1 and clusters, .reduce = sk > 1 and !clusters };

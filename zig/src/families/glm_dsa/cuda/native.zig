@@ -536,8 +536,10 @@ const Owned = struct {
     side_event_count: usize = 0,
     pf: forward.Prefetch = undefined,
     host: drafts.Host = undefined,
-    /// TF_GLM53_PREFILL_W8A8=1 only: the glm53_w8a8 image (prefill o_proj).
+    /// TF_GLM53_PREFILL_W8A8=1 or =2: the glm53_w8a8 image.
     w8a8: cuda.w8a8.Kernels = undefined,
+    qmmf_var: cuda.qmmf.VariantFns = undefined,
+    l2pf: ?forward.l2pf_mod.L2pf = null,
     zfactory: zngram.Factory,
     /// Saved-prefix agreement input/output words, allocated during setup when disk caching is enabled.
     agree_flag: ?cuda.DeviceBuffer = null,
@@ -562,6 +564,7 @@ const Owned = struct {
     alive_side_stream: bool = false,
     alive_modules: u8 = 0,
     alive_w8a8: bool = false,
+    alive_qmmf_var: bool = false,
 
     fn deinit(own: *Owned) void {
         if (own.prefix_snap) |snap| { snap.deinit(); own.gpa.destroy(snap); }
@@ -570,6 +573,7 @@ const Owned = struct {
         if (own.prefix_runtime) |runtime| { runtime.deinit(); own.gpa.destroy(runtime); }
         if (own.alive_stream) own.stream.synchronize() catch {};
         if (own.alive_side_stream) if (own.side_stream) |s| s.synchronize() catch {};
+        if (own.l2pf) |*pf| pf.deinit();
         if (own.alive_host) own.host.deinit();
         if (own.agree_flag) |*flag| flag.free();
         if (own.alive_state) own.st.deinit();
@@ -579,6 +583,7 @@ const Owned = struct {
         if (own.alive_experts) own.experts.unload();
         if (own.alive_lane) own.lane.unload();
         if (own.alive_w8a8) own.w8a8.unload();
+        if (own.alive_qmmf_var) own.qmmf_var.deinit();
         inline for (.{ "glm_glue", "glm53_glue", "glm53_mla", "glm53_index", "glm53_head" }, 0..) |name, i| {
             if ((own.alive_modules & (@as(u8, 1) << i)) != 0) @field(own.modules, name).unload();
         }
@@ -931,7 +936,48 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     const lowrank_decode = moe.decodeSwitch();
     const row_prune = envSwitch("TF_GLM53_ROW_PRUNE");
     const defer_draft_fill = envSwitch("TF_GLM53_DEFER_DRAFT_FILL");
+    const ring_keep = envSwitch("TF_GLM53_RING_KEEP");
+    const moe_noalloc = envSwitch("TF_GLM53_MOE_NOALLOC");
+    const draft_ingest_side = forward.draftIngestSideSwitch();
+    if (draft_ingest_side and forward.megakernelSwitch()) return error.DraftIngestSideWithMegakernel;
+    const draft_graph = envSwitch("TF_GLM53_DRAFT_GRAPH");
+    if (draft_graph and o.drafter == null) return error.DraftGraphNeedsDrafter;
+    if (draft_graph) std.log.info("TF_GLM53_DRAFT_GRAPH=1: drafter block pass replays one CUDA graph (1 stream, 8 rows): tf_glm_embed_b16 + gather + tf_glm53_embed_pick, per layer tf_glm_rmsnorm_6144, df_gsum + tf_qmm_group, df_conv_glm, df_block_qkv_glm, df_attn_part_h8_glm, df_attn_merge_glm, df_swiglu, glm_mm down + gather + df_sum2_glm, head tf_qmm_group, df_top16_part_glm, df_top16_merge_glm, gather; the tables and embed ids upload eagerly before it", .{});
+    const one_frame = envSwitch("TF_GLM53_ONE_FRAME");
+    try validateOneFrameSettings(one_frame, defer_draft_fill);
+    if (one_frame) std.log.info("TF_GLM53_ONE_FRAME=1: follower frames are one 120-byte ncclBroadcast each; keep and rollback wait on rank 0 and travel in one round frame with the next draft_block (no kernel change)", .{});
+    const lazy_draw = envSwitch("TF_GLM53_LAZY_DRAW");
+    if (lazy_draw) std.log.info("TF_GLM53_LAZY_DRAW=1: verify draws rows up to the first rejection on held-draft windows (rank 1: every window); T=1 nucleus rows reuse readHead's merged candidates; no kernel or collective change", .{});
+    var l2pf_problem: []const u8 = "";
+    const l2pf_opts = forward.l2pf_mod.Options.read(struct { fn get(name: [:0]const u8) ?[]const u8 {
+        const value = std.c.getenv(name) orelse return null;
+        return std.mem.span(value);
+    } }.get, &l2pf_problem) catch |e| {
+        std.log.err("{s}", .{l2pf_problem});
+        return e;
+    };
+    if (l2pf_opts.on and forward.megakernelSwitch()) return error.L2pfWithMegakernel;
+    const qa_shard = forward.qaShardSwitch();
+    const draft_down4 = drafts.draftDown4Switch();
+    const cand_fast = parseSwitch(std.c.getenv("TF_GLM53_CAND_FAST"));
+    if (cand_fast and forward.megakernelSwitch()) return error.CandFastNeedsNoMk;
+    const cand_v2 = parseSwitch(std.c.getenv("TF_GLM53_CAND_V2"));
+    if (cand_v2 and forward.megakernelSwitch()) return error.CandV2NeedsNoMk;
+    const route_compact = envSwitch("TF_GLM53_ROUTE_COMPACT");
+    if (route_compact) std.log.info("TF_GLM53_ROUTE_COMPACT=1: side decode routing launches tf_glm_router_tile or tf_glm_router_part, tf_glm_slice_sum, and tf_glm_topk_compact", .{});
+    const add_norm_fuse = forward.addNormFuseSwitch();
+    if (add_norm_fuse and forward.megakernelSwitch()) return error.AddNormFuseNeedsNoMk;
+    if (add_norm_fuse) std.log.info("TF_GLM53_ADD_NORM_FUSE=1: decode layers before the last end in tf_glm53_moe_residual_rmsnorm_6144 (MoE) or tf_glm53_residual_rmsnorm_6144 (dense), which also write the next layer's input norm; that layer launches no tf_glm_rmsnorm_6144 (inactive with an ablation file)", .{});
+    const qpe_absorb_fuse = forward.qpeAbsorbFuseSwitch();
+    if (qpe_absorb_fuse and forward.megakernelSwitch()) return error.QpeAbsorbFuseNeedsNoMk;
+    const own_attend = forward.ownAttendSwitch();
+    const q_one_gather = forward.qOneGatherSwitch();
+    const partial_roce = forward.partialRoceSwitch();
     const decode_mla_mode = forward.decodeMlaModeSwitch();
+    if (q_one_gather and decode_mla_mode != .v3) return error.QOneGatherNeedsDecodeMla3;
+    if (qpe_absorb_fuse and decode_mla_mode != .v3) return error.QpeAbsorbFuseNeedsDecodeMla3;
+    if (qpe_absorb_fuse) std.log.info("TF_GLM53_QPE_ABSORB_FUSE=1: decode MLA v3 (rows 1..8) launches tf_glm53_absorb_qpe_decode_v3 in place of tf_glm53_qpe_pack + tf_glm53_absorb_decode_v3", .{});
+    const decode_mla16 = forward.decodeMla16Switch();
     if (forward.megakernelSwitch() and decode_mla_mode != .off) {
         std.log.err("TF_GLM53_MK=1 and TF_GLM53_DECODE_MLA are incompatible", .{});
         return error.IncompatibleGlm53Modes;
@@ -940,6 +986,7 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     cuda.exl3_experts.l2_depth = try l2Depth();
     const p = try place();
     if (p.world != 2) return error.UnsupportedWorld;
+    if (qa_shard) std.log.info("TF_GLM53_QA_SHARD=1: q_a rows {d}..{d} on this rank; per layer one shard_qkv_a all-gather of rows x 2048 B, then tf_glm53_rmsnorm_2048_halves (bit-identical to tf_glm_rmsnorm_2048); kv_a stays whole", .{ p.rank * 1024, p.rank * 1024 + 1024 });
     var leader_buf: [64]u8 = undefined;
     const leader = try copyLeader(if (std.c.getenv("NCCL_COMM_ID")) |v| std.mem.span(v) else null, &leader_buf);
     const side_comms = sideCommsWanted(forward.attnPipeSwitch(), forward.prefetchSwitch());
@@ -966,21 +1013,36 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
         const raw = std.c.getenv("TF_GLM53_VERIFY_MAX");
         return if (raw) |v| std.mem.span(v) else null;
     } }.get);
+    try forward.validateDecodeMla16(decode_mla16, decode_mla_mode, verify_max);
     const rows = try expertRows();
     const adapt_rows = try parseExpertRowsAdapt(if (std.c.getenv("TF_GLM53_EXPERT_ROWS_ADAPT")) |v| std.mem.span(v) else null);
     const adapt_maxpos = try parseAdaptMaxPos(if (std.c.getenv("TF_GLM53_EXPERT_ROWS_ADAPT_MAXPOS")) |v| std.mem.span(v) else null);
     const chunk_rows = try chunkRows();
     const index_mma_raw = std.c.getenv("TF_GLM53_INDEX_ROWS");
     const index_mma_rows = try forward.index.parseScoreRows(if (index_mma_raw) |v| std.mem.span(v) else null);
+    const index_qs_raw = std.c.getenv("TF_GLM53_INDEX_QS");
+    const index_qs = try forward.index.parseIndexQs(if (index_qs_raw) |v| std.mem.span(v) else null);
+    if (index_qs != 0) std.log.info("TF_GLM53_INDEX_QS={d}: prefill index scores use query-stationary stages", .{index_qs});
+    const gather_ovl_raw = std.c.getenv("TF_GLM53_GATHER_OVL");
+    const gather_ovl = try forward.parseGatherOvl(if (gather_ovl_raw) |v| std.mem.span(v) else null);
+    if (gather_ovl != 0) std.log.info("TF_GLM53_GATHER_OVL=1: cover the final grouped-prefill attention gather with deferred shared expert MLPs", .{});
 
     const prompt_mla = forward.promptMlaSwitch();
     const coll_fuse_requested = collFuseSwitch();
     const coll_fuse = coll_fuse_requested and collFusePayloadFits(verify_max, 4 << 20);
     if (coll_fuse_requested and !coll_fuse) std.log.info("TF_GLM53_COLL_FUSE disabled for this decode shape: packed query or attention partial exceeds the 4 MiB RoCE cap", .{});
+    if ((own_attend or q_one_gather) and !cuda.roce.wanted()) return error.AttendGatherSwitchNeedsRoce;
+    if (q_one_gather and coll_fuse_requested) return error.QOneGatherWithCollFuse;
+    if (own_attend) std.log.info("TF_GLM53_OWN_ATTEND=1: decode attend tf_glm53_attend_verify + tf_glm53_attend_split_merge on side and main streams", .{});
+    if (q_one_gather) std.log.info("TF_GLM53_Q_ONE_GATHER=1: decode all-gather packed QA/QPE once, then tf_glm53_attend_verify + tf_glm53_attend_split_merge per head group", .{});
+    if (partial_roce) std.log.info("TF_GLM53_PARTIAL_ROCE=1: attention partials use RoCE oneShotGather before tf_glm53_mla_merge; absorbed queries remain NCCL", .{});
     const smla_p = forward.smlaPSwitch();
     const shard_qkv_a = forward.shardQkvASwitch();
     // the ROW_PRUNE cache-only last layer projects kv_a without the shard gather (half-width kv rows): refuse the pair
     if (shard_qkv_a and row_prune) return error.ShardQkvAWithRowPruneUnsupported;
+    if (qa_shard and shard_qkv_a) return error.QaShardWithShardQkvA;
+    if (qa_shard and forward.megakernelSwitch()) return error.QaShardWithMegakernel;
+    if (qa_shard and forward.tboSwitch()) return error.QaShardWithTbo;
     const smla_fp8 = forward.smlaFp8Switch();
     if (smla_fp8 and !smla_p) return error.SmlaFp8WithoutSmlaP;
     if (smla_fp8) std.log.info("TF_GLM53_SMLA_FP8=1: prefill attend tf_glm53_smla_p_fp8 (e4m3 score GEMM, lossy, KLD-gated; KV cache stays bf16)", .{});
@@ -991,11 +1053,17 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     const decode_union = forward.decodeUnionSwitch();
     const decode_union_rows = try forward.decodeUnionRows(decode_union, forward.decodeUnion16Switch(), verify_max);
     if (decode_union and forward.megakernelSwitch()) return error.DecodeUnionWithMegakernel;
+    // Q_ONE_GATHER packs QA/QPE per rank, which only the group verify launches read: every decode row must take them.
+    if (q_one_gather and (!decode_union or decode_union_rows < verify_max)) return error.QOneGatherNeedsDecodeUnionAllRows;
     if (decode_union) std.log.info("TF_GLM53_DECODE_UNION=1: decode attend (rows 1..{d}) tf_glm53_attend_verify + tf_glm53_attend_split_merge (byte-identical to attend_mma)", .{decode_union_rows});
     const prefill_w8a8 = forward.prefillW8a8Switch();
+    const prefill_w8a8_all = forward.prefillW8a8AllSwitch();
+    const qmmf_var = try forward.qmmfVarSwitch();
+    if (qmmf_var) std.log.info("TF_GLM53_QMMF_VAR=1: selected prefill FP8B shapes use same-bit QMMF schedule variants", .{});
     const pre_fuse = forward.preFuseSwitch();
     const prep_fuse = forward.prepFuseSwitch();
     if ((pre_fuse != .off or prep_fuse != .off) and shard_qkv_a) return error.PreFuseWithShardQkvA;
+    if (qa_shard and prep_fuse == .split) return error.QaShardWithPrepFuseSplit;
     if (pre_fuse != .off and forward.megakernelSwitch()) return error.PreFuseWithMegakernel;
     std.log.info("TF_GLM53_PRE_FUSE={s} TF_GLM53_PREP_FUSE={s}: grouped q_a | kv_a | indexer wk projections (bit-identical; 0 = off)", .{ preFuseDigestValue(pre_fuse), prepFuseDigestValue(prep_fuse) });
     const prefetch_enabled = forward.prefetchSwitch();
@@ -1004,9 +1072,19 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     try forward.validateProfilePrefillTbo(profile_prefill, tbo_enabled);
     const piece_pipe = forward.piecePipeSwitch();
     const moe_pipe = forward.moePipeSwitch();
+    const moe_ring = try forward.moeRingSwitch();
+    if (!moe_pipe and moe_ring != 2) return error.MoeRingWithoutMoePipe;
+    if (moe_ring != 2) std.log.info("TF_GLM53_MOE_RING={d}: MoE gather slots", .{moe_ring});
     const ws_trim = forward.wsTrimSwitch();
     const memslim = try state.memslimFromEnv();
     const moe_post = forward.moePostSwitch();
+    const moe_ep = try moeEpSwitch(struct {
+        fn get(name: []const u8) ?[]const u8 {
+            if (!std.mem.eql(u8, name, "TF_GLM53_MOE_EP")) return null;
+            const raw = std.c.getenv("TF_GLM53_MOE_EP") orelse return null;
+            return std.mem.span(raw);
+        }
+    }.get);
     const comm_prio = forward.commPrioSwitch();
     const index_merge = forward.indexMergeSwitch();
     const index_pipe = forward.indexPipeSwitch();
@@ -1023,6 +1101,7 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
         std.log.err("TF_GLM53_MOE_PIPE=1 cannot be combined with TF_GLM53_TBO=1", .{});
         return error.MoePipeWithTbo;
     }
+    if (moe_ep and row_prune) return error.MoeEpWithRowPrune;
     if (moe_pipe and row_prune) {
         std.log.err("TF_GLM53_MOE_PIPE=1 cannot be combined with TF_GLM53_ROW_PRUNE=1", .{});
         return error.MoePipeWithRowPrune;
@@ -1030,6 +1109,10 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     std.log.info("TF_GLM53_MOE_PIPE={d}; grouped prefill MoE only (incompatible with TBO and ROW_PRUNE)", .{@intFromBool(moe_pipe)});
     const decode_side = forward.decodeSideSwitch();
     const prompt_experts = forward.promptExpertsMode();
+    if (moe_ep and !moe_post) return error.MoeEpRequiresMoePost;
+    if (moe_ep and prompt_experts == .off) return error.MoeEpRequiresPromptExperts;
+    if (moe_ep and !state.groupedExperts(rows, 512)) return error.MoeEpRequiresGroupedExperts;
+    if (moe_ep) std.log.info("TF_GLM53_MOE_EP=1: two-rank expert-parallel routed experts (grouped prefill; decode on the generic routed path)", .{});
     const scratch_overlay = if (std.c.getenv("TF_GLM53_SCRATCH_OVERLAY")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
     const slim_generic = memslim and scratch_overlay and prompt_experts != .off and !ws_trim;
     if (ws_trim and scratch_overlay) return error.WsTrimWithScratchOverlay;
@@ -1050,8 +1133,16 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     const live_graph_n = if (memslim) try state.graphLivePlan(o.context, live_rows, graph_rows_buf[0..graph_rows_n], &graph_shape_buf) else 0;
     const graph_reserve_bytes = try state.graphsReserveFromEnv(verify_max, o.context);
     const drafter_share = drafts.shareScratchEnabled();
+    if (draft_ingest_side and o.drafter == null) return error.DraftIngestSideNeedsDrafter;
+    if (draft_ingest_side) std.log.info("TF_GLM53_DRAFT_INGEST_SIDE=1: verify forks the drafter ingest after the last tap layer onto its own stream (df_gsum, tf_qmm_group fc and kv, tf_glm_rmsnorm_6144, df_ctx_kv_stage_glm), joined after the head; each draft copies its kept rows into the ring with df_ring_commit_glm in place of df_ctx_kv_glm", .{});
     const pe_flags = forward.promptExpertsFlags(prompt_experts);
-    var geometry: state.Geometry = .{ .full_index_layers = full_layers, .cache_format = if (o.kv_format == .bf16) .bf16 else .fp8, .vocab_local = cfg.vocab / 2, .expert_rows = rows, .index_mma_rows = index_mma_rows, .chunk_rows = chunk_rows, .decode_rows = verify_max, .head_rows = verify_max, .candidate_k = try state.sampleKFromEnv(), .graphs_bytes = graph_reserve_bytes, .drafter_share_bytes = 0, .prefetch = prefetch_enabled, .tbo = tbo_enabled, .piece_pipe = piece_pipe, .moe_pipe = moe_pipe, .ws_trim = ws_trim, .moe_post = moe_post, .comm_prio = comm_prio, .index_merge = index_merge, .index_pipe = index_pipe, .prompt_mla = prompt_mla, .smla_p = smla_p, .smla_fp8 = smla_fp8, .smla_p3 = smla_p3, .shard_qkv_a = shard_qkv_a, .prefill_bf16 = prefill_bf16, .decode_side = decode_side, .decode_mla = decode_mla_mode != .off, .decode_mla_v2 = decode_mla_mode == .v2 or decode_mla_mode == .v3, .decode_mla_v3 = decode_mla_mode == .v3, .prompt_experts = pe_flags.on, .prompt_experts_wide = pe_flags.wide, .prompt_experts_pmx = pe_flags.pmx, .scratch_overlay = scratch_overlay, .slim_generic = slim_generic, .coll_fuse = coll_fuse, .expert_rows_adapt = adapt_rows, .expert_rows_adapt_maxpos = adapt_maxpos, .prompt_experts_p5a = pe_flags.p5a };
+    var geometry: state.Geometry = .{ .full_index_layers = full_layers, .cache_format = if (o.kv_format == .bf16) .bf16 else .fp8, .vocab_local = cfg.vocab / 2, .expert_rows = rows, .index_mma_rows = index_mma_rows, .index_qs = index_qs, .gather_ovl = gather_ovl, .chunk_rows = chunk_rows, .decode_rows = verify_max, .head_rows = verify_max, .candidate_k = try state.sampleKFromEnv(), .graphs_bytes = graph_reserve_bytes, .drafter_share_bytes = 0, .prefetch = prefetch_enabled, .tbo = tbo_enabled, .piece_pipe = piece_pipe, .moe_pipe = moe_pipe, .moe_ring = moe_ring, .ws_trim = ws_trim, .moe_post = moe_post, .moe_ep = moe_ep, .comm_prio = comm_prio, .index_merge = index_merge, .index_pipe = index_pipe, .prompt_mla = prompt_mla, .smla_p = smla_p, .smla_fp8 = smla_fp8, .smla_p3 = smla_p3, .shard_qkv_a = shard_qkv_a, .prefill_bf16 = prefill_bf16, .decode_side = decode_side, .own_attend = own_attend, .q_one_gather = q_one_gather, .decode_mla = decode_mla_mode != .off, .decode_mla_v2 = decode_mla_mode == .v2 or decode_mla_mode == .v3, .decode_mla_v3 = decode_mla_mode == .v3, .prompt_experts = pe_flags.on, .prompt_experts_wide = pe_flags.wide, .prompt_experts_pmx = pe_flags.pmx, .scratch_overlay = scratch_overlay, .slim_generic = slim_generic, .coll_fuse = coll_fuse, .partial_roce = partial_roce, .route_compact = route_compact, .l2pf = l2pf_opts.on, .cand_fast = cand_fast, .expert_rows_adapt = adapt_rows, .expert_rows_adapt_maxpos = adapt_maxpos, .prompt_experts_p5a = pe_flags.p5a };
+    geometry.add_norm_fuse = add_norm_fuse;
+    geometry.qpe_absorb_fuse = qpe_absorb_fuse;
+    geometry.cand_v2 = cand_v2;
+    geometry.qa_shard = qa_shard;
+    std.log.info("TF_GLM53_CAND_FAST={d}: launches tf_glm53_cand_fill_f32, {s}, then tf_glm53_cand_merge_f32", .{ @intFromBool(geometry.cand_fast), if (geometry.cand_fast) "tf_glm53_cand_part_fast_f32" else "tf_glm53_cand_part_f32" });
+    std.log.info("TF_GLM53_CAND_V2={d}: {s}", .{ @intFromBool(geometry.cand_v2), if (geometry.cand_v2) "launches tf_glm53_cand2_fill_f32, tf_glm53_cand2_hist_f32, then tf_glm53_cand2_select_f32 where the scratch holds 16 KiB a row (k >= 64); smaller tiles keep the CAND_FAST kernels" else "off" });
     std.log.info("glm53 head: sampled candidate capacity k={d} per rank (TF_GLM53_SAMPLE_K; default 256)", .{geometry.candidate_k});
     const side_rows = try state.sideRowsFromEnv(geometry.piece_rows, o.context);
     if (side_rows != 0 and !residentEnabled()) return error.SideRowsNeedResident;
@@ -1062,27 +1153,37 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     try state.validateMoePipeGeometry(geometry);
     std.log.info("TF_GLM53_PIECE_PIPE={d}; applies to grouped prefill only (non-grouped prefill and ROW_PRUNE keep the old schedule)", .{@intFromBool(piece_pipe)});
     geometry.prefill_w8a8 = prefill_w8a8;
+    geometry.prefill_w8a8_all = prefill_w8a8_all;
+    geometry.qmmf_var = @intFromBool(qmmf_var);
     geometry.pre_fuse = pre_fuse;
     geometry.prep_fuse = prep_fuse;
     var geometry_without_overlay = geometry;
     geometry_without_overlay.scratch_overlay = false;
     std.log.info("TF_GLM53_SCRATCH_OVERLAY={s}: workspace total {d} bytes (without overlay {d} bytes)", .{ if (scratch_overlay) "on" else "off", state.workspaceLayout(geometry, o.context).bytes, state.workspaceLayout(geometry_without_overlay, o.context).bytes });
 
-    const selection: weights.Select = .{ .manifest = if (mf) |*m| m else null, .shard_qkv_a = shard_qkv_a };
+    const selection: weights.Select = .{ .manifest = if (mf) |*m| m else null, .shard_qkv_a = shard_qkv_a, .shard_q_a = qa_shard, .moe_ep = moe_ep, .rank = p.rank };
     var plan = try weights.planRank(gpa, io, dir, cfg, p.rank, 2, selection);
     defer plan.deinit(gpa);
     var drafter_geometry: ?drafts.Geometry = null;
+    var draft_ingest_stage_bytes: u64 = 0;
     if (o.drafter) |dd| {
-        const g = try drafts.checkConfig(gpa, io, dd);
+        var g = try drafts.checkConfig(gpa, io, dd);
+        g.down4 = draft_down4;
         const dm = try drafts.memoryPlan(g, 4, 2, 1);
+        draft_ingest_stage_bytes = if (draft_ingest_side) blk: {
+            const dg = drafts.runtimeGeometry(g);
+            break :blk glm.dflash_block.stageBytes(dg) + drafts.ingestSideScratchBytes(dg);
+        } else 0;
         if (drafter_share) {
-            plan.weights.drafter = dm.deviceBytesWithSharedScratch() + dm.hostBytes();
+            plan.weights.drafter = dm.deviceBytesWithSharedScratch() + dm.hostBytes() + draft_ingest_stage_bytes;
             geometry.drafter_share_bytes = dm.shared_scratch;
         } else {
-            plan.weights.drafter = dm.deviceBytes() + dm.hostBytes();
+            plan.weights.drafter = dm.deviceBytes() + dm.hostBytes() + draft_ingest_stage_bytes;
         }
         drafter_geometry = g;
     }
+    if (draft_down4 and o.drafter == null) return error.DraftDown4NeedsDrafter;
+    if (draft_down4) std.log.info("TF_GLM53_DRAFT_DOWN4=1: drafter down projections in 4 bits (in memory): df_gsum + tf_qmm_group fp32 out, then the gather and df_sum2_glm; drafts change, verified tokens do not", .{});
     const before = try uma.readMeminfo(gpa, io);
     var step: LoadSteps = .{ .last = before.available, .first = before.available, .last_detail = uma.readMeminfoDetail(gpa, io) catch null };
     var tracer = Tracer.init(ctx.d, gpa, io, p.rank);
@@ -1153,11 +1254,14 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     step.mark(gpa, io, "NCCL communicator");
     own.stream = try cuda.Stream.init(ctx.d, false);
     own.alive_stream = true;
-    try own.group.openRoce(gpa, io, ctx.d, own.stream, 4 << 20, geometry.coll_fuse);
+    try own.group.openRoce(gpa, io, ctx.d, own.stream, 4 << 20, geometry.coll_fuse or geometry.partial_roce);
+    if (geometry.partial_roce and own.group.fast == null) return error.RoceUnavailable;
     if (own.group.fast != null) std.log.info("RoCE gathers bound to the main stream; other streams and setup handshakes use NCCL", .{});
     step.mark(gpa, io, "stream + RoCE shards");
     tracer.step("RoCE shards", .nccl, 4 << 20);
-    const local_switches = PrefillCommSwitches{ .prefetch = @intFromBool(geometry.prefetch), .tbo = @intFromBool(geometry.tbo), .coll_fuse = @intFromBool(geometry.coll_fuse), .index_pipe = @intFromBool(geometry.index_pipe), .attn_pipe = @intFromBool(attn_pipe) };
+    const decode_switches: u8 = @as(u8, @intFromBool(geometry.coll_fuse)) | (@as(u8, @intFromBool(geometry.own_attend)) << 1) | (@as(u8, @intFromBool(geometry.q_one_gather)) << 2) | (@as(u8, @intFromBool(geometry.partial_roce)) << 3) | (@as(u8, @intFromBool(geometry.l2pf)) << 4) | (@as(u8, @intFromBool(one_frame)) << 5) | (@as(u8, @intFromBool(geometry.qa_shard)) << 6);
+    const draft_switches: u8 = @as(u8, @intFromBool(draft_ingest_side)) | (@as(u8, @intFromBool(draft_graph)) << 1) | (@as(u8, @intFromBool(draft_down4)) << 2);
+    const local_switches = PrefillCommSwitches{ .prefetch = @intFromBool(geometry.prefetch), .tbo = @intFromBool(geometry.tbo), .decode_switches = decode_switches, .index_pipe = @intFromBool(geometry.index_pipe), .attn_pipe = @intFromBool(attn_pipe), .draft_switches = draft_switches };
     var peer_switches: [2]PrefillCommSwitches = undefined;
     try own.group.gather(PrefillCommSwitches, ctx.d, own.stream, local_switches, &peer_switches);
     if (!agreesPrefillCommSwitches(peer_switches[0], peer_switches[1])) return error.PrefillCommunicationSettingsDisagree;
@@ -1184,12 +1288,13 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
         tracer.step("attention pipe communicator", .nccl, 0);
     }
     own.wire = try follow.Wire.init(gpa, ctx.d, &own.group.lib, own.group.comm, own.stream, @max(o.context, follow.max_decode_rows * ((cfg.vocab + 31) / 32)));
+    own.wire.one_frame = one_frame;
     own.alive_wire = true;
     step.mark(gpa, io, "follower wire");
     own.lane = try cuda.qmmf.Lane.load(ctx.d, (try ctx.capability()) / 10);
     if (geometry.pre_fuse != .off or geometry.prep_fuse != .off) try own.lane.loadGroup();
     own.alive_lane = true;
-    own.experts = try cuda.exl3_experts.Experts.load(ctx.d);
+    own.experts = try cuda.exl3_experts.Experts.loadWith(ctx.d, moe_noalloc);
     own.alive_experts = true;
     if (prompt_experts == .pmx or prompt_experts == .p5a) own.experts.pmx = try cuda.exl3_experts.pmx.Pmx.load(ctx.d);
     if (prompt_experts == .p5a) own.experts.p5a = try cuda.exl3_experts.p5a.P5a.load(ctx.d);
@@ -1204,13 +1309,27 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
         tracer.step(module_labels[i], .module, 0);
     }
     own.kernels = try forward.Kernels.load(own.modules, &own.lane, &own.experts, geometry.index_mma_rows);
+    own.kernels.head.fast = geometry.cand_fast;
+    own.kernels.head.v2 = geometry.cand_v2;
     if (geometry.smla_p3) try own.kernels.mla.loadSmlaP3(own.modules.glm53_mla);
-    if (decode_union) try own.kernels.mla.loadAttendVerify(own.modules.glm53_mla);
+    if (decode_union or own_attend or q_one_gather) try own.kernels.mla.loadAttendVerify(own.modules.glm53_mla);
+    if (geometry.add_norm_fuse) try own.kernels.loadAddNormFuse(own.modules.glm53_glue);
+    if (geometry.qpe_absorb_fuse) try own.kernels.mla.loadAbsorbQpeV3(own.modules.glm53_mla);
+    if (geometry.qa_shard) try own.kernels.loadQaShard(own.modules.glm53_glue);
     if (geometry.prefill_w8a8) {
         own.w8a8 = try cuda.w8a8.Kernels.load(ctx.d, cuda.kernels.glm53_w8a8);
         own.alive_w8a8 = true;
         own.kernels.w8a8 = own.w8a8.fns;
-        std.log.info("TF_GLM53_PREFILL_W8A8=1: prefill o_proj runs W8A8 (e4m3 rows, fp32 scale per row and 128-K block); lossy, KLD-gated", .{});
+        if (geometry.prefill_w8a8_all) {
+            std.log.info("TF_GLM53_PREFILL_W8A8=2: prefill o_proj and every other FP8B prefill projection this kernel serves run W8A8 (e4m3 rows, fp32 scale per row and 128-K block); lossy, KLD-gated", .{});
+        } else {
+            std.log.info("TF_GLM53_PREFILL_W8A8=1: prefill o_proj runs W8A8 (e4m3 rows, fp32 scale per row and 128-K block); lossy, KLD-gated", .{});
+        }
+    }
+    if (geometry.qmmf_var != 0) {
+        own.qmmf_var = try cuda.qmmf.VariantFns.load(ctx.d);
+        own.alive_qmmf_var = true;
+        own.kernels.qmmf_var = &own.qmmf_var;
     }
     step.mark(gpa, io, "GLM modules + kernels");
     const ablate_path = o.ablate_file orelse if (std.c.getenv("TF_GLM53_ABLATE_FILE")) |v| std.mem.span(v) else null;
@@ -1223,6 +1342,11 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     const weights_vmm = weights.weightsVmmFromLookup(weights.processEnvLookup);
     own.model = try weights.ModelWeights.loadConfig(dir, cfg, p.rank, 2, .{ .allocator = gpa, .io = io, .driver = ctx.d, .device_ordinal = ctx.device, .admission = &admission, .weights_vmm = weights_vmm, .trace = .{ .ctx = &tracer, .call = traceWeightLoad } }, selection);
     own.alive_model = true;
+    if (l2pf_opts.on) {
+        const regions = try forward.l2pf_mod.regionsOf(gpa, &own.model);
+        defer gpa.free(regions);
+        own.l2pf = try forward.l2pf_mod.L2pf.init(gpa, ctx.d, regions, own.model.layers, l2pf_opts);
+    }
     tracer.step("weight model load aggregate", .vmm, plan.weights.total() - (plan.weights.drafter orelse 0));
     if (prompt_experts == .wide) {
         var has_wide_shape_fallback = false;
@@ -1256,6 +1380,8 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
         try own.host.init(gpa, ctx, own.stream, &own.group, own.modules.glm_glue, own.modules.glm53_glue, own.model.embed, own.model.head, .{ .lo = own.model.vocab.lo, .hi = own.model.vocab.hi }, p.rank);
         step.mark(gpa, io, "drafter init (modules, draft head, scratch)");
         own.alive_host = true;
+        own.host.ingest_side = draft_ingest_side;
+        own.host.down4 = draft_down4;
         try own.host.load(io, o.drafter.?, 4, drafter_share);
         tracer.step("drafter load aggregate", .drafter, plan.weights.drafter orelse 0);
     }
@@ -1310,7 +1436,13 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     };
     if (own.alive_host and drafter_share) try own.host.dr.?.bindSharedWorkspace(own.st.ws.phase, own.st.ws.phase_bytes);
     step.mark(gpa, io, "State (KV, indexer keys, workspace)");
-    own.engine = .{ .gpa = gpa, .io = io, .f = .{ .gpa = gpa, .k = &own.kernels, .w = &own.model, .st = &own.st, .stream = own.stream, .coll = forward.Collective.group(&own.group), .prompt_experts_p5a = geometry.prompt_experts_p5a, .decode_union = decode_union, .decode_union_rows = decode_union_rows, .pre_fuse = geometry.pre_fuse, .prep_fuse = geometry.prep_fuse, .ws_trim = geometry.ws_trim, .moe_post = geometry.moe_post, .comm_prio = geometry.comm_prio, .pipe_coll = if (own.alive_pipe_group) own.pipe_group.?.collective() else null, .rank = p.rank, .chunk_rows = geometry.chunk_rows, .decode_side = geometry.decode_side, .prompt_experts = geometry.prompt_experts, .prompt_experts_wide = geometry.prompt_experts_wide, .prompt_experts_pmx = geometry.prompt_experts_pmx, .prompt_mla = geometry.prompt_mla, .smla_p = geometry.smla_p, .smla_fp8 = geometry.smla_fp8, .smla_p3 = geometry.smla_p3, .shard_qkv_a = geometry.shard_qkv_a, .prefill_w8a8 = geometry.prefill_w8a8, .prefetch = if (geometry.prefetch) &own.pf else null, .prefetch_enabled = geometry.prefetch, .tbo_enabled = geometry.tbo, .piece_pipe = geometry.piece_pipe, .moe_pipe = geometry.moe_pipe, .index_merge = geometry.index_merge, .index_pipe = geometry.index_pipe, .lowrank_decode = lowrank_decode, .coll_fuse = geometry.coll_fuse, .index_mma_rows = geometry.index_mma_rows, .row_prune = row_prune }, .defer_draft_fill = defer_draft_fill, .mem = try uma.MemTrace.fromEnv(p.rank) };
+    own.engine = .{ .gpa = gpa, .io = io, .f = .{ .gpa = gpa, .k = &own.kernels, .w = &own.model, .st = &own.st, .stream = own.stream, .coll = forward.Collective.group(&own.group), .prompt_experts_p5a = geometry.prompt_experts_p5a, .decode_union = decode_union, .decode_union_rows = decode_union_rows, .own_attend = geometry.own_attend, .q_one_gather = geometry.q_one_gather, .pre_fuse = geometry.pre_fuse, .prep_fuse = geometry.prep_fuse, .ws_trim = geometry.ws_trim, .moe_post = geometry.moe_post, .moe_ep = geometry.moe_ep, .comm_prio = geometry.comm_prio, .pipe_coll = if (own.alive_pipe_group) own.pipe_group.?.collective() else null, .rank = p.rank, .chunk_rows = geometry.chunk_rows, .decode_side = geometry.decode_side, .prompt_experts = geometry.prompt_experts, .prompt_experts_wide = geometry.prompt_experts_wide, .prompt_experts_pmx = geometry.prompt_experts_pmx, .prompt_mla = geometry.prompt_mla, .smla_p = geometry.smla_p, .smla_fp8 = geometry.smla_fp8, .smla_p3 = geometry.smla_p3, .shard_qkv_a = geometry.shard_qkv_a, .prefill_w8a8 = geometry.prefill_w8a8, .prefetch = if (geometry.prefetch) &own.pf else null, .prefetch_enabled = geometry.prefetch, .tbo_enabled = geometry.tbo, .piece_pipe = geometry.piece_pipe, .moe_pipe = geometry.moe_pipe, .gather_ovl = geometry.gather_ovl, .index_merge = geometry.index_merge, .index_pipe = geometry.index_pipe, .lowrank_decode = lowrank_decode, .coll_fuse = geometry.coll_fuse, .partial_roce = geometry.partial_roce, .route_compact = geometry.route_compact, .l2pf = if (own.l2pf) |*pf| pf else null, .index_mma_rows = geometry.index_mma_rows, .index_qs = geometry.index_qs, .row_prune = row_prune }, .defer_draft_fill = defer_draft_fill, .draft_gumbel = if (std.c.getenv("TF_GLM53_DRAFT_GUMBEL")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false, .ring_keep = ring_keep, .lazy_draw = lazy_draw, .mem = try uma.MemTrace.fromEnv(p.rank) };
+    own.engine.f.decode_mla16 = decode_mla16;
+    own.engine.f.add_norm_fuse = geometry.add_norm_fuse;
+    own.engine.f.qpe_absorb_fuse = geometry.qpe_absorb_fuse;
+    own.engine.f.qa_shard = geometry.qa_shard;
+    own.engine.f.prefill_w8a8_all = geometry.prefill_w8a8_all;
+    own.engine.f.qmmf_var = geometry.qmmf_var != 0;
     if (memslim) {
         own.engine.graph_allow = own.graph_keys;
         own.engine.decode_graph_max = @intCast(live_rows);
@@ -1343,8 +1475,9 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
             .ctx = &own.host,
             .window = g.window,
             .taps_prefill = .{ .f = tap, .out = dr.taps_prefill, .hidden = 6144, .layers = dr.geometry.taps, .cap_rows = g.window },
-            .taps_step = .{ .f = tap, .out = dr.taps_step, .hidden = 6144, .layers = dr.geometry.taps, .cap_rows = glm.dflash.STEP_ROWS },
+            .taps_step = .{ .f = tap, .out = dr.taps_step, .hidden = 6144, .layers = dr.geometry.taps, .cap_rows = glm.dflash.STEP_ROWS, .ingest = if (draft_ingest_side) .{ .ctx = &own.host, .fork_fn = drafts.Host.ingestFork, .join_fn = drafts.Host.ingestJoin } else null },
             .restart_fn = drafts.Host.restartHook,
+            .rewind_fn = drafts.Host.rewindHook,
             .prompt_fn = drafts.Host.promptHook,
             .verify_fn = drafts.Host.verifyHook,
             .draft_fn = drafts.Host.draftHook,
@@ -1352,6 +1485,16 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
             .adopt_fn = drafts.Host.adoptHook,
             .ring_adopt_fn = drafts.Host.ringAdopt,
         };
+        if (draft_graph) {
+            var ok = true;
+            own.host.captureDraftGraph() catch |err| {
+                std.log.err("TF_GLM53_DRAFT_GRAPH=1: drafter graph capture failed: {s}", .{@errorName(err)});
+                ok = false;
+            };
+            var votes: [2]u8 = undefined;
+            try own.group.gather(u8, ctx.d, own.stream, @intFromBool(ok), &votes);
+            if (votes[0] == 0 or votes[1] == 0) return error.DraftGraphCaptureFailed;
+        }
     }
     const resident = residentEnabled();
     own.engine.resident = resident;
@@ -1432,7 +1575,9 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     const prewarm_path = o.prewarm orelse if (std.c.getenv("TF_GLM53_PREWARM")) |v| std.mem.span(v) else null;
     if (prewarm_path != null and !resident) return error.PrewarmNeedsResident;
 
-    const digest = recal_mod.digest(try settingsDigest(gpa, io, dir, o, cfg, plan, choice.rows, lowrank_decode, if (own.alive_ablation) own.ablation.digest else null, geometry.prompt_mla, geometry.smla_p, geometry.smla_fp8, geometry.smla_p3, geometry.shard_qkv_a, geometry.prefill_w8a8, prompt_experts, prefetch_enabled, tbo_enabled, geometry.coll_fuse, piece_pipe, moe_pipe, index_merge, index_pipe, drafter_share, graph_reserve_bytes, row_prune, defer_draft_fill, decode_mla_mode, geometry.index_mma_rows, verify_max, attn_pipe, ws_trim, moe_post, comm_prio, geometry.pre_fuse, geometry.prep_fuse, decode_union, lane_chances, adapt_rows, adapt_limit_position, reuse_grain, side_rows, memslim), recal_sha, sweep_on);
+    var digest_plan = plan;
+    if (draft_ingest_side) digest_plan.weights.drafter = (digest_plan.weights.drafter orelse return error.DraftIngestSideNeedsDrafter) - draft_ingest_stage_bytes;
+    const digest = recal_mod.digest(try settingsDigest(gpa, io, dir, o, cfg, digest_plan, choice.rows, lowrank_decode, if (own.alive_ablation) own.ablation.digest else null, geometry.prompt_mla, geometry.smla_p, geometry.smla_fp8, geometry.smla_p3, geometry.shard_qkv_a, if (geometry.prefill_w8a8_all) @as(u8, 2) else @as(u8, @intFromBool(geometry.prefill_w8a8)), qmmf_var, prompt_experts, prefetch_enabled, tbo_enabled, geometry.coll_fuse, geometry.partial_roce, geometry.q_one_gather, piece_pipe, moe_pipe, moe_ring, index_merge, index_pipe, drafter_share, graph_reserve_bytes, row_prune, defer_draft_fill, decode_mla_mode, geometry.index_mma_rows, geometry.index_qs, verify_max, attn_pipe, ws_trim, moe_post, comm_prio, geometry.pre_fuse, geometry.prep_fuse, decode_union, lane_chances, adapt_rows, adapt_limit_position, reuse_grain, side_rows, memslim, one_frame, draft_down4, geometry.gather_ovl, geometry.moe_ep), recal_sha, sweep_on);
     try cuda.tp_watch.ready(io, digest);
     if (prefix_cache_enabled) {
         const a = try prefix_cache.kvsave.cutAlignment(try expertRows());
@@ -1642,6 +1787,23 @@ test "fine reuse parser defaults off and accepts only supported divisors" {
     try std.testing.expectEqualSlices(u8, &empty_digest, &digest(0));
 }
 
+test "partial RoCE switch hashes only its enabled value" {
+    const digest = struct {
+        fn make(on: bool) [32]u8 {
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            hashPartialRoceSwitch(&hash, on);
+            var out: [32]u8 = undefined;
+            hash.final(&out);
+            return out;
+        }
+    }.make;
+    var empty = std.crypto.hash.sha2.Sha256.init(.{});
+    var empty_digest: [32]u8 = undefined;
+    empty.final(&empty_digest);
+    try std.testing.expectEqualSlices(u8, &empty_digest, &digest(false));
+    try std.testing.expect(!std.mem.eql(u8, &digest(false), &digest(true)));
+}
+
 /// TF_GLM53_DRAFT_CHANCES=1 passes selector probabilities into allocation-based draft window sizing.
 pub fn draftChancesSwitch() bool {
     const value = std.c.getenv("TF_GLM53_DRAFT_CHANCES") orelse return false;
@@ -1665,7 +1827,8 @@ pub fn liveCostsSwitch() bool {
 }
 
 
-const PrefillCommSwitches = extern struct { prefetch: u8, tbo: u8, coll_fuse: u8, index_pipe: u8, attn_pipe: u8 };
+/// decode_switches bits 0..3 are COLL_FUSE, OWN_ATTEND, Q_ONE_GATHER, and PARTIAL_ROCE. Drafter bits 0..2 are ingest-side, graph replay, and down4./// Bit 0 is COLL_FUSE, bit 1 OWN_ATTEND, bit 2 Q_ONE_GATHER, bit 3 PARTIAL_ROCE, bit 5 ONE_FRAME. This preserves the handshake's existing size.bit 4 L2PF. This preserves the handshake's existing size.bit 6 QA_SHARD. This preserves the handshake's existing size.
+const PrefillCommSwitches = extern struct { prefetch: u8, tbo: u8, decode_switches: u8, index_pipe: u8, attn_pipe: u8, draft_switches: u8 = 0 };
 const ExpertRowsAdaptAgreement = extern struct { rows: u32, pad: u32, limit: u64 };
 
 fn agreesExpertRowsAdapt(a: ExpertRowsAdaptAgreement, b: ExpertRowsAdaptAgreement) bool {
@@ -1673,7 +1836,7 @@ fn agreesExpertRowsAdapt(a: ExpertRowsAdaptAgreement, b: ExpertRowsAdaptAgreemen
 }
 
 fn agreesPrefillCommSwitches(rank_zero: PrefillCommSwitches, rank_one: PrefillCommSwitches) bool {
-    return rank_zero.prefetch == rank_one.prefetch and rank_zero.tbo == rank_one.tbo and rank_zero.coll_fuse == rank_one.coll_fuse and rank_zero.index_pipe == rank_one.index_pipe and rank_zero.attn_pipe == rank_one.attn_pipe;
+    return rank_zero.prefetch == rank_one.prefetch and rank_zero.tbo == rank_one.tbo and rank_zero.decode_switches == rank_one.decode_switches and rank_zero.index_pipe == rank_one.index_pipe and rank_zero.attn_pipe == rank_one.attn_pipe and rank_zero.draft_switches == rank_one.draft_switches;
 }
 
 fn hashTransportSwitches(hash: *std.crypto.hash.sha2.Sha256, prefetch_enabled: bool, tbo_enabled: bool, coll_fuse: bool) void {
@@ -1683,6 +1846,10 @@ fn hashTransportSwitches(hash: *std.crypto.hash.sha2.Sha256, prefetch_enabled: b
     hash.update(std.mem.asBytes(&tbo_enabled));
     hash.update("TF_GLM53_COLL_FUSE");
     hash.update(std.mem.asBytes(&coll_fuse));
+}
+
+fn hashPartialRoceSwitch(hash: *std.crypto.hash.sha2.Sha256, partial_roce: bool) void {
+    if (partial_roce) hash.update("TF_GLM53_PARTIAL_ROCE=1");
 }
 
 fn hashIndexSwitches(hash: *std.crypto.hash.sha2.Sha256, index_merge: u8, index_pipe: bool) void {
@@ -1709,8 +1876,18 @@ fn hashShardQkvASwitch(hash: *std.crypto.hash.sha2.Sha256, shard_qkv_a: bool) vo
     if (shard_qkv_a) hash.update("TF_GLM53_SHARD_QKV_A=1");
 }
 
+fn hashQaShardSwitch(hash: *std.crypto.hash.sha2.Sha256, qa_shard: bool) void { if (qa_shard) hash.update("TF_GLM53_QA_SHARD=1"); }
+
 fn hashMoePipeSwitch(hash: *std.crypto.hash.sha2.Sha256, moe_pipe: bool) void {
     if (moe_pipe) hash.update("TF_GLM53_MOE_PIPE=1");
+}
+
+fn hashMoeRingSwitch(hash: *std.crypto.hash.sha2.Sha256, moe_ring: u8) void {
+    if (moe_ring != 2) {
+        hash.update("TF_GLM53_MOE_RING=");
+        const value = [_]u8{@intCast('0' + moe_ring)};
+        hash.update(&value);
+    }
 }
 
 fn hashAttnPipeSwitch(hash: *std.crypto.hash.sha2.Sha256, on: bool) void {
@@ -1729,6 +1906,48 @@ fn hashMoePostSwitch(hash: *std.crypto.hash.sha2.Sha256, moe_post: bool) void {
     if (moe_post) hash.update("TF_GLM53_MOE_POST=1");
 }
 
+fn hashMoeEpSwitch(hash: *std.crypto.hash.sha2.Sha256, moe_ep: bool) void {
+    if (moe_ep) hash.update("TF_GLM53_MOE_EP=1");
+}
+
+pub fn moeEpSwitch(get: anytype) !bool {
+    const raw = get("TF_GLM53_MOE_EP") orelse return false;
+    if (std.mem.eql(u8, raw, "0")) return false;
+    if (std.mem.eql(u8, raw, "1")) return true;
+    return error.BadMoeEp;
+}
+
+test "MOE_EP accepts only zero and one and leaves the off digest input empty" {
+    const lookup = struct {
+        var value: ?[]const u8 = null;
+        fn get(name: []const u8) ?[]const u8 {
+            if (!std.mem.eql(u8, name, "TF_GLM53_MOE_EP")) return null;
+            return value;
+        }
+    };
+    lookup.value = null;
+    try std.testing.expect(!(try moeEpSwitch(lookup.get)));
+    lookup.value = "0";
+    try std.testing.expect(!(try moeEpSwitch(lookup.get)));
+    lookup.value = "1";
+    try std.testing.expect(try moeEpSwitch(lookup.get));
+    lookup.value = "true";
+    try std.testing.expectError(error.BadMoeEp, moeEpSwitch(lookup.get));
+    var empty = std.crypto.hash.sha2.Sha256.init(.{});
+    hashMoeEpSwitch(&empty, false);
+    var off: [32]u8 = undefined;
+    empty.final(&off);
+    var baseline = std.crypto.hash.sha2.Sha256.init(.{});
+    var unchanged: [32]u8 = undefined;
+    baseline.final(&unchanged);
+    try std.testing.expectEqualSlices(u8, &unchanged, &off);
+    var enabled = std.crypto.hash.sha2.Sha256.init(.{});
+    hashMoeEpSwitch(&enabled, true);
+    var changed: [32]u8 = undefined;
+    enabled.final(&changed);
+    try std.testing.expect(!std.mem.eql(u8, &unchanged, &changed));
+}
+
 fn hashCommPrioSwitch(hash: *std.crypto.hash.sha2.Sha256, comm_prio: bool) void {
     if (comm_prio) hash.update("TF_GLM53_COMM_PRIO=1");
 }
@@ -1744,9 +1963,14 @@ fn hashSmlaP3Switch(hash: *std.crypto.hash.sha2.Sha256, smla_p3: bool) void {
     if (smla_p3) hash.update("TF_GLM53_SMLA_P3=1");
 }
 
-/// Off hashes nothing, so default digests stay what they were before the switch existed; on adds its value.
-fn hashPrefillW8a8Switch(hash: *std.crypto.hash.sha2.Sha256, prefill_w8a8: bool) void {
-    if (prefill_w8a8) hash.update("TF_GLM53_PREFILL_W8A8=1");
+/// 0 hashes nothing, so default digests stay what they were before the switch existed. 1 hashes the level-1 token. 2 hashes the level-2 token.
+fn hashPrefillW8a8Switch(hash: *std.crypto.hash.sha2.Sha256, prefill_w8a8: u8) void {
+    if (prefill_w8a8 == 1) hash.update("TF_GLM53_PREFILL_W8A8=1");
+    if (prefill_w8a8 == 2) hash.update("TF_GLM53_PREFILL_W8A8=2");
+}
+
+fn hashPrefillQmmfVarSwitch(hash: *std.crypto.hash.sha2.Sha256, qmmf_var: bool) void {
+    if (qmmf_var) hash.update("TF_GLM53_QMMF_VAR=1");
 }
 
 /// Off hashes nothing, so default digests stay what they were. Both switches are bit-identical; they are hashed so a
@@ -1781,6 +2005,16 @@ fn envSwitch(name: [*:0]const u8) bool {
     return value[0] == '1' and value[1] == 0;
 }
 
+fn validateOneFrameSettings(one_frame: bool, defer_draft_fill: bool) error{OneFrameWithDeferDraftFill}!void {
+    if (one_frame and defer_draft_fill) return error.OneFrameWithDeferDraftFill;
+}
+
+test "one frame refuses deferred draft fill" {
+    try std.testing.expectError(error.OneFrameWithDeferDraftFill, validateOneFrameSettings(true, true));
+    try validateOneFrameSettings(false, true);
+    try validateOneFrameSettings(true, false);
+}
+
 fn decodeMlaDigestValue(mode: forward.DecodeMlaMode) []const u8 {
     return switch (mode) { .off => "0", .v1 => "1", .v2 => "2", .v3 => "3" };
 }
@@ -1811,7 +2045,7 @@ test "pre-fuse digest is unchanged off and distinguishes the four enabled values
     for (values, 0..) |a, i| for (values[i + 1 ..]) |b| try std.testing.expect(!std.mem.eql(u8, &a, &b));
 }
 
-fn settingsDigest(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, o: Options, cfg: weights.Config, plan: weights.Plan, effective_expert_rows: usize, lowrank_decode: bool, ablate_digest: ?[32]u8, prompt_mla: forward.PromptMlaMode, smla_p: bool, smla_fp8: bool, smla_p3: bool, shard_qkv_a: bool, prefill_w8a8: bool, prompt_experts: forward.PromptExperts, prefetch_enabled: bool, tbo_enabled: bool, coll_fuse: bool, piece_pipe: bool, moe_pipe: bool, index_merge: u8, index_pipe: bool, drafter_share: bool, graph_reserve_bytes: u64, row_prune: bool, defer_draft_fill: bool, decode_mla: forward.DecodeMlaMode, index_mma_rows: usize, verify_max: usize, attn_pipe: bool, ws_trim: bool, moe_post: bool, comm_prio: bool, pre_fuse: forward.PreFuse, prep_fuse: forward.PrepFuse, decode_union: bool, lane_chances: bool, adapt_rows: usize, adapt_limit: usize, fine_reuse_grain: usize, side_rows: usize, memslim: bool) ![32]u8 {
+fn settingsDigest(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, o: Options, cfg: weights.Config, plan: weights.Plan, effective_expert_rows: usize, lowrank_decode: bool, ablate_digest: ?[32]u8, prompt_mla: forward.PromptMlaMode, smla_p: bool, smla_fp8: bool, smla_p3: bool, shard_qkv_a: bool, prefill_w8a8: u8, qmmf_var: bool, prompt_experts: forward.PromptExperts, prefetch_enabled: bool, tbo_enabled: bool, coll_fuse: bool, partial_roce: bool, q_one_gather: bool, piece_pipe: bool, moe_pipe: bool, moe_ring: u8, index_merge: u8, index_pipe: bool, drafter_share: bool, graph_reserve_bytes: u64, row_prune: bool, defer_draft_fill: bool, decode_mla: forward.DecodeMlaMode, index_mma_rows: usize, index_qs: u8, verify_max: usize, attn_pipe: bool, ws_trim: bool, moe_post: bool, comm_prio: bool, pre_fuse: forward.PreFuse, prep_fuse: forward.PrepFuse, decode_union: bool, lane_chances: bool, adapt_rows: usize, adapt_limit: usize, fine_reuse_grain: usize, side_rows: usize, memslim: bool, one_frame: bool, draft_down4: bool, gather_ovl: u8, moe_ep: bool) ![32]u8 {
     const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
     defer gpa.free(path);
     const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 24));
@@ -1835,6 +2069,11 @@ fn settingsDigest(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, o: Option
     hash.update(std.mem.asBytes(&o.context));
     hash.update("TF_GLM53_INDEX_ROWS=");
     hash.update(std.mem.asBytes(&index_mma_rows));
+    if (index_qs != 0) {
+        hash.update("TF_GLM53_INDEX_QS=");
+        hash.update(std.mem.asBytes(&index_qs));
+    }
+    if (gather_ovl != 0) hash.update("TF_GLM53_GATHER_OVL=1");
     // Off (8) hashes nothing, so the default digest is unchanged; 16 adds its value.
     if (verify_max != 8) {
         hash.update("TF_GLM53_VERIFY_MAX=");
@@ -1842,11 +2081,16 @@ fn settingsDigest(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, o: Option
     }
     hash.update(if (lowrank_decode) "TF_GLM53_LOWRANK_DECODE=1" else "TF_GLM53_LOWRANK_DECODE=0");
     hashTransportSwitches(&hash, prefetch_enabled, tbo_enabled, coll_fuse);
+    if (q_one_gather) hash.update("TF_GLM53_Q_ONE_GATHER=1");
+    hashPartialRoceSwitch(&hash, partial_roce);
+    if (one_frame) hash.update("TF_GLM53_ONE_FRAME=1");
     if (piece_pipe) hash.update("TF_GLM53_PIECE_PIPE=1");
     hashMoePipeSwitch(&hash, moe_pipe);
+    hashMoeRingSwitch(&hash, moe_ring);
     hashWorkspaceTrimSwitch(&hash, ws_trim);
     hashMemslimSwitch(&hash, memslim);
     hashMoePostSwitch(&hash, moe_post);
+    hashMoeEpSwitch(&hash, moe_ep);
     hashCommPrioSwitch(&hash, comm_prio);
     hashIndexSwitches(&hash, index_merge, index_pipe);
     hashAttnPipeSwitch(&hash, attn_pipe);
@@ -1872,16 +2116,21 @@ fn settingsDigest(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, o: Option
     hashPromptExperts(&hash, prompt_experts);
     if (prompt_mla != .off) {
         hash.update("TF_GLM53_PROMPT_MLA=");
-        hash.update(if (prompt_mla == .tile16) "1" else "2");
+        hash.update(if (prompt_mla == .tile16) "1" else if (prompt_mla == .tile64) "2" else if (prompt_mla == .p2) "3" else "4");
     }
     hashSmlaPSwitch(&hash, smla_p);
     hashSmlaFp8Switch(&hash, smla_fp8);
     hashSmlaP3Switch(&hash, smla_p3);
     hashShardQkvASwitch(&hash, shard_qkv_a);
+    hashQaShardSwitch(&hash, forward.qaShardSwitch());
     hashPrefillW8a8Switch(&hash, prefill_w8a8);
+    hashPrefillQmmfVarSwitch(&hash, qmmf_var);
     hashPreFuseSwitches(&hash, pre_fuse, prep_fuse);
     hashDecodeUnionSwitch(&hash, decode_union);
     hashDecodeUnion16Switch(&hash, forward.decodeUnion16Switch());
+    if (forward.decodeMla16Switch()) hash.update("TF_GLM53_DECODE_MLA16=1");
+    if (envSwitch("TF_GLM53_RING_KEEP")) hash.update("TF_GLM53_RING_KEEP=1");
+    if (envSwitch("TF_GLM53_MOE_NOALLOC")) hash.update("TF_GLM53_MOE_NOALLOC=1");
     hashGlmLaneChances(&hash, draftChancesSwitch(), lane_chances);
     hashGlmLiveCosts(&hash, draftChancesSwitch(), liveCostsSwitch());
     if (copydRequested()) hash.update("TF_GLM53_COPYD=1");
@@ -1925,13 +2174,19 @@ fn settingsDigest(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, o: Option
         hash.update("drafter");
         hash.update(drafter_config);
         hash.update(std.mem.asBytes(&o.drafter_bits));
+        if (draft_down4) hash.update("TF_GLM53_DRAFT_DOWN4=1");
     }
-    const w = [_]u64{ plan.weights.routed, plan.weights.backbone_fp8, plan.weights.embed_head, plan.weights.router_norms, plan.weights.lowrank, plan.weights.drafter orelse 0 };
-    const logical = [_]u64{ plan.logical.routed, plan.logical.backbone_fp8, plan.logical.embed_head, plan.logical.router_norms, plan.logical.lowrank, plan.logical.drafter orelse 0 };
+    // Expert-parallel: each rank holds a different half of the routed experts, so its routed bytes and the names it
+    // does not read differ by rank. The ranks compare this digest (tp_watch.ready), so those two inputs are left out;
+    // the checkpoint identity above still covers every file's bytes.
+    const routed_placed: u64 = if (moe_ep) 0 else plan.weights.routed;
+    const routed_logical: u64 = if (moe_ep) 0 else plan.logical.routed;
+    const w = [_]u64{ routed_placed, plan.weights.backbone_fp8, plan.weights.embed_head, plan.weights.router_norms, plan.weights.lowrank, plan.weights.drafter orelse 0 };
+    const logical = [_]u64{ routed_logical, plan.logical.backbone_fp8, plan.logical.embed_head, plan.logical.router_norms, plan.logical.lowrank, plan.logical.drafter orelse 0 };
     hash.update(std.mem.sliceAsBytes(&w));
     hash.update(std.mem.sliceAsBytes(&logical));
     if (ablate_digest) |digest| hash.update(&digest);
-    for (plan.unused) |name| hash.update(name);
+    if (!moe_ep) for (plan.unused) |name| hash.update(name);
     var out: [32]u8 = undefined;
     hash.final(&out);
     return out;
@@ -2327,6 +2582,19 @@ test "native settings digest material changes with q_a / kv_a sharding" {
     try std.testing.expect(!std.mem.eql(u8, &digest(false), &digest(true)));
 }
 
+test "native settings digest material changes with q_a-only sharding" {
+    const digest = struct {
+        fn make(qa_shard: bool) [32]u8 {
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            hashQaShardSwitch(&hash, qa_shard);
+            var out: [32]u8 = undefined;
+            hash.final(&out);
+            return out;
+        }
+    }.make;
+    try std.testing.expect(!std.mem.eql(u8, &digest(false), &digest(true)));
+}
+
 test "native settings digest material for TF_GLM53_PROMPT_EXPERTS keeps off..3 and distinguishes 10" {
     const digest = struct {
         fn make(mode: forward.PromptExperts) [32]u8 {
@@ -2347,10 +2615,10 @@ test "native settings digest material for TF_GLM53_PROMPT_EXPERTS keeps off..3 a
 
 test "native settings digest material changes with TF_GLM53_PREFILL_W8A8 and is unchanged when off" {
     const digest = struct {
-        fn make(on: bool) [32]u8 {
+        fn make(level: u8) [32]u8 {
             var hash = std.crypto.hash.sha2.Sha256.init(.{});
             hash.update("base");
-            hashPrefillW8a8Switch(&hash, on);
+            hashPrefillW8a8Switch(&hash, level);
             var out: [32]u8 = undefined;
             hash.final(&out);
             return out;
@@ -2360,8 +2628,21 @@ test "native settings digest material changes with TF_GLM53_PREFILL_W8A8 and is 
     plain.update("base");
     var before: [32]u8 = undefined;
     plain.final(&before);
-    try std.testing.expectEqualSlices(u8, &before, &digest(false));
-    try std.testing.expect(!std.mem.eql(u8, &digest(false), &digest(true)));
+    try std.testing.expectEqualSlices(u8, &before, &digest(0));
+    try std.testing.expect(!std.mem.eql(u8, &digest(0), &digest(1)));
+    try std.testing.expect(!std.mem.eql(u8, &digest(1), &digest(2)));
+    var one = std.crypto.hash.sha2.Sha256.init(.{});
+    one.update("base");
+    one.update("TF_GLM53_PREFILL_W8A8=1");
+    var one_bytes: [32]u8 = undefined;
+    one.final(&one_bytes);
+    try std.testing.expectEqualSlices(u8, &one_bytes, &digest(1));
+    var two = std.crypto.hash.sha2.Sha256.init(.{});
+    two.update("base");
+    two.update("TF_GLM53_PREFILL_W8A8=2");
+    var two_bytes: [32]u8 = undefined;
+    two.final(&two_bytes);
+    try std.testing.expectEqualSlices(u8, &two_bytes, &digest(2));
 }
 
 test "native settings digest material changes with TF_GLM53_MOE_PIPE and is unchanged when off" {
@@ -2381,6 +2662,25 @@ test "native settings digest material changes with TF_GLM53_MOE_PIPE and is unch
     plain.final(&before);
     try std.testing.expectEqualSlices(u8, &before, &digest(false));
     try std.testing.expect(!std.mem.eql(u8, &digest(false), &digest(true)));
+}
+
+test "native settings digest material changes only for a nondefault MoE ring" {
+    const digest = struct {
+        fn make(moe_ring: u8) [32]u8 {
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            hash.update("base");
+            hashMoeRingSwitch(&hash, moe_ring);
+            var out: [32]u8 = undefined;
+            hash.final(&out);
+            return out;
+        }
+    }.make;
+    var plain = std.crypto.hash.sha2.Sha256.init(.{});
+    plain.update("base");
+    var before: [32]u8 = undefined;
+    plain.final(&before);
+    try std.testing.expectEqualSlices(u8, &before, &digest(2));
+    try std.testing.expect(!std.mem.eql(u8, &digest(2), &digest(8)));
 }
 
 test "native settings digest material changes with TF_GLM53_ATTN_PIPE and is unchanged when off" {
@@ -2534,12 +2834,33 @@ test "decode union 16 rows needs decode union and verify max 16; digest unchange
 }
 
 test "native prefill communicator settings require rank agreement before side-group creation" {
-    try std.testing.expect(agreesPrefillCommSwitches(.{ .prefetch = 0, .tbo = 0, .coll_fuse = 0, .index_pipe = 0, .attn_pipe = 0 }, .{ .prefetch = 0, .tbo = 0, .coll_fuse = 0, .index_pipe = 0, .attn_pipe = 0 }));
-    try std.testing.expect(!agreesPrefillCommSwitches(.{ .prefetch = 0, .tbo = 0, .coll_fuse = 0, .index_pipe = 0, .attn_pipe = 0 }, .{ .prefetch = 1, .tbo = 0, .coll_fuse = 0, .index_pipe = 0, .attn_pipe = 0 }));
-    try std.testing.expect(!agreesPrefillCommSwitches(.{ .prefetch = 1, .tbo = 0, .coll_fuse = 0, .index_pipe = 0, .attn_pipe = 0 }, .{ .prefetch = 1, .tbo = 1, .coll_fuse = 0, .index_pipe = 0, .attn_pipe = 0 }));
-    try std.testing.expect(!agreesPrefillCommSwitches(.{ .prefetch = 0, .tbo = 0, .coll_fuse = 0, .index_pipe = 0, .attn_pipe = 0 }, .{ .prefetch = 0, .tbo = 0, .coll_fuse = 1, .index_pipe = 0, .attn_pipe = 0 }));
-    try std.testing.expect(!agreesPrefillCommSwitches(.{ .prefetch = 0, .tbo = 0, .coll_fuse = 0, .index_pipe = 0, .attn_pipe = 0 }, .{ .prefetch = 0, .tbo = 0, .coll_fuse = 0, .index_pipe = 1, .attn_pipe = 0 }));
-    try std.testing.expect(!agreesPrefillCommSwitches(.{ .prefetch = 0, .tbo = 0, .coll_fuse = 0, .index_pipe = 0, .attn_pipe = 0 }, .{ .prefetch = 0, .tbo = 0, .coll_fuse = 0, .index_pipe = 0, .attn_pipe = 1 }));
+    try std.testing.expect(agreesPrefillCommSwitches(.{ .prefetch = 0, .tbo = 0, .decode_switches = 0, .index_pipe = 0, .attn_pipe = 0 }, .{ .prefetch = 0, .tbo = 0, .decode_switches = 0, .index_pipe = 0, .attn_pipe = 0 }));
+    try std.testing.expect(!agreesPrefillCommSwitches(.{ .prefetch = 0, .tbo = 0, .decode_switches = 0, .index_pipe = 0, .attn_pipe = 0 }, .{ .prefetch = 1, .tbo = 0, .decode_switches = 0, .index_pipe = 0, .attn_pipe = 0 }));
+    try std.testing.expect(!agreesPrefillCommSwitches(.{ .prefetch = 1, .tbo = 0, .decode_switches = 0, .index_pipe = 0, .attn_pipe = 0 }, .{ .prefetch = 1, .tbo = 1, .decode_switches = 0, .index_pipe = 0, .attn_pipe = 0 }));
+    try std.testing.expect(!agreesPrefillCommSwitches(.{ .prefetch = 0, .tbo = 0, .decode_switches = 0, .index_pipe = 0, .attn_pipe = 0 }, .{ .prefetch = 0, .tbo = 0, .decode_switches = 1, .index_pipe = 0, .attn_pipe = 0 }));
+    try std.testing.expect(!agreesPrefillCommSwitches(.{ .prefetch = 0, .tbo = 0, .decode_switches = 0, .index_pipe = 0, .attn_pipe = 0 }, .{ .prefetch = 0, .tbo = 0, .decode_switches = 2, .index_pipe = 0, .attn_pipe = 0 }));
+    try std.testing.expect(!agreesPrefillCommSwitches(.{ .prefetch = 0, .tbo = 0, .decode_switches = 0, .index_pipe = 0, .attn_pipe = 0 }, .{ .prefetch = 0, .tbo = 0, .decode_switches = 4, .index_pipe = 0, .attn_pipe = 0 }));
+    try std.testing.expect(!agreesPrefillCommSwitches(.{ .prefetch = 0, .tbo = 0, .decode_switches = 0, .index_pipe = 0, .attn_pipe = 0 }, .{ .prefetch = 0, .tbo = 0, .decode_switches = 8, .index_pipe = 0, .attn_pipe = 0 }));
+    try std.testing.expect(!agreesPrefillCommSwitches(.{ .prefetch = 0, .tbo = 0, .decode_switches = 0, .index_pipe = 0, .attn_pipe = 0 }, .{ .prefetch = 0, .tbo = 0, .decode_switches = 32, .index_pipe = 0, .attn_pipe = 0 }));
+    try std.testing.expect(!agreesPrefillCommSwitches(.{ .prefetch = 0, .tbo = 0, .decode_switches = 0, .index_pipe = 0, .attn_pipe = 0 }, .{ .prefetch = 0, .tbo = 0, .decode_switches = 64, .index_pipe = 0, .attn_pipe = 0 }));
+    try std.testing.expect(!agreesPrefillCommSwitches(.{ .prefetch = 0, .tbo = 0, .decode_switches = 0, .index_pipe = 0, .attn_pipe = 0 }, .{ .prefetch = 0, .tbo = 0, .decode_switches = 0, .index_pipe = 1, .attn_pipe = 0 }));
+    try std.testing.expect(!agreesPrefillCommSwitches(.{ .prefetch = 0, .tbo = 0, .decode_switches = 0, .index_pipe = 0, .attn_pipe = 0 }, .{ .prefetch = 0, .tbo = 0, .decode_switches = 0, .index_pipe = 0, .attn_pipe = 1 }));
+}
+
+test "native prefill communicator settings require draft ingest side agreement" {
+    const off: PrefillCommSwitches = .{ .prefetch = 0, .tbo = 0, .decode_switches = 0, .index_pipe = 0, .attn_pipe = 0, .draft_switches = 0 };
+    const on: PrefillCommSwitches = .{ .prefetch = 0, .tbo = 0, .decode_switches = 0, .index_pipe = 0, .attn_pipe = 0, .draft_switches = 1 };
+    try std.testing.expect(!agreesPrefillCommSwitches(off, on));
+}
+
+test "native drafter graph settings require rank agreement" {
+    try std.testing.expect(!agreesPrefillCommSwitches(.{ .prefetch = 0, .tbo = 0, .decode_switches = 0, .index_pipe = 0, .attn_pipe = 0, .draft_switches = 0 }, .{ .prefetch = 0, .tbo = 0, .decode_switches = 0, .index_pipe = 0, .attn_pipe = 0, .draft_switches = 2 }));
+}
+
+test "native drafter switches require rank agreement" {
+    const base: PrefillCommSwitches = .{ .prefetch = 0, .tbo = 0, .decode_switches = 0, .index_pipe = 0, .attn_pipe = 0 };
+    try std.testing.expect(agreesPrefillCommSwitches(base, base));
+    try std.testing.expect(!agreesPrefillCommSwitches(base, .{ .prefetch = 0, .tbo = 0, .decode_switches = 0, .index_pipe = 0, .attn_pipe = 0, .draft_switches = 4 }));
 }
 
 test "copyLeader keeps the rank address" {

@@ -42,6 +42,7 @@ M zig/kernels/cuda/exl3_decode.cuh
 M zig/kernels/cuda/exl3_experts.cu
 M zig/kernels/cuda/exl3_linear.cu
 M zig/kernels/cuda/exl3_prompt.cuh
+M zig/kernels/cuda/experts.cu
 M zig/kernels/cuda/glm_dflash.cu
 A zig/kernels/cuda/glm_dsa/fp8_mma.cu
 A zig/kernels/cuda/glm_dsa/glue.cu
@@ -76,7 +77,9 @@ M zig/kernels/cuda/glm_glue_norm.cuh
 M zig/kernels/cuda/glm_glue_router.cuh
 M zig/kernels/cuda/glm_glue_rows.cuh
 A zig/kernels/cuda/host/glm53_cutlass.cu
+M zig/kernels/cuda/qmm_group.cu
 M zig/kernels/cuda/qmmf.cu
+A zig/kernels/cuda/qmmf2.cu
 M zig/kernels/cuda/roce_gather.cu
 A zig/kernels/cuda/tf_vblock.cuh
 A zig/kernels/cuda/third_party/cutlass/LICENSE.txt
@@ -1051,6 +1054,7 @@ M zig/src/cuda/exl3_upload.zig
 M zig/src/cuda/fp8.zig
 M zig/src/cuda/graph_cache.zig
 M zig/src/cuda/graph_cache_regression_test.zig
+M zig/src/cuda/grouped.zig
 M zig/src/cuda/kernels.zig
 M zig/src/cuda/launch.zig
 M zig/src/cuda/memory.zig
@@ -1068,6 +1072,7 @@ M zig/src/families/glm/cuda_exl3.zig
 M zig/src/families/glm/cuda_glue.zig
 M zig/src/families/glm/cuda_lanes.zig
 M zig/src/families/glm/cuda_native.zig
+M zig/src/families/glm/cuda_q4.zig
 M zig/src/families/glm/cuda_taps.zig
 M zig/src/families/glm/dflash.zig
 M zig/src/families/glm/dflash_block.zig
@@ -1093,6 +1098,7 @@ A zig/src/families/glm_dsa/cuda/fp8_mma.zig
 A zig/src/families/glm_dsa/cuda/grammar_test.zig
 A zig/src/families/glm_dsa/cuda/index.zig
 A zig/src/families/glm_dsa/cuda/kvsave.zig
+A zig/src/families/glm_dsa/cuda/l2pf.zig
 A zig/src/families/glm_dsa/cuda/lanes.zig
 A zig/src/families/glm_dsa/cuda/manifest.zig
 A zig/src/families/glm_dsa/cuda/megakernel/bind_attn.zig
@@ -1134,11 +1140,13 @@ M zig/src/families/qwen3_5/cuda_warm.zig
 M zig/src/native/cuda.zig
 M zig/src/native/cuda_options.zig
 M zig/src/native/glm_dsa_host.zig
+M zig/src/server/anthropic_translate.zig
 M zig/src/server/chat.zig
 M zig/src/server/cli.zig
 M zig/src/server/cli_test.zig
 M zig/src/server/late_system_test.zig
 M zig/src/server/openai.zig
+M zig/src/server/responses_translate.zig
 M zig/src/server/serve.zig
 M zig/src/server/server.zig
 M zig/src/server/tool_grammar.zig
@@ -1193,6 +1201,7 @@ M zig/tests/cuda/main.zig
 A zig/tests/cuda/oracle/fp8b_lane.py
 M zig/tests/cuda/projection_f32_host_tests.zig
 M zig/tests/cuda/projection_f32_tests.zig
+A zig/tests/cuda/qmmf2_tests.zig
 A zig/tests/cuda/roce_allreduce_compile.zig
 A zig/tests/cuda/roce_allreduce_host.zig
 M zig/tests/cuda/roce_gather_tests.zig

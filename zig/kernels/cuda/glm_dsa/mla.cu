@@ -246,6 +246,27 @@ extern "C" __global__ void tf_glm53_absorb_decode_v3(const __nv_bfloat16* q, con
   tf_glm53_absorb_decode_v3_task(q, kvb_codes, kvb_scales, qa, rows, local_heads, head0);
 }
 
+// TF_GLM53_QPE_ABSORB_FUSE=1: tf_glm53_qpe_pack + tf_glm53_absorb_decode_v3 in one launch, the absorb grid. Column
+// block 0 of each head also packs q_pe with the pack task's arithmetic; every CTA runs the unchanged v3 absorb task.
+extern "C" __global__ void tf_glm53_absorb_qpe_decode_v3(const __nv_bfloat16* q, const uint8_t* kvb_codes,
+                                            const float* kvb_scales, __nv_bfloat16* qa,
+                                            int rows, int local_heads, int head0,
+                                            const float* cos, const float* sin, __nv_bfloat16* qpe) {
+  TF_VBLOCK_ENTER();
+  if (TF_VBID.x == 0 && (int)TF_VBID.y < local_heads) {
+    const int h = TF_VBID.y;
+    for (int item = threadIdx.x; item < rows * (PD / 2); item += TF_VBDIM.x) {
+      const int r = item / (PD / 2), i = item % (PD / 2);
+      const int64_t base = ((int64_t)r * local_heads + h) * 256 + ND;
+      const float xv = tf_mla::bf(q[base + 2 * i]), yv = tf_mla::bf(q[base + 2 * i + 1]);
+      const float c = cos[r * (PD / 2) + i], s = sin[r * (PD / 2) + i];
+      qpe[((int64_t)r * local_heads + h) * PD + 2 * i] = rb(glm53_rope::even(xv, c, yv, s));
+      qpe[((int64_t)r * local_heads + h) * PD + 2 * i + 1] = rb(glm53_rope::odd(yv, c, xv, s));
+    }
+  }
+  tf_glm53_absorb_decode_v3_task(q, kvb_codes, kvb_scales, qa, rows, local_heads, head0);
+}
+
 // DCP decode reads rank-local slots directly. Gather-on-prefill reads global token positions and
 // maps every peer key through a stage plane populated at absolute slots (history fetch + current chunk).
 __device__ __forceinline__ void tf_glm53_attend_task(const __nv_bfloat16* qa, const __nv_bfloat16* qpe,
@@ -510,6 +531,171 @@ extern "C" __global__ void tf_glm53_expand_v_prompt_mma_big(const __nv_bfloat16*
     const float* kvb_scales, __nv_bfloat16* out, int rows, int local_heads, int head0) {
   extern __shared__ __align__(16) unsigned char smem_raw[];
   tf_glm53_prompt_mla_big_task<true>(ol, kvb_codes, kvb_scales, out, rows, local_heads, head0, smem_raw);
+}
+
+template <bool EXPAND, int NT, int STAGES>
+__device__ __forceinline__ void tf_glm53_prompt_mla_p2_task(const __nv_bfloat16* x, const uint8_t* codes,
+    const float* scales, __nv_bfloat16* out, int rows, int local_heads, int head0, unsigned char* smem_raw) {
+  static_assert(NT == 32 || NT == 64, "prompt MLA p2 column tile");
+  static_assert(STAGES == 2 || STAGES == 3, "prompt MLA p2 stage count");
+  if (blockDim.x != 256) { asm volatile("trap;"); return; }
+  const int h = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  if (h >= local_heads) return;
+  constexpr int kdim = EXPAND ? LD : ND;
+  constexpr int odim = EXPAND ? VD : LD;
+  constexpr int in_stride = EXPAND ? LD : 256;
+  constexpr int B_STRIDE = kdim + 8;  // Eight bf16 pad entries align row strides for ldmatrix.
+  constexpr int B_BYTES = NT * B_STRIDE * 2;
+  constexpr int A_STAGE_BYTES = 64 * 64 * 2;
+  constexpr int k_stages = kdim / 64;
+  __nv_bfloat16* bt = reinterpret_cast<__nv_bfloat16*>(smem_raw);
+  __nv_bfloat16* aring = reinterpret_cast<__nv_bfloat16*>(smem_raw + B_BYTES);
+  const int ntile = blockIdx.x;
+  const int gh = head0 + h;
+  const int row_tiles = (rows + 63) / 64;
+  const int per = (row_tiles + gridDim.z - 1) / gridDim.z;
+  const int tile_begin = blockIdx.z * per;
+  const int tile_end = min(tile_begin + per, row_tiles);
+  if (tile_begin >= tile_end) return;
+  const int total_stages = (tile_end - tile_begin) * k_stages;
+
+  for (int i = tid; i < NT * kdim; i += 256) {
+    const int n = i / kdim, k = i % kdim;
+    const int col = ntile * NT + n;
+    const float w = col < odim ? (EXPAND ? kvb(codes, scales, gh * KR + ND + col, k)
+                                         : kvb(codes, scales, gh * KR + k, col)) : 0.f;
+    bt[n * B_STRIDE + k] = col < odim ? rb(w) : __float2bfloat16_rn(0.f);
+  }
+  __syncthreads();
+  float acc64[4][4] = {};
+  float acc32[2][4] = {};
+  const int mbase32 = 2 * (warp >> 2);
+  const int nsub = NT == 64 ? warp : (warp & 3);
+  // The 16-byte chunk c of row r uses c ^ (r % 8) on both cp.async and ldmatrix.
+  auto load_a_stage = [&](int stage_id) {
+    const int tile_ordinal = tile_begin + stage_id / k_stages;
+    const int kstage = stage_id % k_stages;
+    const int row0 = tile_ordinal * 64;
+    __nv_bfloat16* dst = reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<unsigned char*>(aring) + (stage_id % STAGES) * A_STAGE_BYTES);
+    for (int c = tid; c < 64 * 8; c += 256) {
+      const int r = c / 8, ch = c % 8;
+      const int rr = row0 + r;
+      const int safe_row = rr < rows ? rr : rows - 1;
+      const int swizzled = ch ^ (r % 8);
+      const int read = rr < rows ? 16 : 0;
+      const uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(dst + r * 64 + swizzled * 8));
+      const __nv_bfloat16* src = x + (static_cast<int64_t>(safe_row) * local_heads + h) * in_stride + kstage * 64 + ch * 8;
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(smem_addr), "l"(src), "r"(read) : "memory");
+    }
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+  };
+  for (int s = 0; s < STAGES; ++s) load_a_stage(s);
+  for (int stage_id = 0; stage_id < total_stages; ++stage_id) {
+    const int groups_after = stage_id == 0 ? STAGES - 1 : min(STAGES - 2, total_stages - stage_id - 1);
+    if (groups_after == 2) asm volatile("cp.async.wait_group 2;\n" ::: "memory");
+    else if (groups_after == 1) asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+    else asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    __syncthreads();
+    if (stage_id > 0 && stage_id + STAGES - 1 < total_stages) load_a_stage(stage_id + STAGES - 1);
+    const int tile_ordinal = tile_begin + stage_id / k_stages;
+    const int row0 = tile_ordinal * 64;
+    const int kstage = stage_id % k_stages;
+    __nv_bfloat16* a_stage = reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<unsigned char*>(aring) + (stage_id % STAGES) * A_STAGE_BYTES);
+    for (int kk = 0; kk < 4; ++kk) {
+      const int k = kstage * 64 + kk * 16;
+      uint32_t b[2];
+      const int b_row = nsub * 8 + (lane & 7);
+      const int b_k = k + (lane < 16 ? ((lane >> 3) & 1) * 8 : 0);
+      const uint32_t b_saddr = static_cast<uint32_t>(__cvta_generic_to_shared(bt + b_row * B_STRIDE + b_k));
+      asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+          : "=r"(b[0]), "=r"(b[1]) : "r"(b_saddr));
+      if constexpr (NT == 64) {
+        #pragma unroll
+        for (int mt = 0; mt < 4; ++mt) {
+          const int m = mt * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
+          const int mk = kk * 16 + (lane >> 4) * 8;
+          const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(a_stage + m * 64 + ((mk / 8) ^ (m % 8)) * 8));
+          uint32_t a[4];
+          asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+              : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(addr));
+          mla_mma16816(acc64[mt], a, b);
+        }
+      } else {
+        #pragma unroll
+        for (int mt = 0; mt < 2; ++mt) {
+          const int m = (mbase32 + mt) * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
+          const int mk = kk * 16 + (lane >> 4) * 8;
+          const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(a_stage + m * 64 + ((mk / 8) ^ (m % 8)) * 8));
+          uint32_t a[4];
+          asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+              : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(addr));
+          mla_mma16816(acc32[mt], a, b);
+        }
+      }
+    }
+    if (kstage + 1 == k_stages) {
+      if constexpr (NT == 64) {
+      const int group = lane >> 2, pair = lane & 3;
+      #pragma unroll
+      for (int mt = 0; mt < 4; ++mt) {
+        const int row = row0 + mt * 16 + group;
+        const int col = ntile * NT + nsub * 8 + 2 * pair;
+        if (row < rows) {
+          const int64_t dst = (static_cast<int64_t>(row) * local_heads + h) * odim + col;
+          out[dst] = rb(acc64[mt][0]); out[dst + 1] = rb(acc64[mt][1]);
+        }
+        if (row + 8 < rows) {
+          const int64_t dst = (static_cast<int64_t>(row + 8) * local_heads + h) * odim + col;
+          out[dst] = rb(acc64[mt][2]); out[dst + 1] = rb(acc64[mt][3]);
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) acc64[mt][i] = 0.f;
+      }
+      } else {
+      const int group = lane >> 2, pair = lane & 3;
+      #pragma unroll
+      for (int mt = 0; mt < 2; ++mt) {
+        const int row = row0 + (mbase32 + mt) * 16 + group;
+        const int col = ntile * NT + nsub * 8 + 2 * pair;
+        if (row < rows) {
+          const int64_t dst = (static_cast<int64_t>(row) * local_heads + h) * odim + col;
+          out[dst] = rb(acc32[mt][0]); out[dst + 1] = rb(acc32[mt][1]);
+        }
+        if (row + 8 < rows) {
+          const int64_t dst = (static_cast<int64_t>(row + 8) * local_heads + h) * odim + col;
+          out[dst] = rb(acc32[mt][2]); out[dst + 1] = rb(acc32[mt][3]);
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) acc32[mt][i] = 0.f;
+      }
+      }
+    }
+  }
+}
+
+constexpr int PROMPT_MLA_P2_ABSORB_SMEM = 64 * 200 * 2 + 3 * 8192;
+constexpr int PROMPT_MLA_P2_EXPAND_SMEM = 64 * 520 * 2 + 3 * 8192;
+constexpr int PROMPT_MLA_P2N_EXPAND_SMEM = 32 * 520 * 2 + 2 * 8192;
+static_assert(PROMPT_MLA_P2_ABSORB_SMEM == 50176 && PROMPT_MLA_P2_ABSORB_SMEM <= 50176, "p2 absorb shared-memory bound");
+static_assert(PROMPT_MLA_P2N_EXPAND_SMEM == 49664 && PROMPT_MLA_P2N_EXPAND_SMEM <= 50176, "p2n expand shared-memory bound");
+static_assert(PROMPT_MLA_P2_EXPAND_SMEM == 91136 && PROMPT_MLA_P2_EXPAND_SMEM <= 101376, "p2 expand shared-memory bound");
+
+extern "C" __global__ __launch_bounds__(256, 2) void tf_glm53_absorb_prompt_p2(const __nv_bfloat16* q, const uint8_t* kvb_codes,
+    const float* kvb_scales, __nv_bfloat16* qa, int rows, int local_heads, int head0) {
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  tf_glm53_prompt_mla_p2_task<false, 64, 3>(q, kvb_codes, kvb_scales, qa, rows, local_heads, head0, smem_raw);
+}
+
+extern "C" __global__ __launch_bounds__(256, 1) void tf_glm53_expand_v_prompt_p2(const __nv_bfloat16* ol, const uint8_t* kvb_codes,
+    const float* kvb_scales, __nv_bfloat16* out, int rows, int local_heads, int head0) {
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  tf_glm53_prompt_mla_p2_task<true, 64, 3>(ol, kvb_codes, kvb_scales, out, rows, local_heads, head0, smem_raw);
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void tf_glm53_expand_v_prompt_p2n(const __nv_bfloat16* ol, const uint8_t* kvb_codes,
+    const float* kvb_scales, __nv_bfloat16* out, int rows, int local_heads, int head0) {
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  tf_glm53_prompt_mla_p2_task<true, 32, 2>(ol, kvb_codes, kvb_scales, out, rows, local_heads, head0, smem_raw);
 }
 
 // Tensor-core attend: one block = one row r and one 32-head group (absorbed MLA: every head of a row attends the
@@ -2078,16 +2264,17 @@ extern "C" __global__ void tf_glm53_expand_v_decode(const __nv_bfloat16* ol, con
 // Each CTA owns 128 value outputs and stages a 128x32 byte weight tile. Every
 // thread owns one output column and keeps one ordered accumulator
 // per row; all R chains visit c=0..511 exactly as in the scalar kernel.
+template<int MAX_ROWS>
 __device__ __forceinline__ void tf_glm53_expand_v_decode_v2_task(const __nv_bfloat16* ol, const uint8_t* kvb_codes,
                                                const float* kvb_scales, __nv_bfloat16* out,
                                                int rows, int local_heads, int head0) {
   const int h = TF_VBID.y, t = threadIdx.x;
-  if (TF_VBDIM.x != DECODE_MLA_V2_THREADS || rows > 8) __trap();
+  if (TF_VBDIM.x != DECODE_MLA_V2_THREADS || rows > MAX_ROWS) __trap();
   if (h >= local_heads) return;
   const int gh = head0 + h;
   const int j0 = TF_VBID.z * 128;
   __shared__ __align__(16) uint8_t tile[128][DECODE_V2_EXPAND_C];
-  float acc[8] = {};
+  float acc[MAX_ROWS] = {};
   const int kv_row0 = gh * KR + ND + j0;
   for (int c0 = 0; c0 < LD; c0 += DECODE_V2_EXPAND_C) {
     // The source has LD-byte rows, while the shared tile has 32-byte rows.
@@ -2118,5 +2305,12 @@ extern "C" __global__ void tf_glm53_expand_v_decode_v2(const __nv_bfloat16* ol, 
                                                const float* kvb_scales, __nv_bfloat16* out,
                                                int rows, int local_heads, int head0) {
   TF_VBLOCK_ENTER();
-  tf_glm53_expand_v_decode_v2_task(ol, kvb_codes, kvb_scales, out, rows, local_heads, head0);
+  tf_glm53_expand_v_decode_v2_task<8>(ol, kvb_codes, kvb_scales, out, rows, local_heads, head0);
+}
+
+extern "C" __global__ void tf_glm53_expand_v_decode_v2_16(const __nv_bfloat16* ol, const uint8_t* kvb_codes,
+                                               const float* kvb_scales, __nv_bfloat16* out,
+                                               int rows, int local_heads, int head0) {
+  TF_VBLOCK_ENTER();
+  tf_glm53_expand_v_decode_v2_task<16>(ol, kvb_codes, kvb_scales, out, rows, local_heads, head0);
 }

@@ -5,6 +5,7 @@ const cuda = @import("cuda");
 
 /// qmm_group.cu's tile-2 instantiation (LaneTile<64, 16, 64, 1, 4, 8>, bf16 out), as zig/kernels/cuda exports it.
 const group_symbol = "_ZN12tf_qmm_group12group_kernelILi64ELi16ELi64ELi1ELi4ELi8ELb0ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
+const group_f32_symbol = "_ZN12tf_qmm_group12group_kernelILi64ELi16ELi64ELi1ELi4ELi8ELb1ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
 const group_smem: u32 = 35328; // LaneTile<64, 16, 64, 1, 4, 8>::SMEM
 
 /// qmm_group.cu's Part and Parts, passed by value: four projections at most, one used here.
@@ -23,6 +24,7 @@ pub const Kernels = struct {
     pack_dense: cuda.Function,
     transpose: cuda.Function,
     gb10: bool, // qmm_group_cuda's programmatic dependent launch: on for GB10 (sm_121)
+    group_f32: ?cuda.Function = null,
 
     /// From the qmm_group and affine4_pack modules.
     pub fn load(group: cuda.Module, ops: cuda.Module, ctx: *const cuda.Context) !Kernels {
@@ -34,6 +36,13 @@ pub const Kernels = struct {
         };
         try k.group.allowDynamicShared(group_smem);
         return k;
+    }
+
+    /// TF_GLM53_DRAFT_DOWN4 only: the fp32-out instantiation, from the same qmm_group module.
+    pub fn loadF32(k: *Kernels, group: cuda.Module) !void {
+        const f = try group.function(group_f32_symbol);
+        try f.allowDynamicShared(group_smem);
+        k.group_f32 = f;
     }
 };
 
@@ -99,6 +108,32 @@ pub fn matmul(ks: *const Kernels, stream: cuda.Stream, x: u64, ldx: usize, xs: u
         .pdl = ks.gb10,
     };
     try cuda.launch.launch(ks.group, cfg, stream, &a);
+}
+
+/// qmm.matmul of a Q4 (tile 2, up to 16 rows): x bf16 (`ldx` apart), group sums xs fp32 [rows][k/64] -> out fp32 [rows][q.n].
+pub fn matmulF32(ks: *const Kernels, stream: cuda.Stream, x: u64, ldx: usize, xs: u64, q: Q4, out: u64, rows: usize) !void {
+    if (rows == 0 or rows > 16) return error.WindowTooWide;
+    const group = ks.group_f32 orelse return error.Q4F32NotLoaded;
+    const sk = splitK(q.n, q.k);
+    const tiles = (q.n + 63) / 64;
+    var parts: Parts = std.mem.zeroes(Parts);
+    parts.count = 1;
+    parts.p[0] = .{ .w = q.w, .scales = q.s, .biases = q.b, .out = out, .n = @intCast(q.n), .npad = @intCast(q.npad), .sk = @intCast(sk), .tiles = @intCast(tiles), .first = 0 };
+    const rows_t = (rows + 15) / 16;
+    const clusters = rows_t * tiles;
+    var a: cuda.Args = .{};
+    a.add(x);
+    a.add(xs);
+    a.add(parts);
+    for ([_]usize{ rows, q.k, if (rows == 1) q.k else ldx, rows_t, sk }) |v| a.add(@as(c_int, @intCast(v)));
+    const cfg: cuda.Config = .{
+        .grid = .{ .x = @intCast(clusters * sk) },
+        .block = .{ .x = 128 },
+        .shared = group_smem,
+        .cluster = if (sk > 1) .{ .x = @intCast(sk) } else null,
+        .pdl = ks.gb10,
+    };
+    try cuda.launch.launch(group, cfg, stream, &a);
 }
 
 test "the draft head's shape takes one K slice; npad rounds to 128s" {

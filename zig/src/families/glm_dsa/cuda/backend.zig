@@ -641,6 +641,7 @@ pub fn Adapter(comptime Engine: type) type {
             const start = b.e.pos;
             try emit(b, .verify, start, ids, @intCast(ids.len));
             var sampled: [follow.max_decode_rows]u32 = undefined;
+            if (comptime @hasField(Engine, "full_draw")) b.e.full_draw = w.held == 0 or b.trace_path != null;
             try b.e.verify(ids, sampled[0..ids.len]);
             if (b.drafting) b.verified_rows += ids.len;
             if (b.traceFile()) |path| recal.verifyLine(path, b.trace_req, start, ids.len, w.held, if (w.held > 0) 0 else w.tokens.len, t0, recal.nowNs() - t0, ids, sampled[0..ids.len]);

@@ -45,6 +45,11 @@ struct tf_glm53_moe_post_params {
   __nv_bfloat16* out; int rows, hidden, rank, b_stride;
   static constexpr int block_size = 256, smem_bytes = 0;
 };
+struct tf_glm53_moe_post_ep_params {
+  const float* y; const float* weights; const int* picks; const float* shared; const float* b; const float* mid;
+  __nv_bfloat16* out; int rows, hidden, rank, b_stride;
+  static constexpr int block_size = 256, smem_bytes = 0;
+};
 struct tf_glm53_residual_rmsnorm_6144_params {
   __nv_bfloat16* x; const float* parts; const __nv_bfloat16* w;
   __nv_bfloat16* normed; int rows; float eps;
@@ -172,6 +177,19 @@ __device__ __forceinline__ void tf_glm53_moe_post_task(const tf_glm53_moe_post_p
   const int row = i / p.hidden, col = i % p.hidden;
   float routed = 0.f;
   for (int q = 0; q < 8; ++q) routed = fmaf(p.weights[row * 8 + q], p.y[(row * 8 + q) * p.hidden + col], routed);
+  float sl = p.shared[i];
+  for (int j = 0; j < p.rank; ++j) sl = fmaf(p.mid[row * p.rank + j], p.b[j * p.b_stride + col], sl);
+  p.out[i] = __float2bfloat16_rn(__fadd_rn(routed, sl));
+}
+
+__device__ __forceinline__ void tf_glm53_moe_post_ep_task(const tf_glm53_moe_post_ep_params& p, int block_idx, int, char*) {
+  const int i = block_idx * tf_glm53_moe_post_ep_params::block_size + threadIdx.x;
+  if (i >= p.rows * p.hidden) return;
+  const int row = i / p.hidden, col = i % p.hidden;
+  float routed = 0.f;
+  for (int q = 0; q < 8; ++q) {
+    if (p.picks[row * 8 + q] >= 0) routed = fmaf(p.weights[row * 8 + q], p.y[(row * 8 + q) * p.hidden + col], routed);
+  }
   float sl = p.shared[i];
   for (int j = 0; j < p.rank; ++j) sl = fmaf(p.mid[row * p.rank + j], p.b[j * p.b_stride + col], sl);
   p.out[i] = __float2bfloat16_rn(__fadd_rn(routed, sl));

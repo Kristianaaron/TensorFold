@@ -77,7 +77,151 @@ pub fn run(gpu: anytype) !void {
     try equal(gpu, whole.words, chunked.words);
     try equal(gpu, whole.scales, chunked.scales);
     try equal(gpu, whole.biases, chunked.biases);
+    try fp32Out(gpu);
     std.debug.print("PASS glm-dflash-chunked-load q4 output: {d} rows in {d}-row chunks equals whole linear\n", .{rows, batch_rows});
+    try rowsIndependent(gpu);
+}
+
+fn bf16(v: f32) u16 {
+    const bits: u32 = @bitCast(v);
+    return @intCast((bits + 0x7fff + ((bits >> 16) & 1)) >> 16);
+}
+
+fn rowsIndependent(gpu: anytype) !void {
+    const a = gpu.gpa;
+    var stream = try cuda.Stream.init(gpu.d, false);
+    defer stream.deinit();
+    var gm = try cuda.Module.load(gpu.d, cuda.kernels.qmm_group);
+    defer gm.unload();
+    var pm = try cuda.Module.load(gpu.d, cuda.kernels.affine4_pack);
+    defer pm.unload();
+    const pk = try glm.q4.Kernels.load(gm, pm, gpu.ctx);
+    const shapes = [_]struct { n: usize, k: usize, seed: usize }{
+        .{ .n = 6144, .k = 30720, .seed = 17 },
+        .{ .n = 8192, .k = 6144, .seed = 29 },
+    };
+    for (shapes) |shape| {
+        const qbytes = glm.q4.bytes(shape.n, shape.k);
+        const weight_host = try a.alloc(u8, qbytes[0]);
+        defer a.free(weight_host);
+        for (weight_host, 0..) |*v, i| v.* = @truncate((i * 37 + shape.seed * 101) & 0xff);
+        const scale_host = try a.alloc(u16, qbytes[1] / @sizeOf(u16));
+        defer a.free(scale_host);
+        @memset(scale_host, bf16(0.125));
+        const bias_host = try a.alloc(u16, qbytes[2] / @sizeOf(u16));
+        defer a.free(bias_host);
+        @memset(bias_host, bf16(0.01));
+        var weight = try cuda.DeviceBuffer.fromHost(gpu.d, weight_host);
+        defer weight.free();
+        var scales = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(scale_host));
+        defer scales.free();
+        var biases = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(bias_host));
+        defer biases.free();
+        const q: glm.q4.Q4 = .{ .w = weight.ptr, .s = scales.ptr, .b = biases.ptr, .n = shape.n, .k = shape.k, .npad = glm.q4.npadOf(shape.n) };
+
+        const x_host = try a.alloc(u16, 8 * shape.k);
+        defer a.free(x_host);
+        for (x_host, 0..) |*v, i| {
+            const value = @as(f32, @floatFromInt(@as(i32, @intCast(i % 19)) - 9)) / 16.0;
+            v.* = bf16(value);
+        }
+        var x = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(x_host));
+        defer x.free();
+        const xs_host = try a.alloc(f32, 8 * (shape.k / 64));
+        defer a.free(xs_host);
+        for (xs_host, 0..) |*v, i| v.* = 0.25 + @as(f32, @floatFromInt(i % 13)) / 32.0;
+        var xs = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(xs_host));
+        defer xs.free();
+        var wide = try cuda.DeviceBuffer.alloc(gpu.d, 8 * shape.n * @sizeOf(u16));
+        defer wide.free();
+        var short = try cuda.DeviceBuffer.alloc(gpu.d, 3 * shape.n * @sizeOf(u16));
+        defer short.free();
+        try glm.q4.matmul(&pk, stream, x.ptr, shape.k, xs.ptr, q, wide.ptr, 8);
+        try glm.q4.matmul(&pk, stream, x.ptr, shape.k, xs.ptr, q, short.ptr, 3);
+        try stream.synchronize();
+        const wide_host = try a.alloc(u16, 3 * shape.n);
+        defer a.free(wide_host);
+        const short_host = try a.alloc(u16, 3 * shape.n);
+        defer a.free(short_host);
+        try wide.download(0, std.mem.sliceAsBytes(wide_host));
+        try short.download(0, std.mem.sliceAsBytes(short_host));
+        if (!std.mem.eql(u8, std.mem.sliceAsBytes(wide_host), std.mem.sliceAsBytes(short_host))) return error.TestFailed;
+    }
+    std.debug.print("PASS glm-dflash rows independent: 8-row Q4 outputs match 3-row prefixes for fc and kv shapes\n", .{});
+}
+
+fn fp32Out(gpu: anytype) !void {
+    const n: usize = 6144;
+    const k: usize = 6144;
+    const max_rows: usize = 8;
+    var stream = try cuda.Stream.init(gpu.d, false);
+    defer stream.deinit();
+    var qm = try cuda.Module.load(gpu.d, cuda.kernels.glm_quant);
+    defer qm.unload();
+    var pm = try cuda.Module.load(gpu.d, cuda.kernels.affine4_pack);
+    defer pm.unload();
+    var gm = try cuda.Module.load(gpu.d, cuda.kernels.qmm_group);
+    defer gm.unload();
+    var dm = try cuda.Module.load(gpu.d, cuda.kernels.glm_dflash);
+    defer dm.unload();
+    const quant_kernels = try glm.quant.Kernels.load(qm);
+    var q4_kernels = try glm.q4.Kernels.load(gm, pm, gpu.ctx);
+    try q4_kernels.loadF32(gm);
+    const df_kernels = try glm.dflash.Kernels.load(dm, .{});
+
+    const host_input = try gpu.gpa.alloc(u16, n * k);
+    defer gpu.gpa.free(host_input);
+    var state: u32 = 0x6d2b79f5;
+    for (host_input) |*value| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        const centered: i32 = @as(i32, @intCast(state & 0xffff)) - 32768;
+        value.* = f32ToBf16(@as(f32, @floatFromInt(centered)) / 32768.0);
+    }
+    var input = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(host_input));
+    defer input.free();
+    const raw_words_n = n * k / 2;
+    const raw_scale_n = n * k / 32;
+    var raw = try cuda.DeviceBuffer.alloc(gpu.d, raw_words_n + raw_scale_n * 2 + 1024);
+    defer raw.free();
+    const scales = raw.ptr + std.mem.alignForward(u64, raw_words_n, 256);
+    const biases = scales + std.mem.alignForward(u64, raw_scale_n, 256);
+    var quantized = try allocPacked(gpu.d, n, k);
+    defer quantized.deinit();
+    try glm.quant.q4(&quant_kernels, stream, input.ptr, n, k, raw.ptr, scales, biases);
+    try glm.q4.pack(&q4_kernels, stream, raw.ptr, scales, biases, quantized.q);
+
+    var sums = try cuda.DeviceBuffer.alloc(gpu.d, max_rows * (k / 64) * 4);
+    defer sums.free();
+    var bf16_output = try cuda.DeviceBuffer.alloc(gpu.d, max_rows * n * 2);
+    defer bf16_output.free();
+    var f32_output = try cuda.DeviceBuffer.alloc(gpu.d, max_rows * n * 4);
+    defer f32_output.free();
+    const rows_to_check = [_]usize{ 1, 3, 8 };
+    for (rows_to_check) |rows| {
+        var args: cuda.Args = .{};
+        args.add(input.ptr);
+        args.add(@as(i32, @intCast(k)));
+        args.add(@as(i32, @intCast(k)));
+        args.add(sums.ptr);
+        try cuda.launch.launch(df_kernels.gsum, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 128 } }, stream, &args);
+        try glm.q4.matmul(&q4_kernels, stream, input.ptr, k, sums.ptr, quantized.q, bf16_output.ptr, rows);
+        try glm.q4.matmulF32(&q4_kernels, stream, input.ptr, k, sums.ptr, quantized.q, f32_output.ptr, rows);
+        try stream.synchronize();
+        const wide = try gpu.gpa.alloc(f32, rows * n);
+        defer gpu.gpa.free(wide);
+        const narrow = try gpu.gpa.alloc(u16, rows * n);
+        defer gpu.gpa.free(narrow);
+        try f32_output.download(0, std.mem.sliceAsBytes(wide));
+        try bf16_output.download(0, std.mem.sliceAsBytes(narrow));
+        for (wide, narrow) |value, actual| try std.testing.expectEqual(actual, f32ToBf16(value));
+    }
+}
+
+fn f32ToBf16(value: f32) u16 {
+    const bits: u32 = @bitCast(value);
+    return @intCast((bits + 0x7fff + ((bits >> 16) & 1)) >> 16);
 }
 
 const Packed = struct {

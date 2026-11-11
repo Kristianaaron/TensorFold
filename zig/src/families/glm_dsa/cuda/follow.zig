@@ -6,11 +6,13 @@
 const std = @import("std");
 const cuda = @import("cuda");
 pub const max_decode_rows = 16;
+pub const round_none: u32 = std.math.maxInt(u32);
+pub const inline_ids: usize = max_decode_rows;
 
-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draw, end, release, cache_hit, rollback, prefill_rows, draft_block, park, unpark, snap_save, snap_load, snap_commit, prewarm_graph, masks = 18 };
+pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draw, end, release, cache_hit, rollback, prefill_rows, draft_block, park, unpark, snap_save, snap_load, snap_commit, prewarm_graph, masks = 18, round = 19 };
 
 pub fn hasPayload(kind: u32) bool {
-    return kind == @backingInt(Kind.begin) or kind == @backingInt(Kind.prefill) or kind == @backingInt(Kind.verify) or kind == @backingInt(Kind.cache_hit) or kind == @backingInt(Kind.prefill_rows) or kind == @backingInt(Kind.draft_block) or kind == @backingInt(Kind.park) or kind == @backingInt(Kind.unpark) or kind == @backingInt(Kind.snap_load) or kind == @backingInt(Kind.prewarm_graph) or kind == @backingInt(Kind.masks);
+    return kind == @backingInt(Kind.begin) or kind == @backingInt(Kind.prefill) or kind == @backingInt(Kind.verify) or kind == @backingInt(Kind.cache_hit) or kind == @backingInt(Kind.prefill_rows) or kind == @backingInt(Kind.draft_block) or kind == @backingInt(Kind.park) or kind == @backingInt(Kind.unpark) or kind == @backingInt(Kind.snap_load) or kind == @backingInt(Kind.prewarm_graph) or kind == @backingInt(Kind.masks) or kind == @backingInt(Kind.round);
 }
 
 
@@ -27,11 +29,13 @@ pub const Header = extern struct {
     }
 };
 
+pub const packed_bytes: usize = @sizeOf(Header) + inline_ids * @sizeOf(u32);
+
 pub const Link = struct {
     /// Host-testable wire validation. A follower must reject malformed rank-0 frames before touching its engine.
     pub fn validate(h: Header, ids: []const u32) !void {
         if (h.protocol != 1) return error.ProtocolMismatch;
-        if (h.kind < @backingInt(Kind.begin) or h.kind > @backingInt(Kind.masks)) return error.BadKind;
+        if (h.kind < @backingInt(Kind.begin) or h.kind > @backingInt(Kind.round)) return error.BadKind;
         const payload_kind = hasPayload(h.kind);
 
         if (h.kind == @backingInt(Kind.begin) and h.slot > 1) return error.BadPayload;
@@ -50,6 +54,8 @@ pub const Link = struct {
         if (h.kind == @backingInt(Kind.prewarm_graph) and (h.n == 0 or h.n > max_decode_rows or h.n != ids.len)) return error.BadPayload;
 
         if (h.kind == @backingInt(Kind.masks) and (h.slot == 0 or h.slot > max_decode_rows or ids.len == 0 or ids.len % @as(usize, h.slot) != 0)) return error.BadPayload;
+
+        if (h.kind == @backingInt(Kind.round) and (ids.len != 5 or ids[0] > max_decode_rows or (ids[1] != round_none and ids[1] > 1 << 20) or (ids[2] == round_none and (ids[3] != 0 or ids[4] != 0)) or (ids[2] != round_none and ids[3] > max_decode_rows))) return error.BadPayload;
 
         if (h.kind == @backingInt(Kind.keep) and h.n > max_decode_rows) return error.BadPayload;
         if (h.kind == @backingInt(Kind.rollback) and h.n > 1 << 20) return error.BadPayload;
@@ -145,6 +151,21 @@ pub const Link = struct {
                 if (comptime @hasField(@TypeOf(engine.*), "window_rows")) if (engine.window_rows < h.n) return error.BadKeep;
                 try engine.keep(@as(usize, h.n));
             },
+            .round => {
+                if (engine.pos != h.position) return error.PositionMismatch;
+                if (comptime @hasField(@TypeOf(engine.*), "window_rows")) if (engine.window_rows < ids[0]) return error.BadKeep;
+                try engine.keep(@as(usize, ids[0]));
+                if (ids[1] != round_none) {
+                    if (@as(usize, ids[1]) > engine.pos) return error.BadRollback;
+                    try engine.rollback(@as(usize, ids[1]));
+                }
+                if (ids[2] != round_none) {
+                    if (comptime @hasDecl(@TypeOf(engine.*), "draftBlock"))
+                        try engine.draftBlock(@intCast(ids[2]), @intCast(ids[3]), ids[4], null, null)
+                    else
+                        return error.UnsupportedOperation;
+                }
+            },
             .release => {
                 if (engine.pos != h.position) return error.PositionMismatch;
                 if (comptime @hasDecl(@TypeOf(engine.*), "clearMasks")) engine.clearMasks();
@@ -182,7 +203,55 @@ pub const Link = struct {
     }
 };
 
+pub const Coalesce = struct {
+    pending: ?Pending = null,
+
+    pub const Pending = struct { position: u64, keep_n: u32, rollback_to: u32 = round_none };
+    pub const Round = struct { header: Header, ids: [5]u32 };
+    pub const Out = union(enum) { pass, round: Round };
+
+    fn roundOf(p: Pending, draft_pos: u32, draft_n: u32, anchor: u32) Round {
+        return .{ .header = .{ .kind = @backingInt(Kind.round), .n = 5, .position = p.position }, .ids = .{ p.keep_n, p.rollback_to, draft_pos, draft_n, anchor } };
+    }
+
+    pub fn push(c: *Coalesce, h: Header, ids: []const u32, out: *[2]Out) !usize {
+        if (h.kind == @backingInt(Kind.keep)) {
+            const n = c.flush(out);
+            c.pending = .{ .position = h.position, .keep_n = h.n };
+            return n;
+        }
+        if (h.kind == @backingInt(Kind.rollback)) {
+            if (c.pending) |*p| {
+                if (p.rollback_to == round_none and h.position == p.position + p.keep_n) {
+                    p.rollback_to = h.n;
+                    return 0;
+                }
+            }
+        }
+        if (h.kind == @backingInt(Kind.draft_block)) {
+            if (c.pending) |p| {
+                if (ids.len != 2 or h.position >= round_none) return error.BadPayload;
+                c.pending = null;
+                out[0] = .{ .round = roundOf(p, @intCast(h.position), ids[0], ids[1]) };
+                return 1;
+            }
+        }
+        const n = c.flush(out);
+        out[n] = .pass;
+        return n + 1;
+    }
+
+    pub fn flush(c: *Coalesce, out: *[2]Out) usize {
+        const p = c.pending orelse return 0;
+        c.pending = null;
+        out[0] = .{ .round = roundOf(p, round_none, 0, 0) };
+        return 1;
+    }
+};
+
 /// NCCL broadcast frame transport shared by the rank-0 adapter and rank-1 follower.
+pub const Received = struct { header: Header, ids: []const u32 };
+
 pub const Wire = struct {
     gpa: std.mem.Allocator,
     d: *const cuda.Driver,
@@ -191,6 +260,8 @@ pub const Wire = struct {
     stream: cuda.Stream,
     device: cuda.DeviceBuffer,
     ids: []u32,
+    one_frame: bool = false,
+    co: Coalesce = .{},
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, stream: cuda.Stream, max_ids: usize) !Wire {
         const device = try cuda.DeviceBuffer.alloc(d, @sizeOf(Header) + max_ids * @sizeOf(u32));
@@ -207,6 +278,7 @@ pub const Wire = struct {
     }
 
     pub fn send(w: *Wire, h: Header, ids: []const u32) !void {
+        if (w.one_frame) return w.sendOneFrame(h, ids);
         try Link.validate(h, ids);
         if (ids.len > w.ids.len) return error.TooManyIds;
         try w.device.uploadAsync(0, std.mem.asBytes(&h), w.stream.handle);
@@ -217,7 +289,8 @@ pub const Wire = struct {
         }
     }
 
-    pub fn receive(w: *Wire) !struct { header: Header, ids: []const u32 } {
+    pub fn receive(w: *Wire) !Received {
+        if (w.one_frame) return w.receivePacked();
         try w.broadcast(0, @sizeOf(Header));
         try w.stream.synchronize();
         var h: Header = undefined;
@@ -231,6 +304,54 @@ pub const Wire = struct {
             try w.device.download(@sizeOf(Header), std.mem.sliceAsBytes(w.ids[0..h.n]));
         }
         const n: usize = if (has_payload) h.n else 0;
+        try Link.validate(h, w.ids[0..n]);
+        return .{ .header = h, .ids = w.ids[0..n] };
+    }
+
+    fn sendOneFrame(w: *Wire, h: Header, ids: []const u32) !void {
+        try Link.validate(h, ids);
+        var out: [2]Coalesce.Out = undefined;
+        const n = try w.co.push(h, ids, &out);
+        for (out[0..n]) |o| switch (o) {
+            .pass => try w.sendPacked(h, ids),
+            .round => |r| try w.sendPacked(r.header, &r.ids),
+        };
+    }
+
+    fn sendPacked(w: *Wire, h: Header, ids: []const u32) !void {
+        try Link.validate(h, ids);
+        if (ids.len > w.ids.len) return error.TooManyIds;
+        if (w.device.len < packed_bytes) return error.WireTooSmall;
+        if (ids.len <= inline_ids) {
+            var buf: [packed_bytes]u8 = @splat(0);
+            @memcpy(buf[0..@sizeOf(Header)], std.mem.asBytes(&h));
+            @memcpy(buf[@sizeOf(Header)..][0 .. ids.len * @sizeOf(u32)], std.mem.sliceAsBytes(ids));
+            try w.device.uploadAsync(0, &buf, w.stream.handle);
+            try w.broadcast(0, packed_bytes);
+            return;
+        }
+        try w.device.uploadAsync(0, std.mem.asBytes(&h), w.stream.handle);
+        try w.device.uploadAsync(@sizeOf(Header), std.mem.sliceAsBytes(ids), w.stream.handle);
+        try w.broadcast(0, packed_bytes);
+        try w.broadcast(@sizeOf(Header), ids.len * @sizeOf(u32));
+    }
+
+    fn receivePacked(w: *Wire) !Received {
+        try w.broadcast(0, packed_bytes);
+        try w.stream.synchronize();
+        var buf: [packed_bytes]u8 = undefined;
+        try w.device.download(0, &buf);
+        const h = std.mem.bytesToValue(Header, buf[0..@sizeOf(Header)]);
+        const has_payload = hasPayload(h.kind);
+        if (has_payload and h.n > w.ids.len) return error.TooManyIds;
+        const n: usize = if (has_payload) h.n else 0;
+        if (n > inline_ids) {
+            try w.broadcast(@sizeOf(Header), n * @sizeOf(u32));
+            try w.stream.synchronize();
+            try w.device.download(@sizeOf(Header), std.mem.sliceAsBytes(w.ids[0..n]));
+        } else {
+            @memcpy(std.mem.sliceAsBytes(w.ids[0..n]), buf[@sizeOf(Header)..][0 .. n * @sizeOf(u32)]);
+        }
         try Link.validate(h, w.ids[0..n]);
         return .{ .header = h, .ids = w.ids[0..n] };
     }
@@ -261,9 +382,9 @@ test "park protocol frames validate payloads and preserve the payload kind map" 
     try std.testing.expectError(error.BadPayload, Link.validate(.{ .kind = park_kind, .n = 2 }, &.{ 1, 512 }));
     try std.testing.expectError(error.BadPayload, Link.validate(.{ .kind = park_kind, .n = 2 }, &.{ 1024, 1024 }));
     try std.testing.expectError(error.BadPayload, Link.validate(.{ .kind = unpark_kind, .n = 1 }, &.{}));
-    // 17 = prewarm_graph and 18 = masks; 19 is past the last kind.
-    try std.testing.expectError(error.BadKind, Link.validate(.{ .kind = 19 }, &.{}));
-    for (1..19) |k| try std.testing.expectEqual(k == 1 or k == 2 or k == 3 or k == 8 or k == 10 or k == 11 or k == 12 or k == 13 or k == 15 or k == 17 or k == 18, hasPayload(@intCast(k)));
+    // 17 = prewarm_graph, 18 = masks, and 19 = round.
+    try std.testing.expectError(error.BadKind, Link.validate(.{ .kind = 20 }, &.{}));
+    for (1..20) |k| try std.testing.expectEqual(k == 1 or k == 2 or k == 3 or k == 8 or k == 10 or k == 11 or k == 12 or k == 13 or k == 15 or k == 17 or k == 18 or k == 19, hasPayload(@intCast(k)));
 }
 
 test "park protocol apply checks position and the follower restored frontier" {
@@ -306,7 +427,7 @@ test "follower masks frames validate, arm and clear" {
     try std.testing.expectError(error.BadPayload, Link.validate(.{ .kind = kind, .n = 17, .slot = 17 }, &too_many));
     try std.testing.expectError(error.BadPayload, Link.validate(.{ .kind = kind, .n = 3, .slot = 2 }, &.{ 1, 2, 3 }));
     try std.testing.expectError(error.BadPayload, Link.validate(.{ .kind = kind, .n = 0, .slot = 1 }, &.{}));
-    try std.testing.expectError(error.BadKind, Link.validate(.{ .kind = 19 }, &.{}));
+    try std.testing.expectError(error.BadKind, Link.validate(.{ .kind = 20 }, &.{}));
     const Fake = struct {
         pos: usize = 0,
         seed: u64 = 0,
@@ -642,4 +763,124 @@ test "follower loop in resident mode keeps the settled prefill frontier on relea
 
 test "follower loop in non-resident mode rolls back to zero on release" {
     try loopbackCase(false, 0);
+}
+
+test "one frame: keep, rollback and draft_block ride in one round frame" {
+    const Frame = struct { header: Header, ids: [16]u32 = @splat(0), len: usize = 0 };
+    const Recorder = struct {
+        fn append(frames: *[8]Frame, count: *usize, header: Header, ids: []const u32) !void {
+            try Link.validate(header, ids);
+            frames[count.*] = .{ .header = header, .len = ids.len };
+            @memcpy(frames[count.*].ids[0..ids.len], ids);
+            count.* += 1;
+        }
+
+        fn push(co: *Coalesce, frames: *[8]Frame, count: *usize, header: Header, ids: []const u32) !void {
+            var out: [2]Coalesce.Out = undefined;
+            const n = try co.push(header, ids, &out);
+            for (out[0..n]) |item| switch (item) {
+                .pass => try append(frames, count, header, ids),
+                .round => |r| try append(frames, count, r.header, &r.ids),
+            };
+        }
+    };
+
+    var co: Coalesce = .{};
+    var sent: [8]Frame = undefined;
+    var count: usize = 0;
+    try Recorder.push(&co, &sent, &count, .{ .kind = @backingInt(Kind.verify), .n = 3, .position = 100 }, &.{ 5, 6, 7 });
+    try Recorder.push(&co, &sent, &count, .{ .kind = @backingInt(Kind.keep), .n = 3, .position = 100 }, &.{});
+    try Recorder.push(&co, &sent, &count, .{ .kind = @backingInt(Kind.rollback), .n = 101, .position = 103 }, &.{});
+    try Recorder.push(&co, &sent, &count, .{ .kind = @backingInt(Kind.draft_block), .n = 2, .position = 101 }, &.{ 1, 6 });
+    try Recorder.push(&co, &sent, &count, .{ .kind = @backingInt(Kind.verify), .n = 1, .position = 101 }, &.{9});
+    try Recorder.push(&co, &sent, &count, .{ .kind = @backingInt(Kind.keep), .n = 1, .position = 101 }, &.{});
+    try Recorder.push(&co, &sent, &count, .{ .kind = @backingInt(Kind.release), .position = 102 }, &.{});
+
+    try std.testing.expectEqual(@as(usize, 5), count);
+    const expected_kinds = [_]Kind{ .verify, .round, .verify, .round, .release };
+    for (sent[0..count], expected_kinds) |frame, kind| {
+        try Link.validate(frame.header, frame.ids[0..frame.len]);
+        try std.testing.expectEqual(kind, @as(Kind, @enumFromInt(frame.header.kind)));
+    }
+    try std.testing.expectEqual(@as(u64, 100), sent[0].header.position);
+    try std.testing.expectEqualSlices(u32, &.{ 5, 6, 7 }, sent[0].ids[0..3]);
+    try std.testing.expectEqual(@as(u64, 100), sent[1].header.position);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 101, 101, 1, 6 }, sent[1].ids[0..5]);
+    try std.testing.expectEqual(@as(u64, 101), sent[2].header.position);
+    try std.testing.expectEqualSlices(u32, &.{9}, sent[2].ids[0..1]);
+    try std.testing.expectEqual(@as(u64, 101), sent[3].header.position);
+    try std.testing.expectEqualSlices(u32, &.{ 1, round_none, round_none, 0, 0 }, sent[3].ids[0..5]);
+    try std.testing.expectEqual(@as(u64, 102), sent[4].header.position);
+}
+
+test "one frame: applying round frames equals applying the frames they replace" {
+    const Fake = struct {
+        pos: usize = 100,
+        window_rows: usize = 0,
+        seed: u64 = 0,
+        rule: struct { temperature: f64 = 0, top_k: usize = 0, top_p: f64 = 1, min_log: f64 = -std.math.inf(f64) } = .{},
+        ops: [32]u64 = @splat(0),
+        op_n: usize = 0,
+        fn record(e: *@This(), op: u64, a: usize, b: usize) void {
+            e.ops[e.op_n] = op | (@as(u64, @intCast(a)) << 8) | (@as(u64, @intCast(b)) << 32);
+            e.op_n += 1;
+        }
+        pub fn verify(e: *@This(), ids: []const u32, _: []u32) !void {
+            e.window_rows = ids.len;
+            e.record(1, ids.len, 0);
+        }
+        pub fn prefill(_: *@This(), _: []const u32) !u32 { return 0; }
+        pub fn nextTurn(_: *@This(), _: []const u32) !u32 { return 0; }
+        pub fn prefillRows(_: *@This(), _: []const u32) !void {}
+        pub fn keep(e: *@This(), n: usize) !void {
+            e.record(2, n, 0);
+            e.pos += n;
+            e.window_rows = 0;
+        }
+        pub fn rollback(e: *@This(), to: usize) !void {
+            e.record(3, to, 0);
+            e.pos = to;
+        }
+        pub fn draftBlock(e: *@This(), pos: usize, n: usize, anchor: u32, _: ?[]u32, _: ?[]f64) !void {
+            e.record(4, pos, n);
+            e.record(5, anchor, 0);
+        }
+    };
+    const Frame = struct { header: Header, ids: []const u32 };
+    const original = [_]Frame{
+        .{ .header = .{ .kind = @backingInt(Kind.verify), .n = 3, .position = 100 }, .ids = &.{ 5, 6, 7 } },
+        .{ .header = .{ .kind = @backingInt(Kind.keep), .n = 3, .position = 100 }, .ids = &.{} },
+        .{ .header = .{ .kind = @backingInt(Kind.rollback), .n = 101, .position = 103 }, .ids = &.{} },
+        .{ .header = .{ .kind = @backingInt(Kind.draft_block), .n = 2, .position = 101 }, .ids = &.{ 1, 6 } },
+        .{ .header = .{ .kind = @backingInt(Kind.verify), .n = 1, .position = 101 }, .ids = &.{9} },
+        .{ .header = .{ .kind = @backingInt(Kind.keep), .n = 1, .position = 101 }, .ids = &.{} },
+        .{ .header = .{ .kind = @backingInt(Kind.release), .position = 102 }, .ids = &.{} },
+    };
+    const coalesced = [_]Frame{
+        original[0],
+        .{ .header = .{ .kind = @backingInt(Kind.round), .n = 5, .position = 100 }, .ids = &.{ 3, 101, 101, 1, 6 } },
+        original[4],
+        .{ .header = .{ .kind = @backingInt(Kind.round), .n = 5, .position = 101 }, .ids = &.{ 1, round_none, round_none, 0, 0 } },
+        original[6],
+    };
+    var plain: Fake = .{};
+    var grouped: Fake = .{};
+    var out: [max_decode_rows]u32 = undefined;
+    for (original) |frame| try Link.apply(&plain, frame.header, frame.ids, &out);
+    for (coalesced) |frame| try Link.apply(&grouped, frame.header, frame.ids, &out);
+    try std.testing.expectEqualSlices(u64, plain.ops[0..plain.op_n], grouped.ops[0..grouped.op_n]);
+    try std.testing.expectEqual(plain.pos, grouped.pos);
+}
+
+test "one frame: validate rejects malformed round payloads" {
+    const kind = @backingInt(Kind.round);
+    try std.testing.expectError(error.BadPayload, Link.validate(.{ .kind = kind, .n = 4 }, &.{ 1, round_none, round_none, 0 }));
+    try std.testing.expectError(error.BadPayload, Link.validate(.{ .kind = kind, .n = 5 }, &.{ 17, round_none, round_none, 0, 0 }));
+    try std.testing.expectError(error.BadPayload, Link.validate(.{ .kind = kind, .n = 5 }, &.{ 1, round_none, 10, 17, 0 }));
+    try std.testing.expectError(error.BadPayload, Link.validate(.{ .kind = kind, .n = 5 }, &.{ 1, round_none, round_none, 1, 0 }));
+}
+
+test "one frame: packed layout fits the header and 16 ids" {
+    try std.testing.expectEqual(@as(usize, 120), packed_bytes);
+    try std.testing.expect(@sizeOf(Header) + 16 * @sizeOf(u32) >= packed_bytes);
 }

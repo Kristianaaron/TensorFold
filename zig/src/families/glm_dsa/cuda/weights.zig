@@ -676,13 +676,14 @@ fn routedCodebook(c: *const Config) experts.Codebook {
 }
 
 /// The largest per-projection host staging WP4's experts.load builds (trellis tiles of this rank), from headers.
-fn expertsHostBytes(L: *Loader, layer: usize, count: usize, dims: usize, lo: usize, hi: usize) !usize {
+fn expertsHostBytes(L: *Loader, layer: usize, count: usize, dims: usize, lo: usize, hi: usize, expert_ids: ?[]const usize) !usize {
     var most: usize = 0;
     var nb: [320]u8 = undefined;
     for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }, 0..) |proj, pi| {
         var bytes: usize = 0;
-        for (0..count) |e| {
-            const t = try L.header(try std.fmt.bufPrint(&nb, "layers.{d}.mlp.experts.{d}.{s}.trellis", .{ layer, e, proj }));
+        for (0..count) |local| {
+            const expert = if (expert_ids) |ids| ids[local] else local;
+            const t = try L.header(try std.fmt.bufPrint(&nb, "layers.{d}.mlp.experts.{d}.{s}.trellis", .{ layer, expert, proj }));
             const local_k = if (pi == 2) hi - lo else dims;
             const local_n = if (pi == 2) dims else hi - lo;
             bytes += (local_k / 16) * (local_n / 16) * 16 * (t.dim(2) / 8);
@@ -694,21 +695,22 @@ fn expertsHostBytes(L: *Loader, layer: usize, count: usize, dims: usize, lo: usi
 
 /// WP4 experts.load's exact uploads, from the headers only (plan mode): per projection the sliced trellis tiles,
 /// the pointer table, the K2 table and the suh/svh slices; every tensor it would read is marked used.
-fn planExperts(L: *Loader, layer: usize, count: usize, dims: usize, full_width: usize, lo: usize, hi: usize) !void {
+fn planExperts(L: *Loader, layer: usize, count: usize, dims: usize, full_width: usize, lo: usize, hi: usize, expert_ids: ?[]const usize) !void {
     const w = L.plan.?;
     for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }, 0..) |proj, pi| {
         const down = pi == 2;
         var trellis: u64 = 0;
         var nb: [320]u8 = undefined;
-        for (0..count) |e| {
-            const t = try L.header(try std.fmt.bufPrint(&nb, "layers.{d}.mlp.experts.{d}.{s}.trellis", .{ layer, e, proj }));
+        for (0..count) |local| {
+            const expert = if (expert_ids) |ids| ids[local] else local;
+            const t = try L.header(try std.fmt.bufPrint(&nb, "layers.{d}.mlp.experts.{d}.{s}.trellis", .{ layer, expert, proj }));
             if (t.rank != 3 or t.dim(2) % 8 != 0) return error.BadExpertTensor;
             const k2 = t.dim(2) / 8;
             const local_k = if (down) hi - lo else dims;
             const local_n = if (down) dims else hi - lo;
             trellis += (local_k / 16) * (local_n / 16) * 16 * k2;
             for ([_][]const u8{ "suh", "svh", "mcg", "mcg_e4m3", "mul1" }) |part| {
-                const raw = try std.fmt.bufPrint(&nb, "layers.{d}.mlp.experts.{d}.{s}.{s}", .{ layer, e, proj, part });
+                const raw = try std.fmt.bufPrint(&nb, "layers.{d}.mlp.experts.{d}.{s}.{s}", .{ layer, expert, proj, part });
                 if (L.hasRaw(raw)) _ = try L.header(raw);
             }
         }
@@ -726,8 +728,8 @@ fn loadLayer(L: *Loader, c: *const Config, sh: share_mod.Share, i: usize) !Devic
     var nb: [320]u8 = undefined;
     const p = try std.fmt.bufPrint(&pb, "layers.{d}.", .{i});
     const hidden: Span = .{ .lo = 0, .hi = c.hidden };
-    if (L.select.shard_qkv_a and (c.q_lora != 2048 or c.kv_lora + c.rope != 576)) return error.UnsupportedShardQkvAShape;
-    const q_a_rows = if (L.select.shard_qkv_a) try shardQkvARows(sh.rank, true) else Span{ .lo = 0, .hi = c.q_lora };
+    if ((L.select.shard_qkv_a or L.select.shard_q_a) and (c.q_lora != 2048 or c.kv_lora + c.rope != 576)) return error.UnsupportedShardQkvAShape;
+    const q_a_rows = if (L.select.shard_qkv_a or L.select.shard_q_a) try shardQkvARows(sh.rank, true) else Span{ .lo = 0, .hi = c.q_lora };
     const kv_a_rows = if (L.select.shard_qkv_a) try shardQkvARows(sh.rank, false) else Span{ .lo = 0, .hi = c.kv_lora + c.rope };
     const q_head = c.nope + c.rope;
     const kv_head = c.nope + c.v_dim;
@@ -786,20 +788,26 @@ fn loadLayer(L: *Loader, c: *const Config, sh: share_mod.Share, i: usize) !Devic
     }
     m.router = try plain(L, try std.fmt.bufPrint(&nb, "{s}mlp.gate.weight", .{p}), null, null, .bf16);
     m.bias = try plain(L, try std.fmt.bufPrint(&nb, "{s}mlp.gate.e_score_correction_bias", .{p}), null, null, .f32);
+    var ep_ids: [128]usize = undefined;
+    const expert_ids: ?[]const usize = if (L.select.moe_ep) blk: {
+        for (&ep_ids, 0..) |*id, local| id.* = experts.expertForLocal(L.select.rank, local);
+        break :blk &ep_ids;
+    } else null;
+    const moe_span: Span = if (L.select.moe_ep) .{ .lo = 0, .hi = c.moe_inter } else .{ .lo = sh.moe.lo, .hi = sh.moe.hi };
     if (L.plan != null) {
-        try planExperts(L, i, c.experts, c.hidden, c.moe_inter, sh.moe.lo, sh.moe.hi);
+        try planExperts(L, i, if (L.select.moe_ep) 128 else c.experts, c.hidden, c.moe_inter, moe_span.lo, moe_span.hi, expert_ids);
         m.routed = undefined;
     } else {
         // One exact reservation for WP4's host staging (the largest projection's rank half), so the ArrayList never
         // grows by doubling through about 0.4 GiB (review N9). experts.load reads at most 5 tensors per expert before
         // it consumes them; the O_DIRECT ring holds Direct.ring_len = 8.
-        try L.host.ensureTotalCapacityPrecise(L.gpa, try expertsHostBytes(L, i, c.experts, c.hidden, sh.moe.lo, sh.moe.hi));
+        try L.host.ensureTotalCapacityPrecise(L.gpa, try expertsHostBytes(L, i, if (L.select.moe_ep) 128 else c.experts, c.hidden, moe_span.lo, moe_span.hi, expert_ids));
         L.hold_host = true;
         defer {
             L.hold_host = false;
             L.trimHost();
         }
-        m.routed = try experts.load(L, i, c.experts, c.hidden, c.moe_inter, sh.moe.lo, sh.moe.hi, routedCodebook(c));
+        m.routed = try experts.load(L, i, if (L.select.moe_ep) 128 else c.experts, c.hidden, c.moe_inter, moe_span.lo, moe_span.hi, routedCodebook(c), expert_ids);
     }
     const shared: Span = .{ .lo = sh.shared.lo, .hi = sh.shared.hi };
     m.shared = .{
@@ -820,6 +828,10 @@ pub const Select = struct {
     manifest: ?*const manifest_mod.Manifest = null,
     /// Load only this TP rank's q_a and kv_a output rows.
     shard_qkv_a: bool = false,
+    /// TF_GLM53_QA_SHARD=1: load only this TP rank's 1024 q_a output rows (kv_a stays whole).
+    shard_q_a: bool = false,
+    moe_ep: bool = false,
+    rank: usize = 0,
 
     /// Bring-up (design §7 L1 at TP2 + DCP2): the first `count` layers and the globals.
     pub fn bringUp(store: []usize, count: usize) Select {
@@ -1075,7 +1087,7 @@ pub const ModelWeights = struct {
         const plan = try planOpen(gpa, &ck, &c, rank, world, select);
         const planned = roundedClasses(plan.placed);
         if (!sameClasses(planned, budget.admission.breakdown.weights)) return error.AdmissionMismatch;
-        if (select.layers == null and select.globals and try unusedNames(&ck, null, gpa) != 0) return error.UnusedCheckpointTensors;
+        if (select.layers == null and select.globals and !select.moe_ep and try unusedNames(&ck, null, gpa) != 0) return error.UnusedCheckpointTensors;
         ck.used.clearRetainingCapacity();
         var model: ModelWeights = .{ .allocator = gpa, .rank = rank, .world = world, .config = c };
         errdefer model.deinit();
