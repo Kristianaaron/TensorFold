@@ -638,8 +638,227 @@ __device__ __forceinline__ void w8s_load_afs(const uint32_t* tile0, int lane, ui
     }
 }
 
-template<int K2G, int K2U>
+// KO1: one LDS of the stage's first trellis word, expanded to four fragments. The MMA or the
+// XOR accumulate consumes them, so neither the LDS nor the MMAs can be dropped.
+__device__ __forceinline__ void w8s_load_afs_ko1(const uint32_t* tile0, int lane, uint32_t (&afs)[4][4]) {
+    const uint32_t w = tile0[0];
+    const uint32_t v = w ^ (uint32_t)lane;
+#pragma unroll
+    for (int h = 0; h < 4; ++h) {
+        afs[h][0] = v;
+        afs[h][1] = v ^ 1u;
+        afs[h][2] = v ^ 2u;
+        afs[h][3] = v ^ 3u;
+    }
+}
+
+// KO is an ablation mask, not a correctness switch: 1 NODECODE, 2 NOMMA, 4 NOLOAD,
+// 8 NOGUARD, 16 NOEPI, 32 NOLDSM, 64 NOBAR, 128 NOLOOPADDR. KO = 0 is the shipping body unchanged.
+template<int K2G, int K2U, int KO>
 __device__ __forceinline__ void gu_body_w8s(const PmxA8Args& a, int item, int nb, unsigned char* smem, int* rows_sh) {
+    constexpr int TWG = 4 * K2G, TWU = 4 * K2U, W = 16, THREADS = 512;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int mat = warp >> 3, slice = warp & 7, g = lane >> 2, t = lane & 3;
+    const int e = a.items[item * 3], off = a.items[item * 3 + 1], cnt = a.items[item * 3 + 2];
+    const int NT = a.N >> 4, S = a.K >> 7;
+    for (int i = threadIdx.x; i < BM; i += THREADS) rows_sh[i] = i < cnt ? a.members[off + i] : -1;
+    __syncthreads();
+    const int cnt16 = (cnt + 15) & ~15;
+    const size_t xstride = a.xs ? (size_t)a.xs : (size_t)a.K;
+    const size_t sstride = a.xs ? (size_t)a.xs : sizeof(float);
+    auto load_stage = [&](int s) {
+        if constexpr ((KO & 4) != 0) { if (s != 0) return; }
+        const int slot = (KO & 4) ? 0 : (s % W8_STAGES);
+        unsigned char* stg = smem + (size_t)slot * W8_STAGE;
+        uint8_t* xa = reinterpret_cast<uint8_t*>(stg);
+        const int k0 = s * W8_K;
+        for (int i = threadIdx.x; i < 2 * BM * 8; i += THREADS) {
+            const int m = i / (BM * 8), r = (i / 8) % BM, ch = i % 8;
+            if (r < cnt16) {
+                const int row = rows_sh[r];
+                const uint8_t* src = (m ? a.x1 : a.x0) + (size_t)(row < 0 ? 0 : row) * xstride + k0 + ch * 16;
+                cp_async16(xa + ((size_t)m * BM + r) * W8_K + w8_swz(r, ch) * 16, src, row >= 0);
+            }
+        }
+        uint32_t* rw = reinterpret_cast<uint32_t*>(stg + W8_X);
+        for (int i = threadIdx.x; i < 2 * W8_TILES * NB * 6; i += THREADS) {
+            const int q = i % 6, n = (i / 6) % NB, kk = (i / (6 * NB)) % W8_TILES, m = i / (6 * NB * W8_TILES);
+            const int local_tw = m ? TWU : TWG;
+            const uint32_t* src = (m ? reinterpret_cast<const uint32_t*>(a.tp1[e]) : reinterpret_cast<const uint32_t*>(a.tp0[e])) + ((size_t)(s * W8_TILES + kk) * NT + nb * NB + n) * local_tw + q * 4;
+            const bool valid = q < (m ? K2U : K2G);
+            if (valid) cp_async16(rw + ((m * W8_TILES + kk) * NB + n) * TWMAX + q * 4, src, true);
+        }
+    };
+    float acc[16][4];
+#pragma unroll
+    for (int n = 0; n < 16; ++n)
+        for (int c = 0; c < 4; ++c) acc[n][c] = 0.f;
+    // KO128: row and chunk do not depend on the stage, so compute the two offsets once per lane.
+    // This trades address ALU for registers, so the result is an upper bound on the arithmetic
+    // the loop spends on row/chunk/w8_swz rather than a lower bound.
+    uint32_t roff[16];
+    uint32_t coff[2];
+    if constexpr ((KO & 128) != 0) {
+#pragma unroll
+        for (int grp = 0; grp < 16; ++grp) roff[grp] = (uint32_t)((8 * grp + (lane & 7)) * W8_K);
+#pragma unroll
+        for (int pair = 0; pair < 2; ++pair) coff[pair] = (uint32_t)((((pair * 4 + (lane >> 3)) ^ (lane & 7)) * 16));
+    }
+    (void)roff;
+    (void)coff;
+#pragma unroll
+    for (int s = 0; s < W8_STAGES - 1; ++s) { if (s < S) load_stage(s); cp_commit(); }
+    cp_wait<W8_STAGES - 2>();
+    __syncthreads();
+    for (int s = 0; s < S; ++s) {
+        if (s + W8_STAGES - 1 < S) load_stage(s + W8_STAGES - 1);
+        cp_commit();
+        const int slot = (KO & 4) ? 0 : (s % W8_STAGES);
+        const unsigned char* stg = smem + (size_t)slot * W8_STAGE;
+        const uint8_t* Xb = reinterpret_cast<const uint8_t*>(stg) + (size_t)mat * BM * W8_K;
+        (void)Xb;
+        const uint32_t* Wd = reinterpret_cast<const uint32_t*>(stg + W8_X) + (size_t)(mat * W8_TILES * NB + slice) * TWMAX;
+        uint32_t afs[4][4];
+        if constexpr ((KO & 1) != 0) {
+            w8s_load_afs_ko1(Wd, lane, afs);
+        } else {
+            if (mat == 0) w8s_load_afs<K2G>(Wd, lane, afs);
+            else w8s_load_afs<K2U>(Wd, lane, afs);
+        }
+#pragma unroll
+        for (int grp = 0; grp < 16; ++grp) {
+            if constexpr ((KO & 8) == 0) { if (8 * grp >= cnt) continue; }
+#pragma unroll
+            for (int pair = 0; pair < 2; ++pair) {
+                uint32_t b[4];
+                if constexpr ((KO & 32) != 0) {
+                    // KO32: no ldmatrix. Every b word is a function of the loop index and lane, and
+                    // the QMMA or the XOR below still consumes all four.
+                    const uint32_t seed = (uint32_t)(s * 131 + grp * 17 + pair * 7) ^ ((uint32_t)lane * 2654435761u);
+                    b[0] = seed;
+                    b[1] = seed ^ 0x9e3779b9u;
+                    b[2] = seed + (uint32_t)(grp + 1);
+                    b[3] = seed ^ (uint32_t)(s + pair);
+                } else if constexpr ((KO & 128) != 0) {
+                    ldsm4(b, Xb + roff[grp] + coff[pair]);
+                } else {
+                    const int row = 8 * grp + (lane & 7);
+                    const int chunk = pair * 4 + (lane >> 3);
+                    ldsm4(b, Xb + (size_t)row * W8_K + w8_swz(row, chunk) * 16);
+                }
+                if constexpr ((KO & 2) != 0) {
+                    // Every afs word and every b word feeds the XOR, so the full decode and the
+                    // b operand stay live while the QMMA leaves the loop.
+                    const uint32_t x = afs[pair * 2][0] ^ afs[pair * 2][1] ^ afs[pair * 2 + 1][0] ^ afs[pair * 2 + 1][1] ^ b[0] ^ b[2];
+                    const uint32_t y = afs[pair * 2][2] ^ afs[pair * 2][3] ^ afs[pair * 2 + 1][2] ^ afs[pair * 2 + 1][3] ^ b[1] ^ b[3];
+                    acc[grp][0] = __uint_as_float(__float_as_uint(acc[grp][0]) ^ x);
+                    acc[grp][1] = __uint_as_float(__float_as_uint(acc[grp][1]) ^ y);
+                    acc[grp][2] = __uint_as_float(__float_as_uint(acc[grp][2]) ^ x ^ y);
+                    acc[grp][3] = __uint_as_float(__float_as_uint(acc[grp][3]) ^ y);
+                } else {
+                    mma_w8(acc[grp], afs[pair * 2], b[0], b[1]);
+                    mma_w8(acc[grp], afs[pair * 2 + 1], b[2], b[3]);
+                }
+            }
+        }
+        // KO64: drop the stage wait and barrier; the prologue fill above keeps both.
+        if constexpr ((KO & 64) == 0) {
+            cp_wait<W8_STAGES - 2>();
+            __syncthreads();
+        }
+    }
+    if constexpr ((KO & 16) != 0) {
+        uint32_t x = 0;
+#pragma unroll
+        for (int n = 0; n < 16; ++n) {
+#pragma unroll
+            for (int c = 0; c < 4; ++c) x ^= __float_as_uint(acc[n][c]);
+        }
+        if (threadIdx.x == 0) a.xd[(size_t)TF_VBID.y * gridDim.x + TF_VBID.x] = __float2half_rn(__uint_as_float(x));
+        return;
+    }
+    float* ep = reinterpret_cast<float*>(smem);
+    for (int rd = 0; rd < 4; ++rd) {
+        if (rd) __syncthreads();
+        if (32 * rd < cnt) {
+#pragma unroll
+            for (int n = 0; n < 4; ++n) {
+                const int ng = 4 * rd + n;
+                float* E = ep + ((size_t)mat * 32 + 8 * n + 2 * t) * 132 + slice * 16 + g;
+                E[0] = acc[ng][0]; E[132] = acc[ng][1]; E[8] = acc[ng][2]; E[132 + 8] = acc[ng][3];
+            }
+        }
+        __syncthreads();
+        for (int r = warp; r < 32 && rd * 32 + r < cnt; r += W) {
+            const int row = rows_sh[rd * 32 + r];
+            if (row < 0) continue;
+            const int c0 = 4 * lane;
+            const float q0 = HAD_SCALE * __ldg(reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(a.s0) + (size_t)row * sstride));
+            const float q1 = HAD_SCALE * __ldg(reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(a.s1) + (size_t)row * sstride));
+            float v[4]; *reinterpret_cast<float4*>(v) = *reinterpret_cast<float4*>(ep + (size_t)r * 132 + c0);
+            tf_exl3::fwht128(v, lane);
+            float u[4]; *reinterpret_cast<float4*>(u) = *reinterpret_cast<float4*>(ep + (size_t)(32 * 132 + r * 132 + c0));
+            tf_exl3::fwht128(u, lane);
+            const size_t col = (size_t)e * a.N + nb * 128 + c0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float gg = v[j] * q0 * __half2float(a.sv0[col + j]);
+                float uu = u[j] * q1 * __half2float(a.sv1[col + j]);
+                if (a.act_mode == 0) { gg = bf16r(gg); uu = bf16r(uu); }
+                if (a.limit > 0) { gg = upTo(gg, a.limit); uu = within(uu, a.limit); }
+                float act = gg / (1.f + expf(-gg));
+                if (a.act_mode == 0) act = bf16r(act);
+                act *= uu;
+                if (a.act_mode == 0) act = bf16r(act);
+                v[j] = act * __half2float(a.sd[col + j]);
+            }
+            tf_exl3::fwht128(v, lane);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) a.xd[(size_t)row * a.N + nb * 128 + c0 + j] = __float2half_rn(v[j] * HAD_SCALE);
+        }
+    }
+}
+
+template<int KO = 0>
+__device__ __forceinline__ void gu_task_w8s(const PmxA8Args& a, unsigned char* smem, int* rows_sh) {
+    const int nb = TF_VBID.x, item = TF_VBID.y;
+    if (item >= a.counts[0]) return;
+    if (!a.all && a.items[item * 3 + 2] <= 64) return;
+    const int e = a.items[item * 3];
+    const int k2g = a.k2_0[e], k2u = a.k2_1[e];
+    if (k2g == 4 && k2u == 4) gu_body_w8s<4, 4, KO>(a, item, nb, smem, rows_sh);
+    else if (k2g == 4 && k2u == 6) gu_body_w8s<4, 6, KO>(a, item, nb, smem, rows_sh);
+    else if (k2g == 6 && k2u == 4) gu_body_w8s<6, 4, KO>(a, item, nb, smem, rows_sh);
+    else if (k2g == 6 && k2u == 6) gu_body_w8s<6, 6, KO>(a, item, nb, smem, rows_sh);
+    else __trap();
+}
+
+// GU-W8S-PF: gu_body_w8s with the four k32 slice decodes split into two pairs, each pair decoded
+// right before the 16 grp MMAs that consume it. Per acc[grp] the MMAs are unchanged: pair 0's two
+// slices, then pair 1's two slices, same fragments, same order. Only the interleaving of the
+// independent grp chains changes, so every mma keeps its operands and its place in the row's k32
+// order. Eight fragment registers are live instead of sixteen, which leaves the 128-register
+// launch bound room for acc[16][4] without a local-memory spill. Stage ring and shared memory are
+// gu_body_w8s's: the decode reads the same stage the MMAs read, so the 2-stage ring and 90,112 B
+// are unchanged.
+template<int K2>
+__device__ __forceinline__ void w8s_load_afs_pair(const uint32_t* tile0, int pair, int lane, uint32_t (&afs)[2][4]) {
+    const LaneMap<K2> map(lane);
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int h = 2 * pair + j;
+        uint32_t lo[4], hi[4];
+        w8_codes<K2>(tile0 + (size_t)(2 * h) * NB * TWMAX, map, lo);
+        w8_codes<K2>(tile0 + (size_t)(2 * h + 1) * NB * TWMAX, map, hi);
+        afs[j][0] = (lo[0] & 0xffffu) | (lo[2] << 16);
+        afs[j][1] = (lo[1] & 0xffffu) | (lo[3] << 16);
+        afs[j][2] = (hi[0] & 0xffffu) | (hi[2] << 16);
+        afs[j][3] = (hi[1] & 0xffffu) | (hi[3] << 16);
+    }
+}
+
+template<int K2G, int K2U>
+__device__ __forceinline__ void gu_body_w8s_pf(const PmxA8Args& a, int item, int nb, unsigned char* smem, int* rows_sh) {
     constexpr int TWG = 4 * K2G, TWU = 4 * K2U, W = 16, THREADS = 512;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int mat = warp >> 3, slice = warp & 7, g = lane >> 2, t = lane & 3;
@@ -685,20 +904,20 @@ __device__ __forceinline__ void gu_body_w8s(const PmxA8Args& a, int item, int nb
         const unsigned char* stg = smem + (size_t)(s % W8_STAGES) * W8_STAGE;
         const uint8_t* Xb = reinterpret_cast<const uint8_t*>(stg) + (size_t)mat * BM * W8_K;
         const uint32_t* Wd = reinterpret_cast<const uint32_t*>(stg + W8_X) + (size_t)(mat * W8_TILES * NB + slice) * TWMAX;
-        uint32_t afs[4][4];
-        if (mat == 0) w8s_load_afs<K2G>(Wd, lane, afs);
-        else w8s_load_afs<K2U>(Wd, lane, afs);
+        uint32_t afs[2][4];
 #pragma unroll
-        for (int grp = 0; grp < 16; ++grp) {
-            if (8 * grp >= cnt) continue;
+        for (int pair = 0; pair < 2; ++pair) {
+            if (mat == 0) w8s_load_afs_pair<K2G>(Wd, pair, lane, afs);
+            else w8s_load_afs_pair<K2U>(Wd, pair, lane, afs);
 #pragma unroll
-            for (int pair = 0; pair < 2; ++pair) {
+            for (int grp = 0; grp < 16; ++grp) {
+                if (8 * grp >= cnt) continue;
                 const int row = 8 * grp + (lane & 7);
                 const int chunk = pair * 4 + (lane >> 3);
                 uint32_t b[4];
                 ldsm4(b, Xb + (size_t)row * W8_K + w8_swz(row, chunk) * 16);
-                mma_w8(acc[grp], afs[pair * 2], b[0], b[1]);
-                mma_w8(acc[grp], afs[pair * 2 + 1], b[2], b[3]);
+                mma_w8(acc[grp], afs[0], b[0], b[1]);
+                mma_w8(acc[grp], afs[1], b[2], b[3]);
             }
         }
         cp_wait<W8_STAGES - 2>();
@@ -746,16 +965,16 @@ __device__ __forceinline__ void gu_body_w8s(const PmxA8Args& a, int item, int nb
     }
 }
 
-__device__ __forceinline__ void gu_task_w8s(const PmxA8Args& a, unsigned char* smem, int* rows_sh) {
+__device__ __forceinline__ void gu_task_w8s_pf(const PmxA8Args& a, unsigned char* smem, int* rows_sh) {
     const int nb = TF_VBID.x, item = TF_VBID.y;
     if (item >= a.counts[0]) return;
     if (!a.all && a.items[item * 3 + 2] <= 64) return;
     const int e = a.items[item * 3];
     const int k2g = a.k2_0[e], k2u = a.k2_1[e];
-    if (k2g == 4 && k2u == 4) gu_body_w8s<4, 4>(a, item, nb, smem, rows_sh);
-    else if (k2g == 4 && k2u == 6) gu_body_w8s<4, 6>(a, item, nb, smem, rows_sh);
-    else if (k2g == 6 && k2u == 4) gu_body_w8s<6, 4>(a, item, nb, smem, rows_sh);
-    else if (k2g == 6 && k2u == 6) gu_body_w8s<6, 6>(a, item, nb, smem, rows_sh);
+    if (k2g == 4 && k2u == 4) gu_body_w8s_pf<4, 4>(a, item, nb, smem, rows_sh);
+    else if (k2g == 4 && k2u == 6) gu_body_w8s_pf<4, 6>(a, item, nb, smem, rows_sh);
+    else if (k2g == 6 && k2u == 4) gu_body_w8s_pf<6, 4>(a, item, nb, smem, rows_sh);
+    else if (k2g == 6 && k2u == 6) gu_body_w8s_pf<6, 6>(a, item, nb, smem, rows_sh);
     else __trap();
 }
 } // namespace tf_glm53_pmx
@@ -973,6 +1192,34 @@ extern "C" __global__ void __launch_bounds__(512,1) tf_glm53_pmx_gu_mb5l2_e4m3(t
 extern "C" __global__ void __launch_bounds__(512,1) tf_glm53_pmx_gu_a8_e4m3(tf_glm53_pmx::PmxA8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::gu_task_a8(a,smem,rows); }
 extern "C" __global__ void __launch_bounds__(512,1) tf_glm53_pmx_gu_w8_e4m3(tf_glm53_pmx::PmxA8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::gu_task_w8(a,smem,rows); }
 extern "C" __global__ void __launch_bounds__(512,1) tf_glm53_pmx_gu_w8s_e4m3(tf_glm53_pmx::PmxA8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::gu_task_w8s(a,smem,rows); }
+// Timing-only ablations of gu_w8s. ko3 = KO1|KO2 and ko9 = KO1|KO8; none of these check output.
+extern "C" __global__ void __launch_bounds__(512,1) tf_glm53_pmx_gu_w8s_ko1_e4m3(tf_glm53_pmx::PmxA8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::gu_task_w8s<1>(a,smem,rows); }
+extern "C" __global__ void __launch_bounds__(512,1) tf_glm53_pmx_gu_w8s_ko2_e4m3(tf_glm53_pmx::PmxA8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::gu_task_w8s<2>(a,smem,rows); }
+extern "C" __global__ void __launch_bounds__(512,1) tf_glm53_pmx_gu_w8s_ko4_e4m3(tf_glm53_pmx::PmxA8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::gu_task_w8s<4>(a,smem,rows); }
+extern "C" __global__ void __launch_bounds__(512,1) tf_glm53_pmx_gu_w8s_ko8_e4m3(tf_glm53_pmx::PmxA8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::gu_task_w8s<8>(a,smem,rows); }
+extern "C" __global__ void __launch_bounds__(512,1) tf_glm53_pmx_gu_w8s_ko16_e4m3(tf_glm53_pmx::PmxA8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::gu_task_w8s<16>(a,smem,rows); }
+extern "C" __global__ void __launch_bounds__(512,1) tf_glm53_pmx_gu_w8s_ko3_e4m3(tf_glm53_pmx::PmxA8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::gu_task_w8s<3>(a,smem,rows); }
+extern "C" __global__ void __launch_bounds__(512,1) tf_glm53_pmx_gu_w8s_ko9_e4m3(tf_glm53_pmx::PmxA8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::gu_task_w8s<9>(a,smem,rows); }
+// Second-round knockouts: ko32 NOLDSM, ko64 NOBAR, ko128 NOLOOPADDR, plus the cumulative
+// ko35 = KO1|KO2|KO32, ko39 = KO1|KO2|KO4|KO32, ko103 = ko39|KO64, ko119 = ko103|KO16.
+extern "C" __global__ void __launch_bounds__(512,1) tf_glm53_pmx_gu_w8s_ko32_e4m3(tf_glm53_pmx::PmxA8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::gu_task_w8s<32>(a,smem,rows); }
+extern "C" __global__ void __launch_bounds__(512,1) tf_glm53_pmx_gu_w8s_ko35_e4m3(tf_glm53_pmx::PmxA8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::gu_task_w8s<35>(a,smem,rows); }
+extern "C" __global__ void __launch_bounds__(512,1) tf_glm53_pmx_gu_w8s_ko39_e4m3(tf_glm53_pmx::PmxA8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::gu_task_w8s<39>(a,smem,rows); }
+extern "C" __global__ void __launch_bounds__(512,1) tf_glm53_pmx_gu_w8s_ko64_e4m3(tf_glm53_pmx::PmxA8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::gu_task_w8s<64>(a,smem,rows); }
+extern "C" __global__ void __launch_bounds__(512,1) tf_glm53_pmx_gu_w8s_ko103_e4m3(tf_glm53_pmx::PmxA8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::gu_task_w8s<103>(a,smem,rows); }
+extern "C" __global__ void __launch_bounds__(512,1) tf_glm53_pmx_gu_w8s_ko119_e4m3(tf_glm53_pmx::PmxA8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::gu_task_w8s<119>(a,smem,rows); }
+extern "C" __global__ void __launch_bounds__(512,1) tf_glm53_pmx_gu_w8s_ko128_e4m3(tf_glm53_pmx::PmxA8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::gu_task_w8s<128>(a,smem,rows); }
+// Empty: same launch shape and dynamic shared memory as gu_w8s, but only the item/count reads.
+// Volatile keeps both loads in the entry so this times launch and grid cost, not a deleted kernel.
+extern "C" __global__ void __launch_bounds__(512,1) tf_glm53_pmx_gu_w8s_empty_e4m3(tf_glm53_pmx::PmxA8Args a) {
+    TF_VBLOCK_ENTER();
+    const int item = TF_VBID.y;
+    const volatile int* counts = a.counts;
+    const volatile int* items = a.items;
+    if (item >= counts[0]) return;
+    if (!a.all && items[item * 3 + 2] <= 64) return;
+}
+extern "C" __global__ void __launch_bounds__(512,1) tf_glm53_pmx_gu_w8s_pf_e4m3(tf_glm53_pmx::PmxA8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::gu_task_w8s_pf(a,smem,rows); }
 
 namespace tf_glm53_pmx {
 // DOWN-W8S (TF_GLM53_DOWN_W8S=1, only with TF_GLM53_GU_W8S): the routed down of items > 64 members as e4m3 x e4m3,
@@ -996,6 +1243,8 @@ static_assert(DW_X == 16384 && DW_W == 12288 && DW_STAGE == 28672, "one 128-K do
 static_assert(DW_SMEM == 86016, "exl3_pmx.zig down_w8_smem");
 static_assert(DW_SMEM + 128 * (int)sizeof(int) <= 101376, "stage ring plus the member-row table");
 static_assert(32 * DW_ES * (int)sizeof(float) <= DW_SMEM, "epilogue tile fits the ring");
+static_assert(32 * DW_ES * (int)sizeof(float) == 33280, "one epilogue tile is 33,280 B");
+static_assert(2 * 32 * DW_ES * (int)sizeof(float) <= DW_SMEM, "double-buffered epilogue tiles fit the ring");
 static_assert(DW_STAGE % 16 == 0 && DW_X % 16 == 0, "16-byte cp.async slots");
 
 struct DownW8Args {
@@ -1023,8 +1272,25 @@ __device__ __forceinline__ void w8s_load_afs_n(const uint32_t* tile0, int lane, 
     }
 }
 
-template<int K2>
+// KO1: one LDS of the stage's first trellis word, expanded to four fragments. The MMA or the
+// XOR accumulate consumes them, so neither the LDS nor the MMAs can be dropped.
+__device__ __forceinline__ void w8s_load_afs_n_ko1(const uint32_t* tile0, int lane, uint32_t (&afs)[4][4]) {
+    const uint32_t w = tile0[0];
+    const uint32_t v = w ^ (uint32_t)lane;
+#pragma unroll
+    for (int h = 0; h < 4; ++h) {
+        afs[h][0] = v;
+        afs[h][1] = v ^ 1u;
+        afs[h][2] = v ^ 2u;
+        afs[h][3] = v ^ 3u;
+    }
+}
+
+// KO is an ablation mask, not a correctness switch: 1 NODECODE, 2 NOMMA, 4 NOLOAD,
+// 16 NOEPI, 32 NOLDSM, 64 NOBAR. KO = 0 is the shipping body unchanged.
+template<int K2, int KO, int EPI>
 __device__ __forceinline__ void down_body_w8s(const DownW8Args& a, int item, int nb, unsigned char* smem, int* rows_sh) {
+    static_assert(EPI == 0 || EPI == 1, "down epilogue variant");
     constexpr int TW = 4 * K2, THREADS = 512;
     static_assert(TW <= TWMAX, "a tile fits its stage slot");
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
@@ -1035,7 +1301,8 @@ __device__ __forceinline__ void down_body_w8s(const DownW8Args& a, int item, int
     const int cnt16 = (cnt + 15) & ~15;
     const uint32_t* T = reinterpret_cast<const uint32_t*>(a.td[e]);
     auto load_stage = [&](int s) {
-        unsigned char* stg = smem + (size_t)(s % DW_STAGES) * DW_STAGE;
+        if constexpr ((KO & 4) != 0) { if (s != 0) return; }
+        unsigned char* stg = smem + (size_t)((KO & 4) ? 0 : (s % DW_STAGES)) * DW_STAGE;
         const int k0 = s * W8_K;
         for (int i = threadIdx.x; i < BM * 8; i += THREADS) {
             const int r = i >> 3, ch = i & 7;
@@ -1062,27 +1329,66 @@ __device__ __forceinline__ void down_body_w8s(const DownW8Args& a, int item, int
     for (int s = 0; s < S; ++s) {
         if (s + DW_STAGES - 1 < S) load_stage(s + DW_STAGES - 1);
         cp_commit();
-        const unsigned char* stg = smem + (size_t)(s % DW_STAGES) * DW_STAGE;
+        const unsigned char* stg = smem + (size_t)((KO & 4) ? 0 : (s % DW_STAGES)) * DW_STAGE;
         const uint8_t* Xb = reinterpret_cast<const uint8_t*>(stg);
         const uint32_t* Wd = reinterpret_cast<const uint32_t*>(stg + DW_X) + (size_t)warp * TWMAX;
         uint32_t afs[4][4];
-        w8s_load_afs_n<K2, DW_NB>(Wd, lane, afs);
+        if constexpr ((KO & 1) != 0) {
+            w8s_load_afs_n_ko1(Wd, lane, afs);
+        } else {
+            w8s_load_afs_n<K2, DW_NB>(Wd, lane, afs);
+        }
 #pragma unroll
         for (int grp = 0; grp < 16; ++grp) {
             if (8 * grp >= cnt) continue;
 #pragma unroll
             for (int pair = 0; pair < 2; ++pair) {
-                const int row = 8 * grp + (lane & 7);
-                const int chunk = pair * 4 + (lane >> 3);
                 uint32_t b[4];
-                ldsm4(b, Xb + (size_t)row * W8_K + w8_swz(row, chunk) * 16);
-                mma_w8(acc[grp], afs[pair * 2], b[0], b[1]);
-                mma_w8(acc[grp], afs[pair * 2 + 1], b[2], b[3]);
+                if constexpr ((KO & 32) != 0) {
+                    // KO32: no ldmatrix. Every b word is a function of the loop index and lane, and
+                    // the QMMA or the XOR below still consumes all four.
+                    const uint32_t seed = (uint32_t)(s * 131 + grp * 17 + pair * 7) ^ ((uint32_t)lane * 2654435761u);
+                    b[0] = seed;
+                    b[1] = seed ^ 0x9e3779b9u;
+                    b[2] = seed + (uint32_t)(grp + 1);
+                    b[3] = seed ^ (uint32_t)(s + pair);
+                } else {
+                    const int row = 8 * grp + (lane & 7);
+                    const int chunk = pair * 4 + (lane >> 3);
+                    ldsm4(b, Xb + (size_t)row * W8_K + w8_swz(row, chunk) * 16);
+                }
+                if constexpr ((KO & 2) != 0) {
+                    // Every afs word and every b word feeds the XOR, so the full decode and the
+                    // b operand stay live while the QMMA leaves the loop.
+                    const uint32_t x = afs[pair * 2][0] ^ afs[pair * 2][1] ^ afs[pair * 2 + 1][0] ^ afs[pair * 2 + 1][1] ^ b[0] ^ b[2];
+                    const uint32_t y = afs[pair * 2][2] ^ afs[pair * 2][3] ^ afs[pair * 2 + 1][2] ^ afs[pair * 2 + 1][3] ^ b[1] ^ b[3];
+                    acc[grp][0] = __uint_as_float(__float_as_uint(acc[grp][0]) ^ x);
+                    acc[grp][1] = __uint_as_float(__float_as_uint(acc[grp][1]) ^ y);
+                    acc[grp][2] = __uint_as_float(__float_as_uint(acc[grp][2]) ^ x ^ y);
+                    acc[grp][3] = __uint_as_float(__float_as_uint(acc[grp][3]) ^ y);
+                } else {
+                    mma_w8(acc[grp], afs[pair * 2], b[0], b[1]);
+                    mma_w8(acc[grp], afs[pair * 2 + 1], b[2], b[3]);
+                }
             }
         }
-        cp_wait<DW_STAGES - 2>();
-        __syncthreads();
+        // KO64: drop the stage wait and barrier; the prologue fill above keeps both.
+        if constexpr ((KO & 64) == 0) {
+            cp_wait<DW_STAGES - 2>();
+            __syncthreads();
+        }
     }
+    if constexpr ((KO & 16) != 0) {
+        uint32_t x = 0;
+#pragma unroll
+        for (int n = 0; n < 16; ++n) {
+#pragma unroll
+            for (int c = 0; c < 4; ++c) x ^= __float_as_uint(acc[n][c]);
+        }
+        if (threadIdx.x == 0) a.y[(size_t)TF_VBID.y * gridDim.x + TF_VBID.x] = __uint_as_float(x);
+        return;
+    }
+    if constexpr (EPI == 0) {
     float* ep = reinterpret_cast<float*>(smem);
     for (int rd = 0; rd < 4; ++rd) {
         if (32 * rd >= cnt) break;
@@ -1110,15 +1416,59 @@ __device__ __forceinline__ void down_body_w8s(const DownW8Args& a, int item, int
             }
         }
     }
+    } else {
+        // Two 32-row epilogue tiles, round rd writing tile rd & 1. The barrier after each spill makes
+        // that tile visible; the other tile is still being read, and tile rd & 1 cannot be rewritten
+        // until round rd + 2, whose spill follows the rd + 1 barrier that every warp reaches only
+        // after finishing its round rd read.
+        constexpr size_t EP_BYTES = (size_t)32 * DW_ES * sizeof(float);
+        static_assert(DW_ES % 4 == 0 && EP_BYTES % 16 == 0, "epilogue rows are 16-byte aligned");
+        if ((a.D & 3) != 0) __trap();
+        if ((reinterpret_cast<uintptr_t>(a.svh) & 7u) != 0) __trap();
+        if ((reinterpret_cast<uintptr_t>(a.y) & 15u) != 0) __trap();
+        float* const ep0 = reinterpret_cast<float*>(smem);
+        float* const ep1 = reinterpret_cast<float*>(smem + EP_BYTES);
+        for (int rd = 0; rd < 4; ++rd) {
+            if (32 * rd >= cnt) break;
+            float* const ep = (rd & 1) ? ep1 : ep0;
+#pragma unroll
+            for (int n = 0; n < 4; ++n) {
+                const int ng = 4 * rd + n;
+                float* E = ep + (size_t)(8 * n + 2 * t) * DW_ES + warp * 16 + g;
+                E[0] = acc[ng][0]; E[DW_ES] = acc[ng][1]; E[8] = acc[ng][2]; E[DW_ES + 8] = acc[ng][3];
+            }
+            __syncthreads();
+            const int r0 = warp, r1 = warp + 16;
+            const int row0 = rows_sh[rd * 32 + r0], row1 = rows_sh[rd * 32 + r1];
+            const float xsc0 = row0 < 0 ? 0.0f : HAD_SCALE * __ldg(reinterpret_cast<const float*>(a.xq + (size_t)row0 * a.xs + a.K));
+            const float xsc1 = row1 < 0 ? 0.0f : HAD_SCALE * __ldg(reinterpret_cast<const float*>(a.xq + (size_t)row1 * a.xs + a.K));
+#pragma unroll
+            for (int blk = 0; blk < 2; ++blk) {
+                float v0[4], v1[4];
+                *reinterpret_cast<float4*>(v0) = *reinterpret_cast<const float4*>(ep + (size_t)r0 * DW_ES + blk * 128 + 4 * lane);
+                *reinterpret_cast<float4*>(v1) = *reinterpret_cast<const float4*>(ep + (size_t)r1 * DW_ES + blk * 128 + 4 * lane);
+                tf_exl3::fwht128x2(v0, v1, lane);
+                const int col = nb * 256 + blk * 128 + 4 * lane;
+                const uint2 q = *reinterpret_cast<const uint2*>(a.svh + (size_t)e * a.D + col);
+                const float2 s0 = __half22float2(*reinterpret_cast<const __half2*>(&q.x));
+                const float2 s1 = __half22float2(*reinterpret_cast<const __half2*>(&q.y));
+                if (row0 >= 0) *reinterpret_cast<float4*>(a.y + (size_t)row0 * a.D + col) =
+                    make_float4(v0[0] * xsc0 * s0.x, v0[1] * xsc0 * s0.y, v0[2] * xsc0 * s1.x, v0[3] * xsc0 * s1.y);
+                if (row1 >= 0) *reinterpret_cast<float4*>(a.y + (size_t)row1 * a.D + col) =
+                    make_float4(v1[0] * xsc1 * s0.x, v1[1] * xsc1 * s0.y, v1[2] * xsc1 * s1.x, v1[3] * xsc1 * s1.y);
+            }
+        }
+    }
 }
 
+template<int KO = 0, int EPI = 0>
 __device__ __forceinline__ void down_task_w8s(const DownW8Args& a, unsigned char* smem, int* rows_sh) {
     const int nb = TF_VBID.x, item = TF_VBID.y;
     if (item >= a.counts[0]) return;
     if (a.items[item * 3 + 2] <= 64) return;
     const int k2 = a.k2[a.items[item * 3]];
-    if (k2 == 4) down_body_w8s<4>(a, item, nb, smem, rows_sh);
-    else if (k2 == 6) down_body_w8s<6>(a, item, nb, smem, rows_sh);
+    if (k2 == 4) down_body_w8s<4, KO, EPI>(a, item, nb, smem, rows_sh);
+    else if (k2 == 6) down_body_w8s<6, KO, EPI>(a, item, nb, smem, rows_sh);
     else __trap();
 }
 
@@ -1174,4 +1524,26 @@ __device__ __forceinline__ void xd_w8s_task(const half* __restrict__ xd, const i
 } // namespace tf_glm53_pmx
 
 extern "C" __global__ void __launch_bounds__(512, 1) tf_glm53_pmx_down_w8s_e4m3(tf_glm53_pmx::DownW8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::down_task_w8s(a, smem, rows); }
+// TF_GLM53_DN_EPI=1: same values, one 16-B store a lane a block, paired FWHT chains and a double-buffered epilogue tile.
+extern "C" __global__ void __launch_bounds__(512, 1) tf_glm53_pmx_down_w8s_epi_e4m3(tf_glm53_pmx::DownW8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::down_task_w8s<0, 1>(a, smem, rows); }
+// Timing-only ablations of down_w8s. None of these check output. KO1 NODECODE, KO2 NOMMA, KO4 NOLOAD,
+// KO16 NOEPI, KO32 NOLDSM, KO64 NOBAR; ko35 = KO1|KO2|KO32, ko39 = KO1|KO2|KO4|KO32.
+extern "C" __global__ void __launch_bounds__(512, 1) tf_glm53_pmx_down_w8s_ko1_e4m3(tf_glm53_pmx::DownW8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::down_task_w8s<1>(a, smem, rows); }
+extern "C" __global__ void __launch_bounds__(512, 1) tf_glm53_pmx_down_w8s_ko2_e4m3(tf_glm53_pmx::DownW8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::down_task_w8s<2>(a, smem, rows); }
+extern "C" __global__ void __launch_bounds__(512, 1) tf_glm53_pmx_down_w8s_ko4_e4m3(tf_glm53_pmx::DownW8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::down_task_w8s<4>(a, smem, rows); }
+extern "C" __global__ void __launch_bounds__(512, 1) tf_glm53_pmx_down_w8s_ko16_e4m3(tf_glm53_pmx::DownW8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::down_task_w8s<16>(a, smem, rows); }
+extern "C" __global__ void __launch_bounds__(512, 1) tf_glm53_pmx_down_w8s_ko32_e4m3(tf_glm53_pmx::DownW8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::down_task_w8s<32>(a, smem, rows); }
+extern "C" __global__ void __launch_bounds__(512, 1) tf_glm53_pmx_down_w8s_ko64_e4m3(tf_glm53_pmx::DownW8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::down_task_w8s<64>(a, smem, rows); }
+extern "C" __global__ void __launch_bounds__(512, 1) tf_glm53_pmx_down_w8s_ko35_e4m3(tf_glm53_pmx::DownW8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::down_task_w8s<35>(a, smem, rows); }
+extern "C" __global__ void __launch_bounds__(512, 1) tf_glm53_pmx_down_w8s_ko39_e4m3(tf_glm53_pmx::DownW8Args a) { TF_VBLOCK_ENTER(); extern __shared__ __align__(16) unsigned char smem[]; __shared__ int rows[128]; tf_glm53_pmx::down_task_w8s<39>(a, smem, rows); }
+// Empty: same launch shape and dynamic shared memory as down_w8s, but only the item/count reads.
+// Volatile keeps both loads in the entry so this times launch and grid cost, not a deleted kernel.
+extern "C" __global__ void __launch_bounds__(512, 1) tf_glm53_pmx_down_w8s_empty_e4m3(tf_glm53_pmx::DownW8Args a) {
+    TF_VBLOCK_ENTER();
+    const int item = TF_VBID.y;
+    const volatile int* counts = a.counts;
+    const volatile int* items = a.items;
+    if (item >= counts[0]) return;
+    if (items[item * 3 + 2] <= 64) return;
+}
 extern "C" __global__ void __launch_bounds__(128) tf_glm53_pmx_xd_w8s(const half* __restrict__ xd, const int* __restrict__ pick, uint8_t* __restrict__ out, int K, int xs) { TF_VBLOCK_ENTER(); __shared__ float red[4]; tf_glm53_pmx::xd_w8s_task(xd, pick, out, K, xs, red); }

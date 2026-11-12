@@ -229,6 +229,33 @@ pub const Group = struct {
         try f.gather(s.handle, mine, all, bytes);
     }
 
+    /// One sum block from both ranks' shards: rank 0's value plus rank 1's. RoCE carries it only on its bound stream
+    /// inside the agreed cap; every other case is a two-rank NCCL sum of the same count and dtype.
+    pub fn sumGather(g: *const Group, s: Stream, mine: u64, all: u64, count: usize, input_bf16: bool) !void {
+        const width: usize = if (input_bf16) 2 else 4;
+        const bytes = std.math.mul(usize, count, width) catch return error.RocePayloadTooLarge;
+        const f = g.fast;
+        const route = gatherRoute(g.gather_roce, f != null, if (f) |fast| fast.fits(bytes) else false, if (f) |fast| fast.boundTo(s.handle) else false);
+        @constCast(g).routes[@intFromEnum(route)] += 1;
+        if (route == .roce) if (f) |fast| {
+            if (!roce.aligned16(mine) or !roce.aligned16(all)) return error.RoceAlignmentViolation;
+            // The RoCE slot holds at most fast.max_bytes, so a large block goes as several sum gathers in order. Each
+            // chunk is a whole multiple of 8 values, so every chunk's input and output stay 16-byte aligned.
+            const max_count: usize = (@as(usize, @intCast(fast.max_bytes)) / width) & ~@as(usize, 7);
+            if (max_count == 0) return error.RocePayloadTooLarge;
+            var at: usize = 0;
+            while (at < count) {
+                const n: usize = @min(count - at, max_count);
+                const off = @as(u64, @intCast(at * width));
+                try fast.sumGather(s.handle, mine + off, all + off, n, input_bf16);
+                at += n;
+            }
+            return;
+        };
+        const dtype: nccl.DataType = if (input_bf16) .bf16 else .f32;
+        try g.lib.check(g.lib.api.ncclAllReduce(mine, all, count, dtype, .sum, g.comm, s.handle), "ncclAllReduce(sumGather)");
+    }
+
     /// `bytes` at `ptr` to rank `peer`, on `s` (its matching recv takes the same count).
     pub fn send(g: *const Group, s: Stream, ptr: u64, bytes: usize, peer: usize) !void {
         try g.lib.check(g.lib.api.ncclSend(ptr, bytes, .u8, @intCast(peer), g.comm, s.handle), "ncclSend");

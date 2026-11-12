@@ -247,6 +247,13 @@ __global__ void __launch_bounds__(NT, 1) tf_glm53_topk(Args a) {
     tf_glm53_topk_task(a, img);
 }
 
+// Same task, two CTAs a SM: the host fits ept to nkeys so a single cluster CTA a row stays resident.
+extern "C" __global__ void __launch_bounds__(NT, 2) tf_glm53_topk_fit(Args a) {
+    TF_VBLOCK_ENTER();
+    extern __shared__ uint32_t img[];
+    tf_glm53_topk_task(a, img);
+}
+
 // Shared memory a CTA for ``ept`` entries a thread (the images; the rest is static).
 inline size_t smem(int ept) { return static_cast<size_t>(NT) * ept * 4; }
 
@@ -1119,6 +1126,242 @@ extern "C" __global__ void tf_glm53_merge2(const Candidate* packed, int* global,
     TF_VBLOCK_ENTER();
     extern __shared__ unsigned char storage[];
     tf_glm53_merge2_task(packed, global, global_counts, local, counts, pos, rank, world, rows, k, block_rows, storage);
+}
+
+// One warp scans the 256 bins as eight a lane; both helpers pick the bin that holds the target rank.
+__device__ __forceinline__ void radix_pick_desc(const unsigned* h, int target, int* out_digit, int* out_greater) {
+    const int lane = threadIdx.x & 31;
+    int loc[8], run = 0;
+    for (int x = 7; x >= 0; --x) { run += static_cast<int>(h[lane * 8 + x]); loc[x] = run; }
+    int suf = run;
+    for (int o = 1; o < 32; o <<= 1) {
+        const int y = __shfl_down_sync(FULL, suf, o);
+        if (lane + o < 32) suf += y;
+    }
+    const int after = suf - run;
+    int best = -1, greater = 0;
+    for (int x = 7; x >= 0; --x) {
+        if (best < 0 && after + loc[x] >= target + 1) {
+            best = lane * 8 + x;
+            greater = after + loc[x] - static_cast<int>(h[best]);
+        }
+    }
+    const unsigned has = __ballot_sync(FULL, best >= 0);
+    const int src = has ? 31 - __clz(has) : 0;
+    *out_digit = __shfl_sync(FULL, best, src);
+    *out_greater = __shfl_sync(FULL, greater, src);
+}
+
+__device__ __forceinline__ void radix_pick_asc(const unsigned* h, int target, int* out_digit, int* out_below) {
+    const int lane = threadIdx.x & 31;
+    int run = 0;
+    for (int x = 0; x < 8; ++x) run += static_cast<int>(h[lane * 8 + x]);
+    int pre = run;
+    for (int o = 1; o < 32; o <<= 1) {
+        const int y = __shfl_up_sync(FULL, pre, o);
+        if (lane >= o) pre += y;
+    }
+    const int before = pre - run;
+    int best = -1, below = 0, acc = before;
+    for (int x = 0; x < 8; ++x) {
+        const int cnt = static_cast<int>(h[lane * 8 + x]);
+        if (best < 0 && acc + cnt >= target + 1) { best = lane * 8 + x; below = acc; }
+        acc += cnt;
+    }
+    const unsigned has = __ballot_sync(FULL, best >= 0);
+    const int src = has ? __ffs(has) - 1 : 0;
+    *out_digit = __shfl_sync(FULL, best, src);
+    *out_below = __shfl_sync(FULL, below, src);
+}
+
+// Same select and compaction as tf_glm53_merge2, with the ordered image cached in the record beside the token.
+// Missing records keep their raw score so the NaN fallback sees exactly the input merge2 saw.
+__device__ __forceinline__ void tf_glm53_merge2_fast_task(const Candidate* packed, int* global, int* global_counts,
+                                            int* local, int* counts, const long long* pos,
+                                            int rank, int world, int rows, int k, int block_rows,
+                                            unsigned char* storage) {
+    const int r = TF_VBID.x, t = threadIdx.x, lane = t & 31;
+    Candidate* values = reinterpret_cast<Candidate*>(storage);
+    __shared__ unsigned hist[256];
+    __shared__ unsigned threshold, tie_token, radix_prefix, radix_mask, tie_prefix;
+    __shared__ int valid_count, take_equal, radix_target, equal_count, n_a, n_b, scan_ws[2 * NW], tile_total, offset, negative_nan, tie_target;
+    const int block = r / block_rows, within = r % block_rows;
+    const int block_count = min(block_rows, rows - block * block_rows);
+    const long long block_base = static_cast<long long>(block) * 2 * block_rows * k;
+    for (int i = t; i < 2 * k; i += NT) {
+        const int which = i / k, col = i % k;
+        const long long src = block_base + static_cast<long long>(which) * block_count * k + static_cast<long long>(within) * k + col;
+        Candidate c = packed[src];
+        if (c.token < 0 || (isinf(c.score) && c.score < 0)) {
+            c = { -CUDART_INF_F, 0x7fffffff };
+        } else if (c.token != 0x7fffffff) {
+            const unsigned bits = __float_as_uint(c.score + 0.0f);
+            c.score = __uint_as_float((bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u));
+        }
+        values[which * k + col] = c;
+    }
+    TF_TASK_SYNC();
+    if (t == 0) { valid_count = 0; negative_nan = 0; }
+    TF_TASK_SYNC();
+    int warp_valid = 0;
+    unsigned warp_nan = 0;
+    for (int base = 0; base < 2 * k; base += NT) {
+        const int i = base + t;
+        int valid = 0;
+        unsigned nan_here = 0;
+        if (i < 2 * k) {
+            const Candidate c = values[i];
+            valid = c.token != 0x7fffffff;
+            nan_here = valid && __float_as_uint(c.score) < 0x007fffffu;
+        }
+        warp_valid += __popc(__ballot_sync(FULL, valid != 0));
+        warp_nan |= __ballot_sync(FULL, nan_here != 0);
+    }
+    if (lane == 0) {
+        if (warp_valid) atomicAdd(&valid_count, warp_valid);
+        if (warp_nan) atomicExch(&negative_nan, 1);
+    }
+    TF_TASK_SYNC();
+    if (negative_nan) {
+        for (int i = t; i < 2 * k; i += NT) {
+            Candidate c = values[i];
+            if (c.token != 0x7fffffff) {
+                const unsigned image = __float_as_uint(c.score);
+                c.score = __uint_as_float((image & 0x80000000u) ? (image ^ 0x80000000u) : ~image);
+            }
+            values[i] = c;
+        }
+        for (int i = 2 * k + t; i < 4096; i += NT) values[i] = { -CUDART_INF_F, 0x7fffffff };
+        TF_TASK_SYNC();
+        tf_glm53_merge_bitonic_task(values, global, global_counts, local, counts, pos, rank, world, k);
+        return;
+    }
+    if (t == 0) tie_token = 0xffffffffu;
+    if (valid_count <= k) {
+        if (t == 0) { threshold = 0; take_equal = k; }
+    } else {
+        if (t == 0) { radix_prefix = 0; radix_mask = 0; radix_target = k - 1; }
+        TF_TASK_SYNC();
+        for (int pass = 0; pass < 4; ++pass) {
+            if (t < 256) hist[t] = 0;
+            TF_TASK_SYNC();
+            const int shift = 24 - pass * 8;
+            for (int base = 0; base < 2 * k; base += NT) {
+                const int i = base + t;
+                if (i < 2 * k) {
+                    const Candidate c = values[i];
+                    const unsigned image = __float_as_uint(c.score);
+                    if (c.token != 0x7fffffff && (image & radix_mask) == radix_prefix)
+                        atomicAdd(&hist[(image >> shift) & 255u], 1);
+                }
+            }
+            TF_TASK_SYNC();
+            if (t < 32) {
+                int dg = 0, greater = 0;
+                radix_pick_desc(hist, radix_target, &dg, &greater);
+                if (t == 0) {
+                    radix_prefix |= static_cast<unsigned>(dg) << shift;
+                    radix_mask |= 255u << shift;
+                    radix_target -= greater;
+                    equal_count = static_cast<int>(hist[dg]);
+                }
+            }
+            TF_TASK_SYNC();
+        }
+        if (t == 0) threshold = radix_prefix;
+        TF_TASK_SYNC();
+        if (t == 0) {
+            take_equal = radix_target + 1;
+            tie_target = take_equal - 1;
+            tie_prefix = 0;
+        }
+        TF_TASK_SYNC();
+        if (take_equal < equal_count) {
+            for (int shift = 24; shift >= 0; shift -= 8) {
+                if (t < 256) hist[t] = 0;
+                TF_TASK_SYNC();
+                for (int base = 0; base < 2 * k; base += NT) {
+                    const int i = base + t;
+                    if (i < 2 * k) {
+                        const Candidate c = values[i];
+                        const unsigned token = static_cast<unsigned>(c.token);
+                        const bool match = c.token != 0x7fffffff && __float_as_uint(c.score) == threshold &&
+                            (shift == 24 || (token >> (shift + 8)) == (tie_prefix >> (shift + 8)));
+                        if (match) atomicAdd(&hist[(token >> shift) & 255u], 1);
+                    }
+                }
+                TF_TASK_SYNC();
+                if (t < 32) {
+                    int dg = 0, below = 0;
+                    radix_pick_asc(hist, tie_target, &dg, &below);
+                    if (t == 0) {
+                        tie_prefix |= static_cast<unsigned>(dg) << shift;
+                        tie_target -= below;
+                    }
+                }
+                TF_TASK_SYNC();
+            }
+            if (t == 0) tie_token = tie_prefix;
+        }
+    }
+    TF_TASK_SYNC();
+    const unsigned boundary = threshold;
+    const int quota = take_equal;
+    const unsigned tie = tie_token;
+    if (t == 0) { n_a = 0; n_b = 0; }
+    TF_TASK_SYNC();
+    for (int which = 0; which < 2; ++which) {
+        if (t == 0) offset = 0;
+        TF_TASK_SYNC();
+        for (int base = 0; base < k; base += NT) {
+            const int i = base + t;
+            Candidate c = i < k ? values[which * k + i] : Candidate{ -CUDART_INF_F, 0x7fffffff };
+            int keep = 0;
+            if (i < k && c.token != 0x7fffffff) {
+                const unsigned image = __float_as_uint(c.score);
+                keep = valid_count <= k || image > boundary || (image == boundary && (quota >= valid_count || static_cast<unsigned>(c.token) <= tie));
+            }
+            const int dst = block_scan(keep, scan_ws, &tile_total);
+            const int before = offset;
+            TF_TASK_SYNC();
+            if (keep) values[which * k + before + dst] = c;
+            if (t == 0) offset += tile_total;
+            TF_TASK_SYNC();
+        }
+        if (t == 0) { if (which == 0) n_a = offset; else n_b = offset; }
+        TF_TASK_SYNC();
+    }
+    if (t == 0) {
+        global_counts[r] = n_a + n_b;
+    }
+    TF_TASK_SYNC();
+    for (int i = t; i < n_a; i += NT) {
+        const int token = values[i].token;
+        int lo = 0, hi = n_b;
+        while (lo < hi) { const int mid = (lo + hi) >> 1; if (values[k + mid].token < token) lo = mid + 1; else hi = mid; }
+        global[static_cast<long long>(r) * k + i + lo] = token;
+    }
+    for (int j = t; j < n_b; j += NT) {
+        const int token = values[k + j].token;
+        int lo = 0, hi = n_a;
+        while (lo < hi) { const int mid = (lo + hi) >> 1; if (values[mid].token < token) lo = mid + 1; else hi = mid; }
+        global[static_cast<long long>(r) * k + j + lo] = token;
+    }
+    for (int i = t; i < k; i += NT) if (i >= n_a + n_b) global[static_cast<long long>(r) * k + i] = -1;
+    TF_TASK_SYNC();
+    const int own_n = rank == 0 ? n_a : n_b;
+    const int own_base = rank == 0 ? 0 : k;
+    const int selected_count = pos[r] + 1 > 2048 ? own_n : 0;
+    for (int i = t; i < k; i += NT) local[static_cast<long long>(r) * k + i] = i < selected_count ? values[own_base + i].token / world : -1;
+    if (t == 0 && counts) counts[r] = selected_count;
+}
+
+extern "C" __global__ void tf_glm53_merge2_fast(const Candidate* packed, int* global, int* global_counts,
+                                            int* local, int* counts, const long long* pos,
+                                            int rank, int world, int rows, int k, int block_rows) {
+    TF_VBLOCK_ENTER();
+    extern __shared__ unsigned char storage[];
+    tf_glm53_merge2_fast_task(packed, global, global_counts, local, counts, pos, rank, world, rows, k, block_rows, storage);
 }
 
 }  // namespace glm53_topk

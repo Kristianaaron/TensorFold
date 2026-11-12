@@ -297,6 +297,8 @@ pub const Gather = struct {
     counters: memory.DeviceBuffer,
     module: Module,
     f: Function,
+    sum_f32: Function,
+    sum_bf16: Function,
     reduce_f32: Function,
     reduce_bf16: Function,
     status_gate: Function,
@@ -365,7 +367,7 @@ pub const Gather = struct {
     }
 
     fn setup(g: *Gather, gpa: std.mem.Allocator, io: std.Io, d: *const Driver, rank: u8, max_bytes: usize) !void {
-        g.* = .{ .gpa = gpa, .d = d, .lib = undefined, .api = undefined, .rank = rank, .layout = .of(max_bytes), .region = undefined, .region_dev = 0, .counters = undefined, .module = undefined, .f = undefined, .reduce_f32 = undefined, .reduce_bf16 = undefined, .status_gate = undefined, .reduce_scratch = undefined, .max_bytes = max_bytes, .timeout_ns = 0 };
+        g.* = .{ .gpa = gpa, .d = d, .lib = undefined, .api = undefined, .rank = rank, .layout = .of(max_bytes), .region = undefined, .region_dev = 0, .counters = undefined, .module = undefined, .f = undefined, .sum_f32 = undefined, .sum_bf16 = undefined, .reduce_f32 = undefined, .reduce_bf16 = undefined, .status_gate = undefined, .reduce_scratch = undefined, .max_bytes = max_bytes, .timeout_ns = 0 };
         g.lib = std.DynLib.open("libibverbs.so.1") catch return @import("sys").optional_libraries.unavailable(.verbs);
         errdefer g.lib.close();
         const info = @typeInfo(Api).@"struct";
@@ -387,6 +389,8 @@ pub const Gather = struct {
         g.module = try Module.load(d, kernels.roce_gather);
         errdefer g.module.unload();
         g.f = try g.module.function("roce_gather");
+        g.sum_f32 = try g.module.function("roce_gather_sum_f32");
+        g.sum_bf16 = try g.module.function("roce_gather_sum_bf16");
         g.reduce_f32 = try g.module.function("roce_reduce_f32");
         g.reduce_bf16 = try g.module.function("roce_reduce_bf16");
         g.status_gate = try g.module.function("roce_status_gate");
@@ -630,6 +634,39 @@ pub const Gather = struct {
         a.add(g.timeout_ns);
         a.add(@as(i32, @intCast(g.n_hca)));
         try launch.launch(g.f, .{ .grid = .{ .x = grid }, .block = .{ .x = threads } }, .{ .handle = stream, .d = g.d }, &a);
+        g.gathers += 1;
+    }
+
+    /// Two-rank sum in the gather itself: rank 0's value plus rank 1's, written in the shard's own dtype at `out`.
+    /// `input_bf16` names the shard type; `send` is this rank's shard and `out` one block of `count` values (bf16 or
+    /// fp32, so 2 or 4 bytes each).
+    pub fn sumGather(g: *Gather, stream: abi.Stream, send: abi.DevicePtr, out: abi.DevicePtr, count: usize, input_bf16: bool) !void {
+        if (!g.boundTo(stream)) return error.StreamMismatch;
+        if (!aligned16(send) or !aligned16(out)) return error.Misaligned;
+        const width: usize = if (input_bf16) 2 else 4;
+        const bytes = std.math.mul(usize, count, width) catch return error.Misaligned;
+        if (!g.fits(bytes) or bytes % 16 != 0) return error.Misaligned;
+        const packs = bytes / 16;
+        const need = @max(1, std.math.divCeil(usize, packs, 2 * threads) catch unreachable);
+        const grid: u32 = @intCast(@min(std.math.ceilPowerOfTwo(usize, need) catch max_blocks, max_blocks));
+        const klass: i32 = @intCast(std.math.log2_int(u32, grid));
+        const base = g.region_dev;
+        var a: launch.Args = .{};
+        a.add(send);
+        a.add(out);
+        a.add(@as(i32, @intCast(packs)));
+        a.add(@as(i32, g.rank));
+        a.add(base + g.layout.recv);
+        a.add(base + g.layout.flags);
+        a.add(base + g.layout.send);
+        a.add(base + g.layout.ctrl);
+        a.add(@as(i64, @intCast(g.layout.slot_bytes)));
+        a.add(g.counters.ptr);
+        a.add(klass);
+        a.add(g.timeout_ns);
+        a.add(@as(i32, @intCast(g.n_hca)));
+        const f = if (input_bf16) g.sum_bf16 else g.sum_f32;
+        try launch.launch(f, .{ .grid = .{ .x = grid }, .block = .{ .x = threads } }, .{ .handle = stream, .d = g.d }, &a);
         g.gathers += 1;
     }
 

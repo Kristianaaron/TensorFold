@@ -111,6 +111,10 @@ pub const Kernels = struct {
     glue: Glue,
     glue53: moe.Kernels,
     residual_rmsnorm_6144: cuda.Function,
+    residual_rmsnorm_6144_reg: cuda.Function,
+    /// TF_GLM53_GATHER_SUM=1: the consumer of one fp32 sum block (attention phase, glue.cu).
+    residual_rmsnorm_6144_sum: cuda.Function,
+    residual_rmsnorm_6144_sum_reg: cuda.Function,
     /// TF_GLM53_ADD_NORM_FUSE=1 only (loadAddNormFuse at setup); null otherwise.
     moe_residual_rmsnorm_6144: ?cuda.Function = null,
     /// TF_GLM53_QA_SHARD=1 only (loadQaShard at setup).
@@ -133,6 +137,9 @@ pub const Kernels = struct {
             .glue = try Glue.load(mods.glm_glue),
             .glue53 = try moe.Kernels.load(mods.glm53_glue),
             .residual_rmsnorm_6144 = try mods.glm53_glue.function("tf_glm53_residual_rmsnorm_6144"),
+            .residual_rmsnorm_6144_reg = try mods.glm53_glue.function("tf_glm53_residual_rmsnorm_6144_reg"),
+            .residual_rmsnorm_6144_sum = try mods.glm53_glue.function("tf_glm53_residual_rmsnorm_6144_sum"),
+            .residual_rmsnorm_6144_sum_reg = try mods.glm53_glue.function("tf_glm53_residual_rmsnorm_6144_sum_reg"),
             .swiglu_plain = try mods.glm53_glue.function("tf_glm53_swiglu_plain"),
             .mla = try mla.Mla.load(mods.glm53_mla),
             .index = try index.Index.load(mods.glm53_index, index_mma_rows),
@@ -232,11 +239,13 @@ pub const Collective = struct {
     ctx: *anyopaque,
     all_gather_fn: *const fn (ctx: *anyopaque, stream: cuda.Stream, mine: u64, all: u64, bytes: usize, phase: Phase) anyerror!void,
     one_shot_gather_fn: *const fn (ctx: *anyopaque, stream: cuda.Stream, mine: u64, all: u64, bytes: usize) anyerror!void = noOneShotGather,
+    sum_gather_fn: *const fn (ctx: *anyopaque, stream: cuda.Stream, mine: u64, all: u64, count: usize, input_bf16: bool) anyerror!void = noSumGather,
     send_recv_fn: *const fn (ctx: *anyopaque, stream: cuda.Stream, send: u64, send_bytes: usize, recv: u64, recv_bytes: usize, peer: usize, phase: Phase) anyerror!void,
     gate_result_fn: *const fn (ctx: *anyopaque, stream: cuda.Stream, token: u64, status: u64) anyerror!void = noGate,
 
     fn noGate(_: *anyopaque, _: cuda.Stream, _: u64, _: u64) anyerror!void {}
     fn noOneShotGather(_: *anyopaque, _: cuda.Stream, _: u64, _: u64, _: usize) anyerror!void { return error.RoceUnavailable; }
+    fn noSumGather(_: *anyopaque, _: cuda.Stream, _: u64, _: u64, _: usize, _: bool) anyerror!void { return error.RoceUnavailable; }
 
     pub fn allGather(c: Collective, stream: cuda.Stream, mine: u64, all: u64, bytes: usize, phase: Phase) !void {
         if (bytes == 0) return;
@@ -249,6 +258,14 @@ pub const Collective = struct {
         if (bytes == 0) return;
         try stream.flushDeferred();
         try c.one_shot_gather_fn(c.ctx, stream, mine, all, bytes);
+    }
+
+    /// `count` values from each rank, summed in one block at `all` in the shard's dtype: fp32 for the attention
+    /// partials (no rounding), bf16 for the MoE partials (rounded once).
+    pub fn sumGather(c: Collective, stream: cuda.Stream, mine: u64, all: u64, count: usize, input_bf16: bool) !void {
+        if (count == 0) return;
+        try stream.flushDeferred();
+        try c.sum_gather_fn(c.ctx, stream, mine, all, count, input_bf16);
     }
 
     /// `send_bytes` to the peer and `recv_bytes` from it, completing in `stream` order (NCCL's grouped send/recv):
@@ -266,12 +283,17 @@ pub const Collective = struct {
 
     /// Production transport: cuda.tp_group.Group (RoCE for small all-gathers on two ranks, NCCL otherwise).
     pub fn group(g: *const cuda.tp_group.Group) Collective {
-        return .{ .ctx = @ptrCast(@constCast(g)), .all_gather_fn = groupGather, .one_shot_gather_fn = groupOneShotGather, .send_recv_fn = groupSendRecv, .gate_result_fn = groupGateResult };
+        return .{ .ctx = @ptrCast(@constCast(g)), .all_gather_fn = groupGather, .one_shot_gather_fn = groupOneShotGather, .sum_gather_fn = groupSumGather, .send_recv_fn = groupSendRecv, .gate_result_fn = groupGateResult };
     }
 
     fn groupGather(ctx: *anyopaque, stream: cuda.Stream, mine: u64, all: u64, bytes: usize, _: Phase) anyerror!void {
         const g: *const cuda.tp_group.Group = @ptrCast(@alignCast(ctx));
         try g.allGather(stream, mine, all, bytes);
+    }
+
+    fn groupSumGather(ctx: *anyopaque, stream: cuda.Stream, mine: u64, all: u64, count: usize, input_bf16: bool) anyerror!void {
+        const g: *const cuda.tp_group.Group = @ptrCast(@alignCast(ctx));
+        try g.sumGather(stream, mine, all, count, input_bf16);
     }
 
     fn copyDevice(stream: cuda.Stream, dst: u64, src: u64, bytes: usize, what: [:0]const u8) !void {
@@ -336,12 +358,20 @@ pub const SideGroup = struct {
     }
 
     pub fn collective(g: *const SideGroup) Collective {
-        return .{ .ctx = @ptrCast(@constCast(g)), .all_gather_fn = gather, .send_recv_fn = sendRecv };
+        return .{ .ctx = @ptrCast(@constCast(g)), .all_gather_fn = gather, .sum_gather_fn = sumGather, .send_recv_fn = sendRecv };
     }
 
     fn gather(ctx: *anyopaque, stream: cuda.Stream, mine: u64, all: u64, bytes: usize, _: Phase) anyerror!void {
         const g: *const SideGroup = @ptrCast(@alignCast(ctx));
         try g.lib.check(g.lib.api.ncclAllGather(mine, all, bytes, .u8, g.comm, stream.handle), "ncclAllGather (stage side)");
+    }
+
+    /// TF_GLM53_GATHER_SUM on the side comm: one sum block (fp32 for fp32 shards, bf16 for bf16 shards). With two
+    /// ranks each element is the single IEEE add of the two ranks' values, so it matches the rank-major sum.
+    fn sumGather(ctx: *anyopaque, stream: cuda.Stream, mine: u64, all: u64, count: usize, input_bf16: bool) anyerror!void {
+        const g: *const SideGroup = @ptrCast(@alignCast(ctx));
+        const dtype: cuda.nccl.DataType = if (input_bf16) .bf16 else .f32;
+        try g.lib.check(g.lib.api.ncclAllReduce(mine, all, count, dtype, .sum, g.comm, stream.handle), "ncclAllReduce (stage side sum)");
     }
 
     fn sendRecv(ctx: *anyopaque, stream: cuda.Stream, send: u64, send_bytes: usize, recv: u64, recv_bytes: usize, peer: usize, _: Phase) anyerror!void {
@@ -429,7 +459,55 @@ pub fn parseGatherOvl(value: ?[]const u8) !u8 {
     const raw = value orelse return 0;
     if (std.mem.eql(u8, raw, "0")) return 0;
     if (std.mem.eql(u8, raw, "1")) return 1;
+    if (std.mem.eql(u8, raw, "2")) return 2;
     return error.BadGatherOvl;
+}
+
+/// The settings digest token for the overlay level. Level 1 keeps its original token so an existing cache key stays
+/// valid; only the new level 2 adds a distinct one.
+pub fn gatherOvlDigestToken(gather_ovl: u8) []const u8 {
+    return switch (gather_ovl) {
+        1 => "TF_GLM53_GATHER_OVL=1",
+        2 => "TF_GLM53_GATHER_OVL=2",
+        else => "",
+    };
+}
+
+/// TF_GLM53_GATHER_SUM: only the exact value "1" enables it, anything else is off.
+pub fn parseGatherSum(value: ?[]const u8) bool {
+    const raw = value orelse return false;
+    return std.mem.eql(u8, raw, "1");
+}
+
+pub fn gatherSumSwitch() bool {
+    const value = std.c.getenv("TF_GLM53_GATHER_SUM") orelse return false;
+    return parseGatherSum(std.mem.span(value));
+}
+
+/// The reduce gather consumes the piece-pipe ring buffers, so it needs the level-1 overlay with the piece pipe on.
+pub fn validateGatherSum(on: bool, gather_ovl: u8, piece_pipe: bool) !void {
+    if (on and !(gather_ovl == 1 and piece_pipe)) return error.GatherSumNeedsPipe;
+}
+
+/// Off adds nothing, so existing cache keys stay valid; on adds the one token.
+pub fn gatherSumDigestToken(on: bool) []const u8 {
+    return if (on) "TF_GLM53_GATHER_SUM=1" else "";
+}
+
+pub fn parseRmsReg(value: ?[]const u8) !bool {
+    const raw = value orelse return false;
+    if (std.mem.eql(u8, raw, "1")) return true;
+    if (std.mem.eql(u8, raw, "0")) return false;
+    return error.BadRmsReg;
+}
+
+pub fn rmsRegSwitch() !bool {
+    const value = std.c.getenv("TF_GLM53_RMS_REG") orelse return false;
+    return parseRmsReg(std.mem.span(value));
+}
+
+pub fn rmsRegDigestToken(on: bool) []const u8 {
+    return if (on) "TF_GLM53_RMS_REG=1" else "";
 }
 
 pub fn moeRingSelected(value: ?[]const u8) !u8 {
@@ -503,16 +581,24 @@ pub fn piecePipeSchedule(enabled: bool, gather_ovl: u8, pieces: usize, out: []Pi
     const extra_shared = if (enabled and gather_ovl != 0 and pieces != 0) pieces - 1 else 0;
     const needed = if (enabled) pieces * 4 + 1 + extra_shared else pieces * 2 + 1;
     if (out.len < needed) return error.ScheduleBufferTooSmall;
-    for (0..pieces) |_| {
+    var queued: usize = 0;
+    for (0..pieces) |piece| {
         out[at] = .attention;
         at += 1;
         if (enabled) {
             out[at] = .reduce_issue;
             at += 1;
-            if (at > 2) {
+            if (piece != 0) {
+                // Level 2 spends the deferred shared MLPs inside the loop, keeping two for the group tail.
+                if (gather_ovl >= 2 and queued >= 2) {
+                    out[at] = .ffn_shared;
+                    at += 1;
+                    queued -= 1;
+                }
                 out[at] = .reduce_finish;
                 out[at + 1] = if (gather_ovl == 0) .ffn_pre else .ffn_route;
                 at += 2;
+                queued += 1;
             }
         } else {
             out[at] = .ffn_pre;
@@ -520,10 +606,17 @@ pub fn piecePipeSchedule(enabled: bool, gather_ovl: u8, pieces: usize, out: []Pi
         }
     }
     if (enabled and pieces != 0) {
-        if (gather_ovl != 0) for (1..pieces) |_| {
-            out[at] = .ffn_shared;
-            at += 1;
-        };
+        if (gather_ovl == 1) {
+            for (1..pieces) |_| {
+                out[at] = .ffn_shared;
+                at += 1;
+            }
+        } else if (gather_ovl >= 2) {
+            for (0..queued) |_| {
+                out[at] = .ffn_shared;
+                at += 1;
+            }
+        }
         out[at] = .reduce_finish;
         out[at + 1] = .ffn_pre;
         at += 2;
@@ -533,23 +626,80 @@ pub fn piecePipeSchedule(enabled: bool, gather_ovl: u8, pieces: usize, out: []Pi
 }
 
 test "piece pipe issues next attention before finishing prior piece and flushes before routed group" {
-    var ops: [15]PipeOp = undefined;
-    const n = try piecePipeSchedule(true, 0, 3, &ops);
-    const attention_next = 1 + std.mem.indexOfScalar(PipeOp, ops[1..n], .attention).?;
-    const first_finish = std.mem.indexOfScalar(PipeOp, ops[0..n], .reduce_finish).?;
-    const first_pre = std.mem.indexOfScalar(PipeOp, ops[0..n], .ffn_pre).?;
-    const routed = std.mem.indexOfScalar(PipeOp, ops[0..n], .routed_group).?;
+    const expected_on = [_]PipeOp{ .attention, .reduce_issue, .attention, .reduce_issue, .reduce_finish, .ffn_pre, .attention, .reduce_issue, .reduce_finish, .ffn_pre, .attention, .reduce_issue, .reduce_finish, .ffn_pre, .attention, .reduce_issue, .reduce_finish, .ffn_pre, .attention, .reduce_issue, .reduce_finish, .ffn_pre, .attention, .reduce_issue, .reduce_finish, .ffn_pre, .attention, .reduce_issue, .reduce_finish, .ffn_pre, .reduce_finish, .ffn_pre, .routed_group };
+    var on: [expected_on.len]PipeOp = undefined;
+    const on_n = try piecePipeSchedule(true, 0, 8, &on);
+    try std.testing.expectEqualSlices(PipeOp, &expected_on, on[0..on_n]);
+    const attention_next = 1 + std.mem.indexOfScalar(PipeOp, on[1..on_n], .attention).?;
+    const first_finish = std.mem.indexOfScalar(PipeOp, on[0..on_n], .reduce_finish).?;
+    const first_pre = std.mem.indexOfScalar(PipeOp, on[0..on_n], .ffn_pre).?;
+    const routed = std.mem.indexOfScalar(PipeOp, on[0..on_n], .routed_group).?;
     try std.testing.expect(attention_next < first_finish and first_finish < first_pre);
-    try std.testing.expect(ops[routed - 2] == .reduce_finish and ops[routed - 1] == .ffn_pre);
-    const gather_ovl_expected = [_]PipeOp{ .attention, .reduce_issue, .attention, .reduce_issue, .reduce_finish, .ffn_route, .attention, .reduce_issue, .reduce_finish, .ffn_route, .ffn_shared, .ffn_shared, .reduce_finish, .ffn_pre, .routed_group };
-    const gather_ovl_n = try piecePipeSchedule(true, 1, 3, &ops);
-    try std.testing.expectEqualSlices(PipeOp, &gather_ovl_expected, ops[0..gather_ovl_n]);
-    var off: [7]PipeOp = undefined;
-    const off_n = try piecePipeSchedule(false, 0, 3, &off);
-    try std.testing.expectEqualSlices(PipeOp, &.{ .attention, .ffn_pre, .attention, .ffn_pre, .attention, .ffn_pre, .routed_group }, off[0..off_n]);
-    var off_gather_ovl: [7]PipeOp = undefined;
-    const off_gather_ovl_n = try piecePipeSchedule(false, 1, 3, &off_gather_ovl);
+    try std.testing.expect(on[routed - 2] == .reduce_finish and on[routed - 1] == .ffn_pre);
+    const gather_ovl_expected = [_]PipeOp{ .attention, .reduce_issue, .attention, .reduce_issue, .reduce_finish, .ffn_route, .attention, .reduce_issue, .reduce_finish, .ffn_route, .attention, .reduce_issue, .reduce_finish, .ffn_route, .attention, .reduce_issue, .reduce_finish, .ffn_route, .attention, .reduce_issue, .reduce_finish, .ffn_route, .attention, .reduce_issue, .reduce_finish, .ffn_route, .attention, .reduce_issue, .reduce_finish, .ffn_route, .ffn_shared, .ffn_shared, .ffn_shared, .ffn_shared, .ffn_shared, .ffn_shared, .ffn_shared, .reduce_finish, .ffn_pre, .routed_group };
+    var gather_ovl_ops: [gather_ovl_expected.len]PipeOp = undefined;
+    const gather_ovl_n = try piecePipeSchedule(true, 1, 8, &gather_ovl_ops);
+    try std.testing.expectEqualSlices(PipeOp, &gather_ovl_expected, gather_ovl_ops[0..gather_ovl_n]);
+    const gather_ovl2_expected = [_]PipeOp{ .attention, .reduce_issue, .attention, .reduce_issue, .reduce_finish, .ffn_route, .attention, .reduce_issue, .reduce_finish, .ffn_route, .attention, .reduce_issue, .ffn_shared, .reduce_finish, .ffn_route, .attention, .reduce_issue, .ffn_shared, .reduce_finish, .ffn_route, .attention, .reduce_issue, .ffn_shared, .reduce_finish, .ffn_route, .attention, .reduce_issue, .ffn_shared, .reduce_finish, .ffn_route, .attention, .reduce_issue, .ffn_shared, .reduce_finish, .ffn_route, .ffn_shared, .ffn_shared, .reduce_finish, .ffn_pre, .routed_group };
+    var gather_ovl2_ops: [gather_ovl2_expected.len]PipeOp = undefined;
+    const gather_ovl2_n = try piecePipeSchedule(true, 2, 8, &gather_ovl2_ops);
+    try std.testing.expectEqualSlices(PipeOp, &gather_ovl2_expected, gather_ovl2_ops[0..gather_ovl2_n]);
+    var off: [17]PipeOp = undefined;
+    const off_n = try piecePipeSchedule(false, 0, 8, &off);
+    try std.testing.expectEqual(@as(usize, 17), off_n);
+    try std.testing.expectEqual(PipeOp.routed_group, off[off_n - 1]);
+    var off_gather_ovl: [17]PipeOp = undefined;
+    const off_gather_ovl_n = try piecePipeSchedule(false, 1, 8, &off_gather_ovl);
     try std.testing.expectEqualSlices(PipeOp, off[0..off_n], off_gather_ovl[0..off_gather_ovl_n]);
+    // Level 1 must stay the pre-existing order for the three-piece case the old test pinned.
+    const level1_three = [_]PipeOp{ .attention, .reduce_issue, .attention, .reduce_issue, .reduce_finish, .ffn_route, .attention, .reduce_issue, .reduce_finish, .ffn_route, .ffn_shared, .ffn_shared, .reduce_finish, .ffn_pre, .routed_group };
+    var level1_three_ops: [level1_three.len]PipeOp = undefined;
+    const level1_three_n = try piecePipeSchedule(true, 1, 3, &level1_three_ops);
+    try std.testing.expectEqualSlices(PipeOp, &level1_three, level1_three_ops[0..level1_three_n]);
+}
+
+pub const DensePipeOp = enum { attention, reduce_issue, reduce_finish, ffn };
+
+/// Host-side order for one dense layer. Level 2 issues each piece's attention-output gather on the comm stream like
+/// the MoE piece pipe, so the next piece's attention covers it; levels 0 and 1 stay synchronous on the main stream.
+pub fn densePieceSchedule(gather_ovl: u8, pieces: usize, out: []DensePipeOp) !usize {
+    if (pieces == 0) return 0;
+    const piped = gather_ovl >= 2;
+    const needed = if (piped) pieces * 4 else pieces * 2;
+    if (out.len < needed) return error.ScheduleBufferTooSmall;
+    var at: usize = 0;
+    if (!piped) {
+        for (0..pieces) |_| {
+            out[at] = .attention;
+            out[at + 1] = .ffn;
+            at += 2;
+        }
+        return at;
+    }
+    for (0..pieces) |piece| {
+        out[at] = .attention;
+        out[at + 1] = .reduce_issue;
+        at += 2;
+        if (piece != 0) {
+            out[at] = .reduce_finish;
+            out[at + 1] = .ffn;
+            at += 2;
+        }
+    }
+    out[at] = .reduce_finish;
+    out[at + 1] = .ffn;
+    return at + 2;
+}
+
+test "dense layer at level 2 waits one piece late and level 1 stays synchronous" {
+    const piped = [_]DensePipeOp{ .attention, .reduce_issue, .attention, .reduce_issue, .reduce_finish, .ffn, .attention, .reduce_issue, .reduce_finish, .ffn, .reduce_finish, .ffn };
+    var got: [piped.len]DensePipeOp = undefined;
+    const n = try densePieceSchedule(2, 3, &got);
+    try std.testing.expectEqualSlices(DensePipeOp, &piped, got[0..n]);
+    const off = [_]DensePipeOp{ .attention, .ffn, .attention, .ffn, .attention, .ffn };
+    var got_off: [off.len]DensePipeOp = undefined;
+    const off_n = try densePieceSchedule(1, 3, &got_off);
+    try std.testing.expectEqualSlices(DensePipeOp, &off, got_off[0..off_n]);
 }
 
 test "index pipe queues gathers in rank order and merges only after every gather" {
@@ -1006,6 +1156,22 @@ pub fn pieceOrdinals(positions: []const usize, piece_rows: usize, group_at: usiz
     return count;
 }
 
+/// One grouped-prefill MoE group: an adaptive 4096-row group (pieces at `piece_rows`) only while the whole
+/// group ends below the adapt limit, because rows past the limit write the borrowed KV tails that hold the
+/// adaptive scratch. Every other group keeps plain expert_rows and 512-row pieces.
+pub const MoeGroup = struct { end: usize, rows: usize, piece_rows: usize, adapt: bool };
+
+pub fn moeGroupAt(positions: []const usize, group_at: usize, expert_rows: usize, piece_rows: usize, adapt_rows: usize, limit_position: usize) MoeGroup {
+    if (adapt_rows != 0) {
+        const adapt_end = pieceAt(.prefill, positions, adapt_rows, group_at).end;
+        if (positions[adapt_end - 1] < limit_position) {
+            return .{ .end = adapt_end, .rows = adapt_rows, .piece_rows = piece_rows, .adapt = true };
+        }
+    }
+    const end = pieceAt(.prefill, positions, expert_rows, group_at).end;
+    return .{ .end = end, .rows = expert_rows, .piece_rows = state.plainPieceRows(piece_rows, adapt_rows), .adapt = false };
+}
+
 /// Decode windows are keyed by the power-of-two bucket of their last position (at least the 2048 dense limit):
 /// whether any row is sparse, and how many local keys the indexer scores, are functions of the bucket.
 pub fn decodeKeyBucket(last_position: usize) usize {
@@ -1206,6 +1372,21 @@ pub fn smlaP3Selected(value: ?[]const u8) bool {
     return if (value) |raw| std.mem.eql(u8, raw, "1") else false;
 }
 
+/// SMLA-K8 (tf_glm53_kv_k8 writes e4m3 key copies, tf_glm53_smla_k8 attends from them, mla.cu) is opt-in; only the
+/// exact value "1" enables it, "0" or unset is off, and any other value is error.BadSmlaK8. Setup reads it once,
+/// carries it in Geometry (the copy carve) and Forward, and refuses it without TF_GLM53_SMLA_P=1.
+pub fn smlaK8Switch() !bool {
+    const value = std.c.getenv("TF_GLM53_SMLA_K8") orelse return false;
+    return smlaK8Selected(std.mem.span(value));
+}
+
+pub fn smlaK8Selected(value: ?[]const u8) !bool {
+    const raw = value orelse return false;
+    if (std.mem.eql(u8, raw, "0")) return false;
+    if (std.mem.eql(u8, raw, "1")) return true;
+    return error.BadSmlaK8;
+}
+
 /// A3 decode verify attend is opt-in; only the exact value "1" enables it.
 pub fn decodeUnionSwitch() bool {
     const value = std.c.getenv("TF_GLM53_DECODE_UNION") orelse return false;
@@ -1396,17 +1577,6 @@ pub fn chunkRows(positions: []const usize, chunk_rows: usize, at: usize) !Chunk 
         if (end > at and positions[end] != positions[end - 1] + 1) return error.NonConsecutivePositions;
     }
     return .{ .start = at, .end = end };
-}
-
-pub fn adaptSelected(limit_position: usize, positions: []const usize) bool {
-    return positions.len != 0 and positions[positions.len - 1] < limit_position;
-}
-
-test "adaptive expert mode selects whole windows by their last position" {
-    try std.testing.expect(!adaptSelected(10, &.{}));
-    try std.testing.expect(adaptSelected(10, &.{ 2, 9 }));
-    try std.testing.expect(!adaptSelected(10, &.{ 2, 10 }));
-    try std.testing.expect(!adaptSelected(10, &.{ 9, 10, 11 }));
 }
 
 pub const LocalToken = struct { global: i32, local_slot: i32 };
@@ -1603,7 +1773,41 @@ test "attention pipe switch accepts only the exact opt-in value" {
     try std.testing.expectEqual(@as(u8, 0), try parseGatherOvl(null));
     try std.testing.expectEqual(@as(u8, 0), try parseGatherOvl("0"));
     try std.testing.expectEqual(@as(u8, 1), try parseGatherOvl("1"));
-    try std.testing.expectError(error.BadGatherOvl, parseGatherOvl("2"));
+    try std.testing.expectEqual(@as(u8, 2), try parseGatherOvl("2"));
+    try std.testing.expectError(error.BadGatherOvl, parseGatherOvl("3"));
+    try std.testing.expectError(error.BadGatherOvl, parseGatherOvl("02"));
+}
+
+test "gather overlay digest token is distinct only for the new level" {
+    try std.testing.expectEqualStrings("", gatherOvlDigestToken(0));
+    try std.testing.expectEqualStrings("TF_GLM53_GATHER_OVL=1", gatherOvlDigestToken(1));
+    try std.testing.expectEqualStrings("TF_GLM53_GATHER_OVL=2", gatherOvlDigestToken(2));
+    try std.testing.expectEqualStrings("", gatherOvlDigestToken(3));
+}
+
+test "gather sum switch is exact and needs the level-1 piece pipe" {
+    try std.testing.expect(!parseGatherSum(null));
+    try std.testing.expect(!parseGatherSum("0"));
+    try std.testing.expect(!parseGatherSum("01"));
+    try std.testing.expect(!parseGatherSum("true"));
+    try std.testing.expect(parseGatherSum("1"));
+    try validateGatherSum(false, 0, false);
+    try validateGatherSum(true, 1, true);
+    try std.testing.expectError(error.GatherSumNeedsPipe, validateGatherSum(true, 0, true));
+    try std.testing.expectError(error.GatherSumNeedsPipe, validateGatherSum(true, 1, false));
+    try std.testing.expectError(error.GatherSumNeedsPipe, validateGatherSum(true, 2, true));
+    try std.testing.expectEqualStrings("", gatherSumDigestToken(false));
+    try std.testing.expectEqualStrings("TF_GLM53_GATHER_SUM=1", gatherSumDigestToken(true));
+}
+
+test "RMS register switch accepts only zero or one and changes the digest only when on" {
+    try std.testing.expect(!try parseRmsReg(null));
+    try std.testing.expect(!try parseRmsReg("0"));
+    try std.testing.expectError(error.BadRmsReg, parseRmsReg("00"));
+    try std.testing.expectError(error.BadRmsReg, parseRmsReg("true"));
+    try std.testing.expect(try parseRmsReg("1"));
+    try std.testing.expectEqualStrings("", rmsRegDigestToken(false));
+    try std.testing.expectEqualStrings("TF_GLM53_RMS_REG=1", rmsRegDigestToken(true));
 }
 
 test "decode MLA 16 switch is exact and requires MLA 3 with verify max 16" {
@@ -1681,6 +1885,10 @@ pub const Forward = struct {
     /// TF_GLM53_SMLA_P3=1, captured once at setup (Geometry.smla_p3, which carves ws.smla_union): the SMLA-P prefill
     /// attend runs as tf_glm53_smla_union + tf_glm53_smla_p3. Off (the default) launches exactly what it did before.
     smla_p3: bool = false,
+    /// TF_GLM53_SMLA_K8=1, captured once at setup (Geometry.smla_k8, which carves the owner and stage e4m3 copies):
+    /// the prefill SMLA-P attend runs tf_glm53_kv_k8 on both planes, then tf_glm53_smla_k8. Off (the default)
+    /// launches exactly what it did before.
+    smla_k8: bool = false,
     /// TF_GLM53_DECODE_UNION=1 (A3), captured once at setup: decode windows of 1..decode_union_rows attend with
     /// tf_glm53_attend_verify + tf_glm53_attend_split_merge (byte-identical to attend_mma + split_merge per row).
     /// TF_GLM53_DECODE_UNION16=1 widens this to 16 rows with TF_GLM53_VERIFY_MAX=16.
@@ -1694,6 +1902,9 @@ pub const Forward = struct {
     /// TF_GLM53_PREFILL_W8A8=2. Level 1 stays o_proj. This adds every other FP8B prefill projection `w8a8.serves` accepts.
     /// Off leaves those launches on qmmf. Setup refuses it unless prefill_w8a8 is also set.
     prefill_w8a8_all: bool = false,
+    /// TF_GLM53_IQ_FOLD=1 (needs TF_GLM53_PREFILL_W8A8=2): the indexer wq_b projection runs w8a8's `_iq` entry,
+    /// which applies tf_glm53_index_q's pair math in the GEMM epilogue, and the separate index_q launch is skipped.
+    iq_fold: bool = false,
     /// TF_GLM53_QMMF_VAR=1 enables same-bit FP8B schedule variants for selected prefill shapes.
     qmmf_var: bool = false,
     /// TF_GLM53_PRE_FUSE, captured once at setup (Geometry.pre_fuse). Off (the default) launches exactly what it did before.
@@ -1708,7 +1919,13 @@ pub const Forward = struct {
     piece_pipe: ?bool = null,
     /// Captured once at setup. This moves only grouped-prefill MoE reductions to the ordered comm stream.
     moe_pipe: bool = false,
+    /// TF_GLM53_GATHER_OVL, captured once at setup: 1 defers shared expert MLPs to the group tail; 2 also spends them
+    /// before each piece's gather wait and pipes the dense piece gathers.
     gather_ovl: u8 = 0,
+    /// TF_GLM53_GATHER_SUM=1: the piece-pipe attention and MoE gathers write one sum block (fp32 attention, bf16
+    /// MoE), and their consumers read it. Off leaves the rank-major gathers and consumers exactly as they were.
+    gather_sum: bool = false,
+    rms_reg: bool = false,
     ws_trim: bool = false,
     moe_post: bool = false,
     moe_ep: bool = false,
@@ -1774,6 +1991,11 @@ pub const Forward = struct {
         if (f.promptExpertsP5a() and (!f.promptExpertsPmx() or !f.promptExpertsWide() or !f.promptExpertsEnabled())) return error.PromptExpertsP5aNeedsPmx;
         if (f.smlaPEnabled() and f.k.mla.attend_kernel == .scalar) return error.SmlaPWithScalarAttend;
         if (f.smlaFp8Enabled() and !f.smlaPEnabled()) return error.SmlaFp8WithoutSmlaP;
+        if (f.smla_k8) {
+            if (!f.smlaPEnabled()) return error.SmlaK8NeedsSmlaP;
+            if (f.k.mla.kv_k8_fn == null or f.k.mla.smla_k8_fn == null) return error.MissingSmlaK8Kernels;
+            if (f.st.smla_k8_slots == 0 or f.st.smla_k8_copy.ptr == 0) return error.MissingSmlaK8Copy;
+        }
         if (f.smla_p3) {
             if (!f.smlaPEnabled()) return error.SmlaP3WithoutSmlaP;
             if (f.smlaFp8Enabled()) return error.SmlaP3WithSmlaFp8;
@@ -1806,6 +2028,11 @@ pub const Forward = struct {
             for (f.w.layers) |l| {
                 if (l.attn.q_a.n != 1024) return error.QaShardWeights;
             }
+        }
+        if (f.iq_fold and !f.prefill_w8a8_all) return error.IqFoldNeedsW8a8;
+        if (f.iq_fold) {
+            if (f.k.w8a8 == null) return error.MissingW8a8Kernels;
+            if (f.w.config.i_dim != 128 or f.w.config.i_heads != 32) return error.IqFoldShape;
         }
         if (f.prefill_w8a8_all and !f.prefill_w8a8) return error.W8a8Level;
         if (f.prefill_w8a8) {
@@ -1877,7 +2104,7 @@ pub const Forward = struct {
                     if (!cuda.exl3_experts.pmx.eligible(l)) return error.ExpertRowsAdaptNeedsPromptExperts;
                 } else if (f.promptExpertsWide() and !cuda.exl3_experts.prompt.eligible(l)) return error.ExpertRowsAdaptNeedsPromptExperts;
             }
-            try state.validateMoePipeGeometry(.{ .expert_rows = ad.rows, .chunk_rows = f.st.ws.rows, .piece_rows = f.st.ws.piece_rows, .decode_rows = f.st.ws.decode_rows, .moe_pipe = f.moe_pipe, .moe_ring = moe_ring });
+            try state.validateMoePipeGeometry(.{ .expert_rows = f.st.ws.expert_rows, .chunk_rows = f.st.ws.rows, .piece_rows = f.st.ws.piece_rows, .decode_rows = f.st.ws.decode_rows, .expert_rows_adapt = ad.rows, .moe_pipe = f.moe_pipe, .moe_ring = moe_ring });
         } else {
             try state.validateMoePipeGeometry(.{ .expert_rows = f.st.ws.expert_rows, .chunk_rows = f.st.ws.rows, .piece_rows = f.st.ws.piece_rows, .decode_rows = f.st.ws.decode_rows, .moe_pipe = f.moe_pipe, .moe_ring = moe_ring });
         }
@@ -1960,6 +2187,12 @@ pub const Forward = struct {
 
     fn moePipeEnabled(f: *const Forward) bool {
         return f.moe_pipe;
+    }
+
+    fn groupedPrefill(f: *const Forward) bool {
+        const ws = &f.st.ws;
+        const adapt_rows: usize = if (f.st.adapt) |ad| ad.rows else 0;
+        return state.groupedExperts(ws.expert_rows, state.plainPieceRows(ws.piece_rows, adapt_rows));
     }
 
     fn indexPipeEnabled(f: *const Forward) bool {
@@ -2126,6 +2359,20 @@ pub const Forward = struct {
         if (mode == .prefill) if (try f.launchPrefillW8a8(s, x, ldx, rows, w, y, out)) return;
         return f.k.lane.matmulOutPinned(s, x, ldx, rows, w, y, out, part, pin_n);
     }
+
+    /// TF_GLM53_IQ_FOLD: the wq_b projection's `_iq` entry writes tf_glm53_index_q's output directly. True means
+    /// qi was written and the caller skips index_q; false leaves the caller on project + index_q (same bits).
+    /// wq_b is N 32 x 128 and K 2048, so `servesFast` holds; the per-head pair math needs a whole 128-column tile.
+    fn projectIq(f: *const Forward, mode: Mode, s: cuda.Stream, x: u64, ldx: usize, rows: usize, w: cuda.qmmf.Weight, qi: u64, positions: u64, cos: u64, sin: u64) !bool {
+        if (mode != .prefill or !f.iq_fold or !f.prefill_w8a8_all or f.prefill_gemms != null) return false;
+        if (!cuda.w8a8.servesFast(w) or w.n != 32 * 128) return false;
+        const ws = &f.st.ws;
+        const need: u64 = @intCast(cuda.w8a8.scratchBytes(rows, @as(usize, @intCast(w.k))));
+        if (ws.sizes.w8a8_scratch < need) return false;
+        const fns = f.k.w8a8 orelse return error.MissingW8a8Kernels;
+        try fns.runIq(s, x, ldx, rows, w, qi, positions, cos, sin, ws.w8a8_scratch, ws.sizes.w8a8_scratch);
+        return true;
+    }
     /// TF_GLM53_PREFILL_W8A8=1 prefill o_proj: the same fp32 rank partial rows as project(.f32), from the e4m3
     /// rows of `x` and the FP8B weight. Scratch: ws.part, the attend partials expand_v has already consumed on this
     /// stream (the next piece's attend rewrites it after this call, also in stream order); xq | xs fit in it.
@@ -2168,13 +2415,6 @@ pub const Forward = struct {
     /// rows run in pieces (absolute multiples of piece_rows), attention then FFN per piece: a piece attends only
     /// to keys of rows at or before it, which earlier pieces already wrote.
     pub fn launch(f: *const Forward, mode: Mode, positions: []const usize, head: Chunk) !void {
-        if (mode == .prefill) if (f.st.adapt) |ad| if (adaptSelected(ad.limit_position, positions)) {
-            var st2 = f.st.*;
-            st2.ws = ad.ws;
-            var g = f.*;
-            g.st = &st2;
-            return g.launchSteps(mode, positions, head);
-        };
         // MK8: decode only (prefill untouched); the end of the step flushes the last segment.
         if (mode == .decode) if (f.mk) |sink| if (megakernelSwitch()) {
             var g = f.*;
@@ -2255,19 +2495,13 @@ pub const Forward = struct {
                         const kept = Chunk{ .start = first, .end = p.end };
                         if (f.moePipeEnabled()) try f.finishMoePendingFor(&moe_pending, kept);
                         try f.attention(l, i, mode, positions, kept, ordinal, next, 0, false, true, null);
-                        try f.ffn(l, kept, mode);
+                        try f.ffn(l, kept, mode, 0);
                     }
                     at = p.end;
                 }
-            } else if (prefill and !f.tboEnabled() and state.groupedExperts(f.st.ws.expert_rows, f.st.ws.piece_rows)) switch (l.ffn) {
+            } else if (prefill and !f.tboEnabled() and f.groupedPrefill()) switch (l.ffn) {
                 .moe => try f.groupedMoeLayer(l, i, positions, ordinal, next, &moe_pending),
-                .dense => while (at < positions.len) {
-                    const p = pieceAt(mode, positions, f.st.ws.piece_rows, at);
-                    if (f.moePipeEnabled()) try f.finishMoePendingFor(&moe_pending, p);
-                    try f.attention(l, i, mode, positions, p, ordinal, next, 0, false, false, null);
-                    try f.ffn(l, p, mode);
-                    at = p.end;
-                },
+                .dense => try f.denseLayer(l, i, mode, positions, ordinal, next, &moe_pending),
             } else while (at < positions.len) {
                 const p = pieceAt(mode, positions, f.st.ws.piece_rows, at);
                 if (f.moePipeEnabled()) try f.finishMoePendingFor(&moe_pending, p);
@@ -2275,7 +2509,7 @@ pub const Forward = struct {
                     try f.tboPiece(l, i, positions, p, ordinal, next);
                 } else {
                     try f.attention(l, i, mode, positions, p, ordinal, next, 0, false, false, null);
-                    if (f.addNormFused(mode, i)) try f.ffnNorm(l, p, mode, f.w.layers[i + 1].in_norm) else try f.ffn(l, p, mode);
+                    if (f.addNormFused(mode, i)) try f.ffnNorm(l, p, mode, 0, f.w.layers[i + 1].in_norm) else try f.ffn(l, p, mode, 0);
                 }
                 if (prefill and f.prof_prefill) if (f.prof) |profile| {
                     try f.profileSync();
@@ -2331,11 +2565,11 @@ pub const Forward = struct {
         work_a = f.*;
         work_a.tbo_half = 0;
         work_a.tbo_xn_off = 0;
-        try work_a.ffn(l, halves[0], .prefill);
+        try work_a.ffn(l, halves[0], .prefill, work_a.tbo_xn_off);
         work_b = f.*;
         work_b.tbo_half = 1;
         work_b.tbo_xn_off = halves[0].end - halves[0].start;
-        try work_b.ffn(l, halves[1], .prefill);
+        try work_b.ffn(l, halves[1], .prefill, work_b.tbo_xn_off);
         const moe_partial = switch (l.ffn) { .moe => true, .dense => false };
         try f.finishTboReduce(halves[0], moe_partial, null, 0, 0);
         try f.finishTboReduce(halves[1], moe_partial, null, 0, 1);
@@ -2394,7 +2628,9 @@ pub const Forward = struct {
         const comm = f.st.tbo_stream orelse return error.MissingTboStream;
         try f.st.pipe_ready[ring_slot].?.record(f.stream);
         try comm.wait(f.st.pipe_ready[ring_slot].?);
-        try f.commColl().allGather(comm, ws.pipe_src[ring_slot], ws.pipe_gather[ring_slot], (p.end - p.start) * hidden * 4, .attention_output);
+        if (f.gather_sum) {
+            try f.commColl().sumGather(comm, ws.pipe_src[ring_slot], ws.pipe_gather[ring_slot], (p.end - p.start) * hidden, false);
+        } else try f.commColl().allGather(comm, ws.pipe_src[ring_slot], ws.pipe_gather[ring_slot], (p.end - p.start) * hidden * 4, .attention_output);
         try f.st.pipe_done[ring_slot].?.record(comm);
     }
 
@@ -2404,9 +2640,15 @@ pub const Forward = struct {
         try f.st.moe_pipe_ready[ring_slot].?.record(f.stream);
         try comm.wait(f.st.moe_pipe_ready[ring_slot].?);
         const n = p.end - p.start;
-        const mine = if (f.moe_post) ws.moe_pipe_gather[ring_slot] + f.rank * n * hidden * 2 else ws.moe_pipe_src[ring_slot];
-        try f.commColl().allGather(comm, mine, ws.moe_pipe_gather[ring_slot], n * hidden * 2, .moe_partial);
-        try moe.residualAddBf16(f.k.glue53.residual_add_bf16, comm, ws.x + p.start * hidden * 2, ws.moe_pipe_gather[ring_slot], p.end - p.start);
+        const sum = f.gather_sum and f.ablate == null;
+        const mine = if (sum and f.moe_post) ws.moe_pipe_gather[ring_slot] + n * hidden * 2 else if (sum) f.gatherBuffer() + n * hidden * world * 2 else if (f.moe_post) ws.moe_pipe_gather[ring_slot] + f.rank * n * hidden * 2 else ws.moe_pipe_src[ring_slot];
+        if (sum) {
+            try f.commColl().sumGather(comm, mine, ws.moe_pipe_gather[ring_slot], n * hidden, true);
+            try moe.residualAddBf16Sum(f.k.glue53.residual_add_bf16_sum, comm, ws.x + p.start * hidden * 2, ws.moe_pipe_gather[ring_slot], p.end - p.start);
+        } else {
+            try f.commColl().allGather(comm, mine, ws.moe_pipe_gather[ring_slot], n * hidden * 2, .moe_partial);
+            try moe.residualAddBf16(f.k.glue53.residual_add_bf16, comm, ws.x + p.start * hidden * 2, ws.moe_pipe_gather[ring_slot], p.end - p.start);
+        }
         if (f.ablate) |ab| if (ab.vec(layer, .ffn)) |v| try ab.launch(f.k.ablate.?, comm, ws.x + p.start * hidden * 2, ws.moe_pipe_gather[ring_slot], .bf16_parts, v, p.end - p.start, 0, 0, f.w.config.eps);
         try f.st.moe_pipe_done[ring_slot].?.record(comm);
         // One event per piece lets next-layer attention wait for precisely the rows it will read.
@@ -2465,7 +2707,10 @@ pub const Forward = struct {
         var args: cuda.Args = .{};
         const xn = ws.xn + off * hidden * 2;
         inline for (.{ ws.x + p.start * hidden * 2, ws.pipe_gather[ring_slot], norm, xn, @as(c_int, @intCast(n)), f.w.config.eps }) |v| args.add(v);
-        try cuda.launch.launch(f.k.residual_rmsnorm_6144, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 256 } }, f.stream, &args);
+        const residual = if (f.gather_sum)
+            (if (f.rms_reg) f.k.residual_rmsnorm_6144_sum_reg else f.k.residual_rmsnorm_6144_sum)
+        else if (f.rms_reg) f.k.residual_rmsnorm_6144_reg else f.k.residual_rmsnorm_6144;
+        try cuda.launch.launch(residual, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 256 } }, f.stream, &args);
         try f.profileEnd(.prefill, layer, .attn_post);
     }
 
@@ -2533,6 +2778,29 @@ pub const Forward = struct {
             try f.st.tbo_done[half].?.record(comm);
             return;
         }
+        // The same two phases through the reduce gather: one sum block and the `_sum` consumer (fp32 for attention,
+        // bf16 for MoE). Other phases, TBO halves and reduceAddNorm keep the rank-major layout.
+        if (f.gather_sum and phase == .attention_output and f.ablate == null) {
+            if (next_norm) |weight| {
+                if (bf16_partial) return error.BadFusedNormPartial;
+                const sum_block = ws.pipe_gather[0];
+                if (prof) |timing| try f.profileBegin(timing.mode, timing.layer, timing.stage);
+                try f.coll.sumGather(f.stream, source, sum_block, n * hidden, false);
+                if (prof) |timing| try f.profileEnd(timing.mode, timing.layer, timing.stage);
+                if (prof) |timing| if (timing.after) |stage| try f.profileBegin(timing.mode, timing.layer, stage);
+                var args: cuda.Args = .{};
+                const xn = ws.xn + xn_off * hidden * 2;
+                inline for (.{ ws.x + p.start * hidden * 2, sum_block, weight, xn, @as(c_int, @intCast(n)), f.w.config.eps }) |v| args.add(v);
+                const residual = if (f.rms_reg) f.k.residual_rmsnorm_6144_sum_reg else f.k.residual_rmsnorm_6144_sum;
+                try cuda.launch.launch(residual, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 256 } }, f.stream, &args);
+                return;
+            }
+        }
+        if (f.gather_sum and phase == .moe_partial and bf16_partial and f.ablate == null) {
+            try f.coll.sumGather(f.stream, source, ws.gathered, n * hidden, true);
+            try moe.residualAddBf16Sum(f.k.glue53.residual_add_bf16_sum, f.stream, ws.x + p.start * hidden * 2, ws.gathered, n);
+            return;
+        }
         if (prof) |timing| try f.profileBegin(timing.mode, timing.layer, timing.stage);
         try f.coll.allGather(f.stream, source, ws.gathered, bytes, phase);
         if (prof) |timing| try f.profileEnd(timing.mode, timing.layer, timing.stage);
@@ -2542,7 +2810,8 @@ pub const Forward = struct {
             var args: cuda.Args = .{};
             const xn = ws.xn + xn_off * hidden * 2;
             inline for (.{ ws.x + p.start * hidden * 2, ws.gathered, weight, xn, @as(c_int, @intCast(n)), f.w.config.eps }) |v| args.add(v);
-            try cuda.launch.launch(f.k.residual_rmsnorm_6144, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 256 } }, f.stream, &args);
+            const residual = if (f.rms_reg) f.k.residual_rmsnorm_6144_reg else f.k.residual_rmsnorm_6144;
+            try cuda.launch.launch(residual, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 256 } }, f.stream, &args);
         } else if (bf16_partial) {
             try moe.residualAddBf16(f.k.glue53.residual_add_bf16, f.stream, ws.x + p.start * hidden * 2, ws.gathered, n);
         } else {
@@ -2751,8 +3020,11 @@ pub const Forward = struct {
                 } else try f.project(mode, s, xn, hidden, rows, ix.weights_proj, ws.iw, .bf16, ws.lane_part);
                 try f.profileSubEnd(mode, plane, .attn_pre_indexer_weights_proj);
                 try f.profileSubBegin(mode, plane, .attn_pre_indexer_query_proj);
-                try f.project(mode, s, ws.q_resid, state.q_lora, rows, ix.wq_b, ws.iq, .bf16, ws.lane_part);
-                try k.index.q(s, ws.iq, cos, sin, ws.qi, rows);
+                const folded = try f.projectIq(mode, s, ws.q_resid, state.q_lora, rows, ix.wq_b, ws.qi, positions_at, cos, sin);
+                if (!folded) {
+                    try f.project(mode, s, ws.q_resid, state.q_lora, rows, ix.wq_b, ws.iq, .bf16, ws.lane_part);
+                    try k.index.q(s, ws.iq, cos, sin, ws.qi, rows);
+                }
                 try f.profileSubEnd(mode, plane, .attn_pre_indexer_query_proj);
                 try f.select(mode, plane, pos, lo, iplane);
             }
@@ -2792,7 +3064,16 @@ pub const Forward = struct {
             if (f.activePrefetch()) |pf| if (p.start == 0) try s.wait(pf.fetched[b]);
             if (f.smlaPEnabled()) {
                 try f.profileSubBegin(mode, plane, .attn_pre_smla_p_scores);
-                if (f.smla_p3) {
+                if (f.smla_k8) {
+                    // Both planes hold final bf16 slots < n here: this piece's keys were written by kv_write above on
+                    // `s`, earlier pieces and chunks are in stream order, and the only other producer (the prefetch
+                    // history fetch on the side stream) was joined by the p.start == 0 wait just above.
+                    const max_pos = positions[p.end - 1];
+                    const n = @min(max_pos / world + 1, f.st.smla_k8_slots);
+                    try k.mla.quantK8(s, latent, rope, f.st.smlaK8OwnerCopy(), 0, n);
+                    if (stage) |st| if (st.latent.data.ptr != 0 and st.rope.data.ptr != 0) try k.mla.quantK8(s, st.latent.data.ptr, st.rope.data.ptr, f.st.smlaK8StageCopy(), 0, n);
+                    try k.mla.attendSmlaK8(s, ws.qa, ws.qpe, latent, rope, stage, f.st.smlaK8OwnerCopy(), f.st.smlaK8StageCopy(), positions_at, tokens, ws.local_slots, counts, ws.local_counts, dense_len, ws.part, rows, state.local_heads, f.rank, world);
+                } else if (f.smla_p3) {
                     try k.mla.attendSmlaP3(s, ws.qa, ws.qpe, latent, rope, stage, positions_at, tokens, ws.local_slots, counts, ws.local_counts, dense_len, ws.part, rows, state.local_heads, f.rank, world, ws.smla_union, ws.sizes.smla_union);
                 } else if (f.smlaFp8Enabled()) {
                     try k.mla.attendSmlaPFp8(s, ws.qa, ws.qpe, latent, rope, stage, positions_at, tokens, ws.local_slots, counts, ws.local_counts, dense_len, ws.part, rows, state.local_heads, f.rank, world);
@@ -3012,6 +3293,20 @@ pub const Forward = struct {
     }
 
     fn groupedMoeLayer(f: *const Forward, l: weights.DeviceLayer, plane: usize, positions: []const usize, ordinal: usize, next: ?usize, pending_moe: *MoePipePendingSet) !void {
+        const base = &f.st.ws;
+        var group_at: usize = 0;
+        while (group_at < positions.len) {
+            const moe_group = moeGroupAt(positions, group_at, base.expert_rows, base.piece_rows, if (f.st.adapt) |ad| ad.rows else 0, if (f.st.adapt) |ad| ad.limit_position else 0);
+            var st = f.st.*;
+            st.ws = if (moe_group.adapt) f.st.adapt.?.ws else base.*;
+            var g = f.*;
+            g.st = &st;
+            try g.groupedMoeGroup(l, plane, positions, ordinal, next, pending_moe, group_at, moe_group);
+            group_at = moe_group.end;
+        }
+    }
+
+    fn groupedMoeGroup(f: *const Forward, l: weights.DeviceLayer, plane: usize, positions: []const usize, ordinal: usize, next: ?usize, pending_moe: *MoePipePendingSet, group_at: usize, moe_group: MoeGroup) !void {
         const ws = &f.st.ws;
         const m = switch (l.ffn) { .moe => |moe_weights| moe_weights, .dense => return error.ExpectedMoeLayer };
         var mlp_k = f.k.mlpKernels();
@@ -3019,13 +3314,11 @@ pub const Forward = struct {
             mlp_k.project_ctx = @constCast(f);
             mlp_k.project_fn = mlpProject;
         }
-        var group_at: usize = 0;
-        while (group_at < positions.len) {
-            // Expert groups cut at absolute multiples of expert_rows (validExpertRows: a multiple of piece_rows), like
-            // pieces and chunks, so a resumed or restored prompt batches its experts the way a fresh one does.
-            const group_end = pieceAt(.prefill, positions, ws.expert_rows, group_at).end;
-            std.debug.assert(group_end - group_at <= ws.expert_rows);
-            var row_at = group_at;
+        // Expert groups cut at absolute multiples of the selected group size, like pieces and chunks, so a
+        // resumed or restored prompt batches its experts the way a fresh one does.
+        const group_end = moe_group.end;
+        std.debug.assert(group_end - group_at <= moe_group.rows);
+        var row_at = group_at;
             var piece_ordinal: usize = 0;
             var pending: ?PipePending = null;
             var deferred_shared: [state.Workspace.max_moe_pipe_pieces]PipePending = undefined;
@@ -3034,15 +3327,25 @@ pub const Forward = struct {
             // The piece pipe skips the attention-site ablation; an ablated prompt takes the plain path (as TBO does).
             const pipe_on = f.piecePipeEnabled() and f.ablate == null;
             while (row_at < group_end) {
-                const p = pieceAt(.prefill, positions, ws.piece_rows, row_at);
+                const p = pieceAt(.prefill, positions, moe_group.piece_rows, row_at);
                 const n = p.end - p.start;
                 const off = row_at - group_at;
-                std.debug.assert(off + n <= ws.expert_rows);
+                std.debug.assert(off + n <= moe_group.rows);
                 if (f.moePipeEnabled()) try f.finishMoePendingFor(pending_moe, p);
                 if (pipe_on) {
                     const ring_slot = piece_ordinal % 2;
                     try f.attention(l, plane, .prefill, positions, p, ordinal, next, off, false, false, ring_slot);
                     if (pending) |previous| {
+                        // Level 2 spends the oldest deferred shared MLP here, before the wait, and keeps two for the
+                        // group tail; level 1 keeps all of them for the tail. Data proof: the oldest queued piece's
+                        // reduceFinish ran in an earlier iteration, so its xn rows and post-attention residual are
+                        // final, and its shared_out rows are read only by postPrompt at the group's end.
+                        if (f.gather_ovl >= 2 and deferred_shared_count >= 2) {
+                            try f.ffnShared(l, m, mlp_k, deferred_shared[0].p, deferred_shared[0].off);
+                            var shift: usize = 1;
+                            while (shift < deferred_shared_count) : (shift += 1) deferred_shared[shift - 1] = deferred_shared[shift];
+                            deferred_shared_count -= 1;
+                        }
                         try f.reduceFinish(previous.p, previous.off, previous.slot, l.post_norm, l.index);
                         if (f.gather_ovl == 0) {
                             try f.ffnPre(l, m, mlp_k, previous.p, previous.off);
@@ -3066,9 +3369,11 @@ pub const Forward = struct {
                 piece_ordinal += 1;
             }
             if (pending) |last| {
-                if (f.gather_ovl != 0) for (deferred_shared[0..deferred_shared_count]) |deferred| {
-                    try f.ffnShared(l, m, mlp_k, deferred.p, deferred.off);
-                };
+                if (f.gather_ovl != 0) {
+                    for (deferred_shared[0..deferred_shared_count]) |deferred| {
+                        try f.ffnShared(l, m, mlp_k, deferred.p, deferred.off);
+                    }
+                }
                 try f.reduceFinish(last.p, last.off, last.slot, l.post_norm, l.index);
                 try f.ffnPre(l, m, mlp_k, last.p, last.off);
                 pending = null;
@@ -3083,7 +3388,7 @@ pub const Forward = struct {
             row_at = group_at;
             piece_ordinal = 0;
             while (row_at < group_end) {
-                const p = pieceAt(.prefill, positions, ws.piece_rows, row_at);
+                const p = pieceAt(.prefill, positions, moe_group.piece_rows, row_at);
                 const n = p.end - p.start;
                 const off = row_at - group_at;
                 const lr: ?moe.LowRankWeights = if (m.lowrank) |r| .{ .a = r.a, .b = r.b, .mid = ws.lowrank_mid + off * 8 * (r.rank_local * 4), .rank_local = r.rank_local } else null;
@@ -3091,7 +3396,7 @@ pub const Forward = struct {
                 if (f.moePipeEnabled() and moe_slot_used[ring_slot]) try f.stream.wait(f.st.moe_pipe_done[ring_slot].?);
                 if (f.moePipeEnabled()) moe_slot_used[ring_slot] = true;
                 const gathered_bytes = n * hidden * world * 2;
-                const moe_out = if (f.moe_post) ws.moe_pipe_gather[ring_slot] + f.rank * n * hidden * 2 else if (f.moePipeEnabled()) ws.moe_pipe_src[ring_slot] else f.gatherBuffer() + gathered_bytes;
+                const moe_out = if (f.gather_sum and f.ablate == null and f.moe_post and f.moePipeEnabled()) ws.moe_pipe_gather[ring_slot] + n * hidden * 2 else if (f.gather_sum and f.ablate == null) f.gatherBuffer() + gathered_bytes else if (f.moe_post) ws.moe_pipe_gather[ring_slot] + f.rank * n * hidden * 2 else if (f.moePipeEnabled()) ws.moe_pipe_src[ring_slot] else f.gatherBuffer() + gathered_bytes;
                 var legacy_lowrank_k = f.k.glue53;
                 legacy_lowrank_k.decode_fast = false;
                 // Between this blockPost and its pdone event, main-stream work only produces later pieces'
@@ -3126,22 +3431,58 @@ pub const Forward = struct {
                 try f.profileSync();
                 try profile.collect();
             };
-            group_at = group_end;
+    }
+
+    /// One dense layer. Levels 0 and 1 run attention then the dense FFN on the main stream, so the attention-output
+    /// gather is a synchronous main-stream AllGather. Level 2 issues that gather on the pipe stream and finishes the
+    /// prior piece first, so one piece's attention covers the prior piece's gather; `off` keeps each in-flight piece's
+    /// xn rows distinct (`ws.xn` is carved for expert_rows).
+    fn denseLayer(f: *const Forward, l: weights.DeviceLayer, plane: usize, mode: Mode, positions: []const usize, ordinal: usize, next: ?usize, pending_moe: *MoePipePendingSet) !void {
+        const ws = &f.st.ws;
+        const piped = f.gather_ovl >= 2 and f.piecePipeEnabled() and f.ablate == null and f.st.tbo_stream != null and
+            f.st.pipe_ready[0] != null and f.st.pipe_done[0] != null and ws.expert_rows != 0;
+        std.debug.assert(!piped or ws.expert_rows != 0);
+        var at: usize = 0;
+        var pending: ?PipePending = null;
+        var piece_ordinal: usize = 0;
+        while (at < positions.len) {
+            const p = pieceAt(mode, positions, ws.piece_rows, at);
+            if (f.moePipeEnabled()) try f.finishMoePendingFor(pending_moe, p);
+            if (!piped) {
+                try f.attention(l, plane, mode, positions, p, ordinal, next, 0, false, false, null);
+                try f.ffn(l, p, mode, 0);
+                at = p.end;
+                continue;
+            }
+            const off = p.start % ws.expert_rows;
+            const ring_slot = piece_ordinal % 2;
+            try f.attention(l, plane, mode, positions, p, ordinal, next, off, false, false, ring_slot);
+            if (pending) |previous| {
+                try f.reduceFinish(previous.p, previous.off, previous.slot, l.post_norm, l.index);
+                try f.ffn(l, previous.p, mode, previous.off);
+            }
+            pending = .{ .p = p, .off = off, .slot = ring_slot };
+            at = p.end;
+            piece_ordinal += 1;
+        }
+        if (pending) |last| {
+            try f.reduceFinish(last.p, last.off, last.slot, l.post_norm, l.index);
+            try f.ffn(l, last.p, mode, last.off);
         }
     }
 
     /// One piece's FFN consumes the normalized attention output, then runs MoE or dense MLP -> TP sum -> residual.
-    fn ffn(f: *const Forward, l: weights.DeviceLayer, p: Chunk, mode: Mode) !void {
-        return f.ffnNorm(l, p, mode, null);
+    fn ffn(f: *const Forward, l: weights.DeviceLayer, p: Chunk, mode: Mode, xn_off: usize) !void {
+        return f.ffnNorm(l, p, mode, xn_off, null);
     }
 
-    fn ffnNorm(f: *const Forward, l: weights.DeviceLayer, p: Chunk, mode: Mode, next_norm: ?u64) !void {
+    fn ffnNorm(f: *const Forward, l: weights.DeviceLayer, p: Chunk, mode: Mode, xn_off: usize, next_norm: ?u64) !void {
         // Decode side stream for the key path and shared expert after bertholomus/TensorFold glm-dsa-tp4 commit f14e7f7 (Apache-2.0, Albert Lee); independent Zig.
         const ws = &f.st.ws;
         const k = f.k;
         const s = f.stream;
         const n = p.end - p.start;
-        const xn = ws.xn + f.tbo_xn_off * hidden * 2;
+        const xn = ws.xn + xn_off * hidden * 2;
         const scratch: mlp.Scratch = .{ .gate_up = ws.mlp_gate_up, .activation = ws.mlp_act, .mm_part = ws.lane_part };
         const out = f.slot(n);
         const dense = switch (l.ffn) { .dense => true, .moe => false };
@@ -3200,14 +3541,14 @@ pub const Forward = struct {
                 if (mode == .decode) if (f.l2pf) |pf| try pf.fork(f.stream, l.index, .n);
                 if (next_norm) |norm_w| {
                     try f.reduceAddNorm(p, moe_out, norm_w, .{ .mode = mode, .layer = l.index, .stage = .moe_comm });
-                } else try f.reduce(p, .moe_partial, moe_out, true, null, 0, .{ .mode = mode, .layer = l.index, .stage = .moe_comm });
+                } else try f.reduce(p, .moe_partial, moe_out, true, null, xn_off, .{ .mode = mode, .layer = l.index, .stage = .moe_comm });
                 if (f.tbo_half == null) if (f.ablate) |ab| if (ab.vec(l.index, .ffn)) |v| try ab.launch(f.k.ablate.?, f.stream, ws.x + p.start * hidden * 2, ws.gathered, .bf16_parts, v, n, 0, 0, f.w.config.eps);
                 return;
             },
         }
         if (dense) try f.profileEnd(mode, l.index, .dense_mlp);
         if (mode == .decode) if (f.l2pf) |pf| try pf.fork(f.stream, l.index, .n);
-        try f.reduce(p, .moe_partial, out, false, next_norm, 0, if (dense) .{ .mode = mode, .layer = l.index, .stage = .dense_comm } else null);
+        try f.reduce(p, .moe_partial, out, false, next_norm, xn_off, if (dense) .{ .mode = mode, .layer = l.index, .stage = .dense_comm } else null);
         if (f.tbo_half == null) if (f.ablate) |ab| if (ab.vec(l.index, .ffn)) |v| try ab.launch(f.k.ablate.?, f.stream, ws.x + p.start * hidden * 2, ws.gathered, .f32_parts, v, n, 0, 0, f.w.config.eps);
     }
 
@@ -3480,6 +3821,46 @@ test "piece ordinals follow pieces for aligned and unaligned groups" {
     try std.testing.expectEqual(@as(usize, 1), pieceOrdinals(&short, 512, 0, short.len, &short_ordinal));
     try std.testing.expectEqual(@as(usize, 0), short_ordinal[0]);
 }
+
+test "a prompt spanning an adaptive group then plain groups cuts 1024 then 512" {
+    var positions: [8192]usize = undefined;
+    for (&positions, 0..) |*position, i| position.* = i;
+    var group_at: usize = 0;
+    var group_count: usize = 0;
+    var first_pieces: [8]usize = undefined;
+    var plain_pieces: [8]usize = undefined;
+    while (group_at < positions.len) {
+        const moe_group = moeGroupAt(&positions, group_at, 1024, 1024, 4096, 4096);
+        if (group_count == 0) {
+            try std.testing.expect(moe_group.adapt);
+            try std.testing.expectEqual(@as(usize, 4096), moe_group.end);
+            try std.testing.expectEqual(@as(usize, 4096), moe_group.rows);
+            try std.testing.expectEqual(@as(usize, 1024), moe_group.piece_rows);
+            try std.testing.expectEqual(@as(usize, 4), pieceOrdinals(&positions, moe_group.piece_rows, group_at, moe_group.end, &first_pieces));
+        } else {
+            try std.testing.expect(!moe_group.adapt);
+            try std.testing.expectEqual(@as(usize, 1024), moe_group.rows);
+            try std.testing.expectEqual(@as(usize, 512), moe_group.piece_rows);
+            if (group_count == 1) {
+                try std.testing.expectEqual(@as(usize, 1024), moe_group.end - group_at);
+                try std.testing.expectEqual(@as(usize, 2), pieceOrdinals(&positions, moe_group.piece_rows, group_at, moe_group.end, &plain_pieces));
+            }
+        }
+        group_at = moe_group.end;
+        group_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 5), group_count);
+}
+
+test "an adaptive group that would cross the adapt limit falls back to a plain group" {
+    var positions: [2048]usize = undefined;
+    for (&positions, 0..) |*position, i| position.* = 3500 + i;
+    const moe_group = moeGroupAt(&positions, 0, 1024, 1024, 4096, 3600);
+    try std.testing.expect(!moe_group.adapt);
+    try std.testing.expectEqual(@as(usize, 512), moe_group.piece_rows);
+    try std.testing.expect(moe_group.end <= 1024);
+}
+
 
 test "packed query pair layout preserves byte-identical QA and QPE views" {
     const qa = [_]u8{ 0, 1, 2, 3, 4, 5 };

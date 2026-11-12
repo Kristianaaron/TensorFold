@@ -19,6 +19,7 @@
 #include <stdint.h>
 
 #include "../qmm_frag.cuh"
+#include "rope.cuh"
 
 namespace tf_glm53_w8a8 {
 
@@ -227,10 +228,10 @@ tf_glm53_w8a8_gemm(const uint8_t* __restrict__ xq, const float* __restrict__ xs,
         }
 }
 
-// Bench-only copies of tf_glm53_w8a8_gemm. The release kernel above is unchanged.
-// One template. The switch is the mode: knock-outs (dx_*) may tear or ignore K, and the same-bits
-// modes (sc, s6, pf8, pf16, o2, m64) keep each output's products, K order and __fmaf_rn chain.
-// A row's chain does not read its tile-mates, the ring depth, or which CTA owns the row.
+// Copies of tf_glm53_w8a8_gemm for the bench modes and TF_GLM53_IQ_FOLD. The release kernel above is unchanged.
+// One template. The switch is the mode: knock-outs (dx_*) may tear or ignore K, the same-bits modes
+// (sc, s6, pf8, pf16, o2, m64, iq, m64_iq) keep each output's products, K order and __fmaf_rn chain, and iq
+// adds index_q's epilogue. A row's chain does not read its tile-mates, the ring depth, or which CTA owns the row.
 //
 // smem, GB10 cap 101376 B a CTA:
 //   s6 ring is 6 * 16384 = 98304. Scales stay on __ldg (0 B). 98304 <= 101376, so 6 stages, not 5.
@@ -251,6 +252,8 @@ enum Mode : int {
     PF16 = 8,
     O2 = 9,
     M64 = 10,
+    IQ = 11,
+    M64_IQ = 12,
 };
 
 static_assert(6 * 16384 == 98304 && 98304 <= 101376, "s6 ring fits, scales not in smem");
@@ -294,15 +297,17 @@ __device__ __forceinline__ void prefetch_ahead(const uint8_t* xq, const uint8_t*
 template <int MODE>
 __device__ __forceinline__ void body(const uint8_t* __restrict__ xq, const float* __restrict__ xs, const uint8_t* __restrict__ w,
                                     const float* __restrict__ ws, void* __restrict__ out, int M, int N, int K, int out_f32,
-                                    unsigned char* smem) {
+                                    const long long* __restrict__ positions, const float* __restrict__ cos,
+                                    const float* __restrict__ sin, unsigned char* smem) {
     namespace base = tf_glm53_w8a8;
     constexpr bool dx_l2 = MODE == DX_L2;
     constexpr bool dx_noscale = MODE == DX_NOSCALE;
     constexpr bool dx_mma = MODE == DX_MMA;
     constexpr bool dx_nosync = MODE == DX_NOSYNC;
     constexpr bool scale_pipe = MODE == SC;
+    constexpr bool iq = MODE == IQ or MODE == M64_IQ;
     constexpr int prefetch = MODE == PF8 ? 8 : MODE == PF16 ? 16 : 0;
-    constexpr int BM = MODE == M64 ? 64 : base::BM;
+    constexpr int BM = MODE == M64 or MODE == M64_IQ ? 64 : base::BM;
     constexpr int BN = base::BN;
     constexpr int BK = base::BK;
     constexpr int STAGES = MODE == S6 ? 6 : MODE == O2 ? 3 : base::STAGES;
@@ -322,7 +327,14 @@ __device__ __forceinline__ void body(const uint8_t* __restrict__ xq, const float
     if constexpr (scale_pipe) static_assert(STAGES * SCALE_SLOT == 2112, "sc bytes");
     if constexpr (MODE == S6) static_assert(STAGES * STAGE == 98304, "s6 bytes");
     if constexpr (MODE == O2) static_assert(STAGES * STAGE == 49152, "o2 bytes");
-    if constexpr (MODE == M64) static_assert(BM == 64 && MT == 2 && STAGES == 4, "m64 tile");
+    if constexpr (MODE == M64 or MODE == M64_IQ) static_assert(BM == 64 && MT == 2 && STAGES == 4, "m64 tile");
+    if constexpr (MODE == IQ) static_assert(BM == 128 && MT == 4 && STAGES == 4, "iq tile");
+    // index_q reads only the row's cos/sin; positions is the engine's absolute row table, carried for signature parity.
+    (void)positions;
+    if constexpr (!iq) {
+        (void)cos;
+        (void)sin;
+    }
 
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm = warp / WN, wn = warp % WN;
@@ -509,7 +521,25 @@ __device__ __forceinline__ void body(const uint8_t* __restrict__ xq, const float
                 const int row = m0 + wm * (BM / WM) + i * 16 + g + h * 8;
                 if (row >= M) continue;
                 const size_t o = static_cast<size_t>(row) * N + col;
-                if (out_f32) {
+                if constexpr (iq) {
+                    // index_q's input is the GEMM's stored bf16 row, so round both accumulators first and then
+                    // apply its pair math (rope.cuh, the same helpers index.cu calls). Pair 2p,2p+1 of the CTA's
+                    // 128-wide head is one rope pair for p < 32; dims 64..127 copy the stored bf16 unchanged.
+                    const __nv_bfloat16 y0 = __float2bfloat16_rn(acc[i][j][2 * h]);
+                    const __nv_bfloat16 y1 = __float2bfloat16_rn(acc[i][j][2 * h + 1]);
+                    const int pair = (col - n0) >> 1;
+                    __nv_bfloat16* qout = static_cast<__nv_bfloat16*>(out);
+                    if (pair < 32) {
+                        const float c = __ldg(cos + static_cast<size_t>(row) * 32 + pair);
+                        const float s = __ldg(sin + static_cast<size_t>(row) * 32 + pair);
+                        const float x0 = __bfloat162float(y0), x1 = __bfloat162float(y1);
+                        qout[o] = __float2bfloat16_rn(glm53_rope::even(x0, c, x1, s));
+                        qout[o + 1] = __float2bfloat16_rn(glm53_rope::odd(x1, c, x0, s));
+                    } else {
+                        qout[o] = y0;
+                        qout[o + 1] = y1;
+                    }
+                } else if (out_f32) {
                     *reinterpret_cast<float2*>(static_cast<float*>(out) + o) = make_float2(acc[i][j][2 * h], acc[i][j][2 * h + 1]);
                 } else {
                     *reinterpret_cast<__nv_bfloat162*>(static_cast<__nv_bfloat16*>(out) + o) =
@@ -526,7 +556,19 @@ __device__ __forceinline__ void body(const uint8_t* __restrict__ xq, const float
                                                                 const uint8_t* __restrict__ w, const float* __restrict__ ws,         \
                                                                 void* __restrict__ out, int M, int N, int K, int out_f32) {          \
         extern __shared__ __align__(128) unsigned char smem[];                                                                        \
-        tf_glm53_w8f::body<tf_glm53_w8f::mode>(xq, xs, w, ws, out, M, N, K, out_f32, smem);                                          \
+        tf_glm53_w8f::body<tf_glm53_w8f::mode>(xq, xs, w, ws, out, M, N, K, out_f32, nullptr, nullptr, nullptr, smem);                \
+    }
+
+// TF_GLM53_IQ_FOLD: the wq_b GEMM plus index_q's epilogue into the indexer query. positions is the engine's
+// absolute row table (index_q's math reads only cos/sin by local row); out is bf16, the dtype index_q reads.
+#define W8F_IQ_KERNEL(sym, mode, minb)                                                                                                 \
+    extern "C" __global__ void __launch_bounds__(256, minb) sym(const uint8_t* __restrict__ xq, const float* __restrict__ xs,         \
+                                                                const uint8_t* __restrict__ w, const float* __restrict__ ws,         \
+                                                                void* __restrict__ out, int M, int N, int K, int out_f32,            \
+                                                                const long long* __restrict__ positions,                            \
+                                                                const float* __restrict__ cos, const float* __restrict__ sin) {      \
+        extern __shared__ __align__(128) unsigned char smem[];                                                                        \
+        tf_glm53_w8f::body<tf_glm53_w8f::mode>(xq, xs, w, ws, out, M, N, K, out_f32, positions, cos, sin, smem);                      \
     }
 
 W8F_KERNEL(tf_glm53_w8a8_dx_l2, DX_L2, 1)
@@ -539,5 +581,8 @@ W8F_KERNEL(tf_glm53_w8a8_gemm_pf8, PF8, 1)
 W8F_KERNEL(tf_glm53_w8a8_gemm_pf16, PF16, 1)
 W8F_KERNEL(tf_glm53_w8a8_gemm_o2, O2, 2)
 W8F_KERNEL(tf_glm53_w8a8_gemm_m64, M64, 1)
+W8F_IQ_KERNEL(tf_glm53_w8a8_gemm_iq, IQ, 1)
+W8F_IQ_KERNEL(tf_glm53_w8a8_gemm_m64_iq, M64_IQ, 1)
 
 #undef W8F_KERNEL
+#undef W8F_IQ_KERNEL

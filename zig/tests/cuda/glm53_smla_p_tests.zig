@@ -28,7 +28,7 @@ const partial_row_bytes = o_row_bytes + lse_row_bytes;
 const lse_tol = 1e-4;
 
 const Shape = struct { rows: usize, rank: usize, start: usize };
-const Kernel = enum { mma, smla, fp8, p3 };
+const Kernel = enum { mma, smla, fp8, p3, k8 };
 
 fn label(kernel: Kernel) []const u8 {
     return switch (kernel) {
@@ -36,6 +36,7 @@ fn label(kernel: Kernel) []const u8 {
         .smla => "smla_p",
         .fp8 => "smla_fp8",
         .p3 => "smla_p3",
+        .k8 => "smla_k8",
     };
 }
 
@@ -44,6 +45,7 @@ pub fn run(gpu: anytype) !void {
     defer module.unload();
     var kernels = try mla.Mla.load(module);
     kernels.attend_kernel = .mma;
+    try kernels.loadSmlaK8(module);
     var stream = try cuda.Stream.init(gpu.d, false);
     defer stream.deinit();
     // Positions are consecutive prompt positions from `start`: 1 sparse row (7500) or 1 dense row (1000); 7 rows
@@ -65,6 +67,9 @@ const Inputs = struct {
     latent: u64,
     rope: u64,
     stage: types.StagePlanePair,
+    /// SMLA-K8 only: owner and stage e4m3 copies (mla.smla_k8_row_bytes a slot).
+    copy: u64,
+    stage_copy: u64,
     positions: u64,
     tokens: u64,
     slots: u64,
@@ -90,6 +95,7 @@ const Inputs = struct {
             .smla => try kernels.attendSmlaP(stream, qa, qpe, inputs.latent, inputs.rope, inputs.stage, pos, tok, sl, gc, lc, dl, out, n, 32, rank, world),
             .fp8 => try kernels.attendSmlaPFp8(stream, qa, qpe, inputs.latent, inputs.rope, inputs.stage, pos, tok, sl, gc, lc, dl, out, n, 32, rank, world),
             .p3 => try kernels.attendSmlaP3(stream, qa, qpe, inputs.latent, inputs.rope, inputs.stage, pos, tok, sl, gc, lc, dl, out, n, 32, rank, world, inputs.table, inputs.table_bytes),
+            .k8 => try kernels.attendSmlaK8(stream, qa, qpe, inputs.latent, inputs.rope, inputs.stage, inputs.copy, inputs.stage_copy, pos, tok, sl, gc, lc, dl, out, n, 32, rank, world),
         }
     }
 };
@@ -207,6 +213,10 @@ fn runShape(gpu: anytype, stream: cuda.Stream, kernels: *const mla.Mla, shape: S
     defer dstage_latent.free();
     var dstage_rope = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(stage_rope));
     defer dstage_rope.free();
+    var dcopy = try cuda.DeviceBuffer.alloc(gpu.d, cache_rows * mla.smla_k8_row_bytes);
+    defer dcopy.free();
+    var dstage_copy = try cuda.DeviceBuffer.alloc(gpu.d, cache_rows * mla.smla_k8_row_bytes);
+    defer dstage_copy.free();
     var dpositions = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(positions));
     defer dpositions.free();
     var dtokens = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(tokens));
@@ -228,6 +238,8 @@ fn runShape(gpu: anytype, stream: cuda.Stream, kernels: *const mla.Mla, shape: S
             .latent = .{ .data = dstage_latent, .dtype = .bf16, .rows = cache_rows, .cols = mla.latent_dim, .stride = mla.latent_dim },
             .rope = .{ .data = dstage_rope, .dtype = .bf16, .rows = cache_rows, .cols = mla.rope_dim, .stride = mla.rope_dim },
         },
+        .copy = dcopy.ptr,
+        .stage_copy = dstage_copy.ptr,
         .positions = dpositions.ptr,
         .tokens = dtokens.ptr,
         .slots = dslots.ptr,
@@ -235,6 +247,8 @@ fn runShape(gpu: anytype, stream: cuda.Stream, kernels: *const mla.Mla, shape: S
         .local_counts = dlocal_counts.ptr,
         .dense_len = ddense_len.ptr,
     };
+    try kernels.quantK8(stream, dlatent.ptr, drope.ptr, dcopy.ptr, 0, cache_rows);
+    try kernels.quantK8(stream, dstage_latent.ptr, dstage_rope.ptr, dstage_copy.ptr, 0, cache_rows);
 
     var dref = try cuda.DeviceBuffer.alloc(gpu.d, rows * partial_row_bytes);
     defer dref.free();
@@ -242,9 +256,12 @@ fn runShape(gpu: anytype, stream: cuda.Stream, kernels: *const mla.Mla, shape: S
     defer dgot.free();
     var dfp8 = try cuda.DeviceBuffer.alloc(gpu.d, rows * partial_row_bytes);
     defer dfp8.free();
+    var dk8 = try cuda.DeviceBuffer.alloc(gpu.d, rows * partial_row_bytes);
+    defer dk8.free();
     try inputs.launch(kernels, stream, .mma, 0, rows, dref.ptr, shape.rank);
     try inputs.launch(kernels, stream, .smla, 0, rows, dgot.ptr, shape.rank);
     try inputs.launch(kernels, stream, .fp8, 0, rows, dfp8.ptr, shape.rank);
+    try inputs.launch(kernels, stream, .k8, 0, rows, dk8.ptr, shape.rank);
     try stream.synchronize();
     const ref = try download(gpu, dref);
     defer gpu.gpa.free(ref);
@@ -252,12 +269,17 @@ fn runShape(gpu: anytype, stream: cuda.Stream, kernels: *const mla.Mla, shape: S
     defer gpu.gpa.free(got);
     const fp8 = try download(gpu, dfp8);
     defer gpu.gpa.free(fp8);
+    const k8 = try download(gpu, dk8);
+    defer gpu.gpa.free(k8);
     try compareParity(ref, got, shape, overlap, loads);
     try compareFp8(got, fp8, shape);
+    try expectLseK8(fp8, k8, shape);
+    try compareK8(got, k8, shape);
     const host: Host = .{ .q = q, .qp = qp, .latent = latent, .rope = rope, .stage_latent = stage_latent, .stage_rope = stage_rope, .positions = positions, .tokens = tokens, .counts = global_counts };
     try emulateFp8(gpu.gpa, host, got, fp8, shape);
     try invariance(gpu, stream, kernels, inputs, got, shape, .smla);
     try invariance(gpu, stream, kernels, inputs, fp8, shape, .fp8);
+    try invariance(gpu, stream, kernels, inputs, k8, shape, .k8);
     if (rows == 512 and shape.rank == 0) try bench(gpu, stream, kernels, inputs, .{ dref.ptr, dgot.ptr, dfp8.ptr }, shape, visible_keys);
 }
 
@@ -516,6 +538,70 @@ fn compareFp8(ref: []const u8, got: []const u8, shape: Shape) !void {
     std.debug.print("PASS glm53-smla-fp8 vs smla_p rows={d} rank={d}: nmse <= {e:.1}, lse max abs <= {d}, empty rows exact\n", .{ rows, shape.rank, fp8_nmse_max, fp8_lse_max });
 }
 
+/// LSE bit-exactness against SMLA-FP8 on every row-head: the K8 scores and softmax are the FP8 ones, so any difference
+/// is a broken copy row, key scale or score layout.
+fn expectLseK8(fp8: []const u8, k8: []const u8, shape: Shape) !void {
+    const rows = shape.rows;
+    const el = std.mem.bytesAsSlice(u32, @as([]align(1) const u8, fp8[rows * o_row_bytes ..][0 .. rows * lse_row_bytes]));
+    const kl = std.mem.bytesAsSlice(u32, @as([]align(1) const u8, k8[rows * o_row_bytes ..][0 .. rows * lse_row_bytes]));
+    for (el, kl, 0..) |a, b, i| {
+        if (a == b) continue;
+        std.debug.print("FAIL glm53-smla-k8 lse rows={d} rank={d} start={d}: row {d} head {d}: smla_fp8 {d} smla_k8 {d}\n", .{ rows, shape.rank, shape.start, i / 32, i % 32, @as(f32, @bitCast(a)), @as(f32, @bitCast(b)) });
+        return error.TestFailed;
+    }
+    std.debug.print("PASS glm53-smla-k8 lse rows={d} rank={d} start={d}: LSE bit-exact to smla_fp8 on {d} row-heads\n", .{ rows, shape.rank, shape.start, rows * 32 });
+}
+
+/// SMLA-K8 vs bf16 SMLA-P over every row-head, the same bounds as compareFp8 (nmse <= 0.03, LSE max abs <= 0.25).
+fn compareK8(ref: []const u8, got: []const u8, shape: Shape) !void {
+    const rows = shape.rows;
+    const ro = std.mem.bytesAsSlice(u16, @as([]align(1) const u8, ref[0 .. rows * o_row_bytes]));
+    const go = std.mem.bytesAsSlice(u16, @as([]align(1) const u8, got[0 .. rows * o_row_bytes]));
+    const rl = std.mem.bytesAsSlice(f32, @as([]align(1) const u8, ref[rows * o_row_bytes ..][0 .. rows * lse_row_bytes]));
+    const gl = std.mem.bytesAsSlice(f32, @as([]align(1) const u8, got[rows * o_row_bytes ..][0 .. rows * lse_row_bytes]));
+    var err2: f64 = 0;
+    var ref2: f64 = 0;
+    var max_abs: f64 = 0;
+    var lse_max: f64 = 0;
+    var lse_sum: f64 = 0;
+    var live: usize = 0;
+    var empty: usize = 0;
+    for (0..rows * 32) |rh| {
+        const a = rl[rh];
+        const b = gl[rh];
+        if (std.math.isInf(a) or std.math.isInf(b) or std.math.isNan(b)) {
+            var zeros = a == b;
+            for (0..mla.latent_dim) |d| zeros = zeros and ro[rh * mla.latent_dim + d] == 0 and go[rh * mla.latent_dim + d] == 0;
+            if (!zeros) {
+                std.debug.print("FAIL glm53-smla-k8 rows={d} rank={d}: empty row {d} head {d}: smla_p LSE {d} smla_k8 LSE {d}, outputs zero {}\n", .{ rows, shape.rank, rh / 32, rh % 32, a, b, zeros });
+                return error.TestFailed;
+            }
+            empty += 1;
+            continue;
+        }
+        const dl = @abs(@as(f64, a) - b);
+        lse_max = @max(lse_max, dl);
+        lse_sum += dl;
+        live += 1;
+        for (0..mla.latent_dim) |d| {
+            const i = rh * mla.latent_dim + d;
+            const rv: f64 = bf16Value(ro[i]);
+            const gv: f64 = bf16Value(go[i]);
+            err2 += (gv - rv) * (gv - rv);
+            ref2 += rv * rv;
+            max_abs = @max(max_abs, @abs(gv - rv));
+        }
+    }
+    const nmse = if (ref2 > 0) err2 / ref2 else 0;
+    const lse_mean = if (live > 0) lse_sum / @as(f64, @floatFromInt(live)) else 0;
+    std.debug.print("RESULT glm53-smla-k8 rows={d} rank={d}: vs smla_p out nmse={e:.3} max_abs={e:.3}; lse max_abs={e:.3} mean_abs={e:.3}; live row-heads {d}, empty {d}\n", .{ rows, shape.rank, nmse, max_abs, lse_max, lse_mean, live, empty });
+    if (!(nmse <= fp8_nmse_max) or !(lse_max <= fp8_lse_max)) {
+        std.debug.print("FAIL glm53-smla-k8 rows={d} rank={d}: out nmse {e:.3} (bound {e:.1}) or lse max abs {e:.3} (bound {d}) out of the sanity bounds\n", .{ rows, shape.rank, nmse, fp8_nmse_max, lse_max, fp8_lse_max });
+        return error.TestFailed;
+    }
+    std.debug.print("PASS glm53-smla-k8 vs smla_p rows={d} rank={d}: nmse <= {e:.1}, lse max abs <= {d}, empty rows exact\n", .{ rows, shape.rank, fp8_nmse_max, fp8_lse_max });
+}
+
 const Host = struct {
     q: []const u16,
     qp: []const u16,
@@ -747,6 +833,7 @@ pub fn runP3(gpu: anytype) !void {
     defer module.unload();
     var kernels = try mla.Mla.load(module);
     kernels.attend_kernel = .mma;
+    try kernels.loadSmlaK8(module);
     try kernels.loadSmlaP3(module);
     var stream = try cuda.Stream.init(gpu.d, false);
     defer stream.deinit();
@@ -866,6 +953,10 @@ fn runShapeP3(gpu: anytype, stream: cuda.Stream, kernels: *const mla.Mla, case: 
     defer dstage_latent.free();
     var dstage_rope = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(stage_rope));
     defer dstage_rope.free();
+    var dcopy = try cuda.DeviceBuffer.alloc(gpu.d, cache_rows * mla.smla_k8_row_bytes);
+    defer dcopy.free();
+    var dstage_copy = try cuda.DeviceBuffer.alloc(gpu.d, cache_rows * mla.smla_k8_row_bytes);
+    defer dstage_copy.free();
     var dpositions = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(positions));
     defer dpositions.free();
     var dtokens = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(tokens));
@@ -892,6 +983,8 @@ fn runShapeP3(gpu: anytype, stream: cuda.Stream, kernels: *const mla.Mla, case: 
             .latent = .{ .data = dstage_latent, .dtype = .bf16, .rows = cache_rows, .cols = mla.latent_dim, .stride = mla.latent_dim },
             .rope = .{ .data = dstage_rope, .dtype = .bf16, .rows = cache_rows, .cols = mla.rope_dim, .stride = mla.rope_dim },
         },
+        .copy = dcopy.ptr,
+        .stage_copy = dstage_copy.ptr,
         .positions = dpositions.ptr,
         .tokens = dtokens.ptr,
         .slots = dslots.ptr,
@@ -901,12 +994,18 @@ fn runShapeP3(gpu: anytype, stream: cuda.Stream, kernels: *const mla.Mla, case: 
         .table = dtable.ptr,
         .table_bytes = dtable.len,
     };
+    try kernels.quantK8(stream, dlatent.ptr, drope.ptr, dcopy.ptr, 0, cache_rows);
+    try kernels.quantK8(stream, dstage_latent.ptr, dstage_rope.ptr, dstage_copy.ptr, 0, cache_rows);
 
     // Distinct fill bytes so an output position P3 fails to write cannot match SMLA-P's by accident.
     var dref = try cuda.DeviceBuffer.alloc(gpu.d, rows * partial_row_bytes);
     defer dref.free();
     var dgot = try cuda.DeviceBuffer.alloc(gpu.d, rows * partial_row_bytes);
     defer dgot.free();
+    var dfp8 = try cuda.DeviceBuffer.alloc(gpu.d, rows * partial_row_bytes);
+    defer dfp8.free();
+    var dk8 = try cuda.DeviceBuffer.alloc(gpu.d, rows * partial_row_bytes);
+    defer dk8.free();
     try dref.fill8(0x11, stream.handle);
     try dgot.fill8(0x77, stream.handle);
     try inputs.launch(kernels, stream, .smla, 0, rows, dref.ptr, shape.rank);
@@ -926,7 +1025,7 @@ fn runShapeP3(gpu: anytype, stream: cuda.Stream, kernels: *const mla.Mla, case: 
     const again = try download(gpu, dgot);
     defer gpu.gpa.free(again);
     try expectBytesP3(ref, again, shape);
-    if (case.bench) try benchP3(gpu, stream, kernels, inputs, .{ dref.ptr, dgot.ptr }, shape, visible_keys);
+    if (case.bench) try benchP3(gpu, stream, kernels, inputs, .{ dref.ptr, dfp8.ptr, dgot.ptr, dk8.ptr }, shape, visible_keys);
 }
 
 /// The whole [rows][32][512] BF16 output plane and [rows][32] FP32 LSE plane, byte for byte.
@@ -951,15 +1050,15 @@ fn expectBytesP3(ref: []const u8, got: []const u8, shape: Shape) !void {
     return error.TestFailed;
 }
 
-/// BENCH: SMLA-P vs SMLA-P3 (union pre-kernel + attend) vs the union pre-kernel alone, 2 warm-ups then 10 timed
-/// launches each.
-fn benchP3(gpu: anytype, stream: cuda.Stream, kernels: *const mla.Mla, inputs: Inputs, outs: [2]u64, shape: Shape, visible_keys: usize) !void {
+/// BENCH: SMLA-P vs SMLA-FP8 vs SMLA-P3 (union pre-kernel + attend) and SMLA-K8, 2 warm-ups then 10 timed launches
+/// each, then the K8 copy writer over every populated key slot.
+fn benchP3(gpu: anytype, stream: cuda.Stream, kernels: *const mla.Mla, inputs: Inputs, outs: [4]u64, shape: Shape, visible_keys: usize) !void {
     var e0 = try cuda.Event.init(gpu.d, true);
     defer e0.deinit();
     var e1 = try cuda.Event.init(gpu.d, true);
     defer e1.deinit();
-    var us: [2]f64 = undefined;
-    for ([_]Kernel{ .smla, .p3 }, outs, 0..) |kernel, out, idx| {
+    var us: [4]f64 = undefined;
+    for ([_]Kernel{ .smla, .fp8, .p3, .k8 }, outs, 0..) |kernel, out, idx| {
         for (0..12) |i| {
             if (i == 2) try e0.record(stream);
             try inputs.launch(kernels, stream, kernel, 0, shape.rows, out, shape.rank);
@@ -979,6 +1078,16 @@ fn benchP3(gpu: anytype, stream: cuda.Stream, kernels: *const mla.Mla, inputs: I
     try e1.record(stream);
     try stream.synchronize();
     const union_us = @as(f64, try e0.elapsedMs(e1)) * 1000.0 / 10.0;
+    // The K8 copy writer over the whole populated key range (one plane).
+    for (0..12) |i| {
+        if (i == 2) try e0.record(stream);
+        try kernels.quantK8(stream, inputs.latent, inputs.rope, inputs.copy, 0, cache_rows);
+    }
+    try e1.record(stream);
+    try stream.synchronize();
+    const quant_us = @as(f64, try e0.elapsedMs(e1)) * 1000.0 / 10.0;
     const flops = @as(f64, @floatFromInt(visible_keys)) * 32.0 * (576.0 + 512.0) * 2.0;
-    std.debug.print("BENCH glm53-smla-p3 rows={d} start={d} ({d} visible keys): smla_p {d:.1} us ({d:.2} TFLOPS), smla_p3 {d:.1} us ({d:.2} TFLOPS; union {d:.1} us + attend {d:.1} us), speedup {d:.2}x\n", .{ shape.rows, shape.start, visible_keys, us[0], flops / us[0] * 1e-6, us[1], flops / us[1] * 1e-6, union_us, us[1] - union_us, us[0] / us[1] });
+    std.debug.print("BENCH glm53-smla-p3 rows={d} start={d} ({d} visible keys): smla_p {d:.1} us ({d:.2} TFLOPS), smla_p3 {d:.1} us ({d:.2} TFLOPS; union {d:.1} us + attend {d:.1} us), speedup {d:.2}x\n", .{ shape.rows, shape.start, visible_keys, us[0], flops / us[0] * 1e-6, us[2], flops / us[2] * 1e-6, union_us, us[2] - union_us, us[0] / us[2] });
+    std.debug.print("BENCH glm53-smla-k8 rows={d} | p {d:.1} | fp8 {d:.1} | p3 {d:.1} | k8 {d:.1} us | k8/p3 {d:.3}\n", .{ shape.rows, us[0], us[1], us[2], us[3], us[3] / us[2] });
+    std.debug.print("BENCH glm53-smla-k8 quant keys={d} {d:.1} us\n", .{ cache_rows, quant_us });
 }

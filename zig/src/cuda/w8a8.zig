@@ -35,6 +35,8 @@ pub const level2_k: usize = 6144;
 
 pub const quant_symbol: [:0]const u8 = "tf_glm53_w8a8_quant";
 pub const gemm_symbol: [:0]const u8 = "tf_glm53_w8a8_gemm";
+/// TF_GLM53_IQ_FOLD: the wq_b GEMM plus index_q's epilogue into the indexer query.
+pub const gemm_iq_symbol: [:0]const u8 = "tf_glm53_w8a8_gemm_iq";
 
 /// Where the e4m3 rows [m][k] and the scales [k/128][m] sit in one scratch span.
 pub const Scratch = struct { xq: u64, xs: u64 };
@@ -79,6 +81,7 @@ pub fn gemmBlocks(m: usize, n: usize) usize {
 
 /// The two kernels of one call; a value type so Forward's kernel table can hold it (the module stays with Kernels).
 pub const gemm_m64_symbol: [:0]const u8 = "tf_glm53_w8a8_gemm_m64";
+pub const gemm_m64_iq_symbol: [:0]const u8 = "tf_glm53_w8a8_gemm_m64_iq";
 pub const m64_tile_m: usize = 64;
 /// 4 ring stages of a 64-row activation tile (4,096 B) and a 128-column weight tile (8,192 B).
 pub const m64_shared: u32 = 4 * (64 * 64 + 128 * 64);
@@ -86,7 +89,9 @@ pub const m64_shared: u32 = 4 * (64 * 64 + 128 * 64);
 pub const Fns = struct {
     quant: Function,
     gemm: Function,
-    /// Dynamic shared memory and row-tile height of `gemm` (the release kernel unless Kernels.useM64 ran).
+    /// TF_GLM53_IQ_FOLD's wq_b entry: the same K loop and epilogue rounding, then index_q's pair math.
+    gemm_iq: Function,
+    /// Dynamic shared memory and row-tile height of `gemm` and `gemm_iq` (the release kernels unless Kernels.useM64 ran).
     gemm_smem: u32 = shared_bytes,
     gemm_tile_m: usize = tile_m,
 
@@ -133,6 +138,40 @@ pub const Fns = struct {
         try f.quantize(s, x, ldx, m, k, at.xq, at.xs);
         try f.gemmRows(s, at.xq, at.xs, w, y, m, out);
     }
+
+    /// TF_GLM53_IQ_FOLD: quantize then the `_iq` GEMM, writing index_q's query qi [m][w.n] (bf16).
+    /// The projected rows are not materialized; the epilogue reads each accumulator through the bf16 rounding
+    /// the non-folded GEMM would store, then applies index_q's own pair math.
+    pub fn runIq(f: Fns, s: Stream, x: u64, ldx: usize, m: usize, w: qmmf.Weight, qi: u64, positions: u64, cos: u64, sin: u64, scratch: u64, scratch_len: u64) !void {
+        if (!supports(w) or w.n % 128 != 0) return error.W8a8Weight;
+        const k: usize = w.k;
+        if (scratch_len < scratchBytes(m, k)) return error.W8a8Scratch;
+        const at = scratchAt(scratch, m, k);
+        try f.quantize(s, x, ldx, m, k, at.xq, at.xs);
+        try f.gemmRowsIq(s, at.xq, at.xs, w, qi, m, positions, cos, sin);
+    }
+
+    /// The `_iq` GEMM entry: the `gemmRows` launch shape and arguments, plus positions/cos/sin, bf16 qi output.
+    pub fn gemmRowsIq(f: Fns, s: Stream, xq: u64, xs: u64, w: qmmf.Weight, qi: u64, m: usize, positions: u64, cos: u64, sin: u64) !void {
+        if (!supports(w) or w.n % 128 != 0) return error.W8a8Weight;
+        if (m == 0) return;
+        var a: launch_.Args = .{};
+        a.add(xq);
+        a.add(xs);
+        a.add(w.codes);
+        a.add(w.scales);
+        a.add(qi);
+        a.add(@as(i32, @intCast(m)));
+        a.add(@as(i32, @intCast(w.n)));
+        a.add(@as(i32, @intCast(w.k)));
+        a.add(@as(i32, 0)); // out_f32: _iq writes bf16, the dtype index_q reads
+        a.add(positions);
+        a.add(cos);
+        a.add(sin);
+        const cols: usize = @intCast(w.n);
+        const blocks: usize = ((m + f.gemm_tile_m - 1) / f.gemm_tile_m) * ((cols + tile_n - 1) / tile_n);
+        try launch_.launch(f.gemm_iq, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = threads, .y = 1, .z = 1 }, .shared = f.gemm_smem }, s, &a);
+    }
 };
 
 /// The W8A8 image's module and its kernels.
@@ -152,15 +191,21 @@ pub const Kernels = struct {
     pub fn fromModule(mod: Module) !Kernels {
         const gemm = try mod.function(gemm_symbol);
         try gemm.allowDynamicShared(shared_bytes);
-        return .{ .mod = mod, .fns = .{ .quant = try mod.function(quant_symbol), .gemm = gemm } };
+        const gemm_iq = try mod.function(gemm_iq_symbol);
+        try gemm_iq.allowDynamicShared(shared_bytes);
+        return .{ .mod = mod, .fns = .{ .quant = try mod.function(quant_symbol), .gemm = gemm, .gemm_iq = gemm_iq } };
     }
 
-    /// TF_GLM53_W8_M64=1: the GEMM becomes tf_glm53_w8a8_gemm_m64 (64-row tiles, 49,152 B, two CTAs an SM; the
-    /// same products, K order and fma chain a row, so the same bits). Call before copying `fns`.
+    /// TF_GLM53_W8_M64=1: the GEMM becomes tf_glm53_w8a8_gemm_m64 and the fold entry its `_m64_iq` twin (64-row
+    /// tiles, 49,152 B, two CTAs an SM; the same products, K order and fma chain a row, so the same bits). Call
+    /// before copying `fns`.
     pub fn useM64(k: *Kernels) !void {
         const f = try k.mod.function(gemm_m64_symbol);
         try f.allowDynamicShared(m64_shared);
+        const iq = try k.mod.function(gemm_m64_iq_symbol);
+        try iq.allowDynamicShared(m64_shared);
         k.fns.gemm = f;
+        k.fns.gemm_iq = iq;
         k.fns.gemm_smem = m64_shared;
         k.fns.gemm_tile_m = m64_tile_m;
     }

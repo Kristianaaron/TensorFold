@@ -13,6 +13,7 @@ const oracle_tests = @import("oracle_tests.zig");
 const libs_tests = @import("libs_tests.zig");
 const rank_scatter_tests = @import("rank_scatter_tests.zig");
 const roce_gather_tests = @import("roce_gather_tests.zig");
+const glm53_gsum_tests = @import("glm53_gsum_tests.zig");
 const sample_tests = @import("sample_tests.zig");
 const glue_tests = @import("glue_tests.zig");
 const window_profile = @import("window_profile.zig");
@@ -88,6 +89,7 @@ const glm53_ra8_tests = @import("glm53_ra8_tests.zig");
 const glm53_fp8_backend_probe = @import("glm53_fp8_backend_probe");
 const glm53_prefill_bf16_tests = @import("glm53_prefill_bf16_tests.zig");
 const glm53_w8a8_tests = @import("glm53_w8a8_tests.zig");
+const glm53_iqf_tests = @import("glm53_iqf_tests.zig");
 const glm53_mk_tests = @import("glm53_mk_tests");
 const glm53_mk_moe_tests = @import("glm53_mk_moe_tests");
 const glm53_mk_attn_tests = @import("glm53_mk_attn_tests");
@@ -158,6 +160,8 @@ const usage =
     \\  roce-gather <rank>        two ranks (NCCL_COMM_ID): the RoCE all-gather against NCCL's, graph replays, time a call
     \\  glm53-partial-roce <rank>  16-row GLM attention partial bytes through RoCE against NCCL send/receive
     \\  roce-allreduce <rank>     GLM sizes R=1..8: RoCE vs NCCL bit equality, graph replay, median/p99 latency
+    \\  glm53-gsum                one-GPU emulated peer: rank-major gather + consumers vs one sum block (fp32
+    \\                            attention, bf16 MoE), bit for bit, then BENCH at 1024 rows
     \\  rank-sum                  the reduce-scatter's sum kernel alone, 2 to 5 ranks as each rank (one GPU, no NCCL)
     \\  nccl-pair <rank> <world> <idfile>  one rank of a multi-host communicator: send/recv with every peer, all-reduce, all-gather
     \\  gdn-replay <dir>          replay_kernel bits against the Python oracle's fixture
@@ -249,10 +253,13 @@ const usage =
     \\  glm53-p5ax             GLM-5.3 =10 vs =3 byte sweep: rows 1..2048, items 1..256, 4 routings, 2 rank weight sets, splits
     \\  glm53-p5a-bench        the shared P5 routed bench (=3 vs =10)
     \\  glm53-ra8              ROUTED-A8 e4m3 rotated activations against release pmx gate/up, bench
+    \\  glm53-ra8-ko           gu_w8s knockout timings (KO1/2/4/8/16/3/9/32/35/39/64/103/119/128 + empty) at rows 2048 and 4096
+    \\  glm53-dn-ko            down_w8s + xd_w8s knockout timings (KO1/2/4/16/32/64/35/39 + empty), p5a down full/no-epi, and epi/p5a_epi byte-checks + timings at rows 2048 and 4096
     \\  glm53-prefill            GLM-5.3 CUTLASS FP8 prefill shapes vs MMA, seeded and row-tiled
     \\  glm53-prefill-bf16       GLM-5.3 BF16 dequant/cuBLASLt prefill vs MMA and fixed-row chunk invariance
     \\  glm53-w8a8               GLM-5.3 TF_GLM53_PREFILL_W8A8 o_proj vs default qmmf: KLD-gate metrics, layout, row invariance, bench
     \\  glm53-w8a8-all           GLM-5.3 TF_GLM53_PREFILL_W8A8=2 shapes vs default qmmf: max abs, max rel, mean abs, bench
+    \\  glm53-iqf                GLM-5.3 TF_GLM53_IQ_FOLD wq_b `_iq` vs gemm+index_q: byte-equal query, rows 1..1024, bench
     \\  exl3 [dir]                EXL3 decode-row linear: float64 checks, row invariance, the Python engine's fixture (dir none skips it)
     \\  exl3-tp2 <rank> <host:port> [dir]  EXL3 tensor parallel: rank shards vs the Python engine's, all-gathered (dir none skips them)
     \\  exl3-tiles [DIR]          EXL3's tile candidate: codebooks and tiles bit-equal, FP64, rows through qlinear and Dense
@@ -344,6 +351,10 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "roce-gather")) return roce_gather_tests.run(gpu, try std.fmt.parseInt(usize, try arg(rest, 0), 10));
     if (std.mem.eql(u8, cmd, "glm53-partial-roce")) return roce_gather_tests.runGlmPartial(gpu, try std.fmt.parseInt(usize, try arg(rest, 0), 10));
     if (std.mem.eql(u8, cmd, "roce-allreduce")) return roce_gather_tests.runAllReduce(gpu, try std.fmt.parseInt(usize, try arg(rest, 0), 10));
+    if (std.mem.eql(u8, cmd, "glm53-gsum")) {
+        try glm53_gsum_tests.run(gpu);
+        return glm53_gsum_tests.bench(gpu, 1024);
+    }
     if (std.mem.eql(u8, cmd, "rank-sum")) return rank_scatter_tests.sum(gpu);
     if (std.mem.eql(u8, cmd, "nccl-pair")) return libs_tests.ncclPair(gpu, try std.fmt.parseInt(c_int, try arg(rest, 0), 10), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try arg(rest, 2));
     if (std.mem.eql(u8, cmd, "gdn-replay")) return oracle_tests.gdnReplay(gpu, try arg(rest, 0));
@@ -464,10 +475,13 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "glm53-p5ax")) return glm53_p5a_tests.sweep(gpu);
     if (std.mem.eql(u8, cmd, "glm53-p5a-bench")) return glm53_p5a_tests.bench(gpu);
     if (std.mem.eql(u8, cmd, "glm53-ra8")) return glm53_ra8_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "glm53-ra8-ko")) return glm53_ra8_tests.runKo(gpu);
+    if (std.mem.eql(u8, cmd, "glm53-dn-ko")) return glm53_ra8_tests.runDnKo(gpu);
     if (std.mem.eql(u8, cmd, "glm53-prefill")) return glm53_fp8_backend_probe.runPrefill(gpu);
     if (std.mem.eql(u8, cmd, "glm53-prefill-bf16")) return glm53_prefill_bf16_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm53-w8a8")) return glm53_w8a8_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm53-w8a8-all")) return glm53_w8a8_tests.runAll(gpu);
+    if (std.mem.eql(u8, cmd, "glm53-iqf")) return glm53_iqf_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm53-mk")) return glm53_mk_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm53-mk-moe")) return glm53_mk_moe_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm53-mk-attn")) return glm53_mk_attn_tests.run(gpu);

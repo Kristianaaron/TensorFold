@@ -5,6 +5,8 @@
 // Also see docs/roce-gather.md for this implementation's constraints.
 
 #include <stdint.h>
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
 
 namespace {
 
@@ -132,8 +134,132 @@ extern "C" __global__ void __launch_bounds__(512) roce_gather(
     }
 }
 
+__device__ __forceinline__ float roce_sum_to_f32(float v) { return v; }
+__device__ __forceinline__ float roce_sum_to_f32(__nv_bfloat16 v) { return __bfloat162float(v); }
+
+// A sum block keeps the shard's width: 4 fp32 or 8 bf16 values, either way one 16-B pack in and out.
+template <typename T> struct SumBlock { using type = __nv_bfloat16; };
+template <> struct SumBlock<float> { using type = float; };
+
+template <typename T>
+__device__ __forceinline__ T roce_sum_value(float a, float b);
+template <>
+__device__ __forceinline__ float roce_sum_value<float>(float a, float b) { return __fadd_rn(a, b); }
+template <>
+__device__ __forceinline__ __nv_bfloat16 roce_sum_value<__nv_bfloat16>(float a, float b) {
+    return __float2bfloat16_rn(__fadd_rn(a, b));
+}
+
+template <typename T>
+__device__ __forceinline__ T roce_sum_poison();
+template <>
+__device__ __forceinline__ float roce_sum_poison<float>() { return __uint_as_float(0x7fc00000u); }
+template <>
+__device__ __forceinline__ __nv_bfloat16 roce_sum_poison<__nv_bfloat16>() { return __ushort_as_bfloat16(0xffffu); }
+
+// The same staging, doorbell and peer wait as roce_gather, with one sum block instead of the rank-major pair.
+// s0 is rank 0's value and s1 rank 1's; fp32 keeps the single IEEE add, bf16 rounds that add once to bf16.
+template <typename T>
+__device__ __forceinline__ void roce_gather_sum_body(
+    const uint4* __restrict__ in, typename SumBlock<T>::type* __restrict__ out, int packs, int rank, char* recv,
+    char* flags, char* send, uint32_t* ctrl, long long slot_bytes, uint32_t* counters, int klass,
+    uint64_t timeout_ns, int n_hca) {
+    using O = typename SumBlock<T>::type;
+    const int tid = threadIdx.x;
+    const int count = packs * (16 / (int)sizeof(T));
+    uint32_t* stage = counters + 2 + klass;
+    uint32_t* tail = counters + 2 + K_CLASSES + klass;
+    __shared__ uint32_t poisoned;
+    if (tid == 0) poisoned = ld_relaxed_gpu(counters + K_POISON) | ld_relaxed_sys(ctrl + C_ABORT);
+    __syncthreads();
+    if (poisoned != 0u) {
+        const int at = blockIdx.x * blockDim.x + tid, stride = gridDim.x * blockDim.x;
+        const O nan = roce_sum_poison<T>();
+        for (int i = at; i < count; i += stride) out[i] = nan;
+        return;
+    }
+    const uint32_t seq = ld_relaxed_gpu(counters + K_EPOCH) + 1u;
+    const uint32_t slot = seq & 1u;
+    const int at = blockIdx.x * blockDim.x + tid, stride = gridDim.x * blockDim.x;
+
+    uint4* mine = reinterpret_cast<uint4*>(send + (long long)slot * slot_bytes);  // 1. stage
+    for (int i = at; i < packs; i += stride) mine[i] = in[i];
+    __syncthreads();
+    if (tid == 0) {  // 2. the doorbell, by the last block to stage
+        fence_sys();
+        if ((arrive(stage) + 1u) % gridDim.x == 0u) {
+            st_relaxed_sys(ctrl + C_NBYTES + slot, (uint32_t)packs * 16u);
+            fence_sys();
+            st_relaxed_sys(ctrl + C_SEQ, seq);
+        }
+    }
+    if (tid < n_hca) {  // 3. the peer's stripes
+        const uint32_t* flag = reinterpret_cast<const uint32_t*>(flags + ((long long)slot * n_hca + tid) * FLAG_STRIDE);
+        const uint64_t deadline = globaltimer() + timeout_ns;
+        while (true) {
+            const uint32_t peer_seq = ld_acquire_sys(flag);
+            if (peer_seq == seq) {
+                if (ld_relaxed_sys(flag + 1) != (uint32_t)packs * 16u) {
+                    st_relaxed_sys(ctrl + C_HCA, (uint32_t)tid);
+                    st_relaxed_sys(ctrl + C_ERROR_SEQ, seq);
+                    st_relaxed_sys(ctrl + C_ERROR_KIND, 2u);
+                    st_relaxed_sys(ctrl + C_ERROR, 1u);
+                    st_release_gpu(counters + K_POISON, 1u);
+                }
+                break;
+            }
+            if (ld_relaxed_sys(ctrl + C_ABORT) != 0u || globaltimer() >= deadline) {
+                st_relaxed_sys(ctrl + C_HCA, (uint32_t)tid);
+                st_relaxed_sys(ctrl + C_ERROR_SEQ, seq);
+                st_relaxed_sys(ctrl + C_ERROR_KIND, 1u);
+                st_relaxed_sys(ctrl + C_ERROR, 1u);
+                st_release_gpu(counters + K_POISON, 1u);
+                break;
+            }
+        }
+    }
+    __syncthreads();
+    if (tid == 0) poisoned = ld_relaxed_gpu(counters + K_POISON) | ld_relaxed_sys(ctrl + C_ABORT);
+    __syncthreads();
+    if (poisoned == 0u) {  // 4. one sum block, rank 0's value first; 16-B loads, system-scope for the peer slot
+        const uint4* theirs = reinterpret_cast<const uint4*>(recv + (long long)slot * slot_bytes);
+        constexpr int PER = 16 / (int)sizeof(T);  // values a 16-B pack: 4 fp32 or 8 bf16
+        for (int i = at; i < packs; i += stride) {
+            const uint4 ua = in[i];
+            const uint4 ub = ld_relaxed_sys4(theirs + i);
+            const T* ta = reinterpret_cast<const T*>(&ua);
+            const T* tb = reinterpret_cast<const T*>(&ub);
+            __align__(16) O o[PER];
+#pragma unroll
+            for (int j = 0; j < PER; ++j) {
+                const float a = roce_sum_to_f32(ta[j]);
+                const float b = roce_sum_to_f32(tb[j]);
+                o[j] = roce_sum_value<T>(rank == 0 ? a : b, rank == 0 ? b : a);
+            }
+            reinterpret_cast<uint4*>(out)[i] = *reinterpret_cast<const uint4*>(o);
+        }
+    }
+    fence_gpu();  // 5. the epoch, by the last block to finish
+    __syncthreads();
+    if (tid == 0 && (arrive(tail) + 1u) % gridDim.x == 0u) {
+        fence_gpu();
+        if (ld_relaxed_sys(ctrl + C_ERROR) == 0u && ld_relaxed_sys(ctrl + C_ABORT) == 0u) st_release_gpu(counters + K_EPOCH, seq);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(512) roce_gather_sum_f32(
+    const uint4* __restrict__ in, float* __restrict__ out, int packs, int rank, char* recv, char* flags, char* send,
+    uint32_t* ctrl, long long slot_bytes, uint32_t* counters, int klass, uint64_t timeout_ns, int n_hca) {
+    roce_gather_sum_body<float>(in, out, packs, rank, recv, flags, send, ctrl, slot_bytes, counters, klass, timeout_ns, n_hca);
+}
+
+extern "C" __global__ void __launch_bounds__(512) roce_gather_sum_bf16(
+    const uint4* __restrict__ in, __nv_bfloat16* __restrict__ out, int packs, int rank, char* recv, char* flags, char* send,
+    uint32_t* ctrl, long long slot_bytes, uint32_t* counters, int klass, uint64_t timeout_ns, int n_hca) {
+    roce_gather_sum_body<__nv_bfloat16>(in, out, packs, rank, recv, flags, send, ctrl, slot_bytes, counters, klass, timeout_ns, n_hca);
+}
+
 // A two-rank sum over roce_gather's rank-ordered device staging buffer.
-#include <cuda_bf16.h>
 
 extern "C" __global__ void roce_reduce_f32(const float* __restrict__ all, float* __restrict__ out, const uint32_t* ctrl, int count) {
     __shared__ uint32_t poisoned;

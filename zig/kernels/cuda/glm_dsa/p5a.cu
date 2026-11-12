@@ -147,7 +147,9 @@ template <int NB8, int CB> __device__ __forceinline__ void gu_body(const half* X
     float* Eg = reinterpret_cast<float*>(smem_raw); int mat, nt; ttile<2>(warp * TMT, cb, mat, nt); const int col0 = (nt - cb * 8) * 16, n = cb * 128 + 4 * lane;
     gu_half<0, NB8>(acc, Eg, mat, col0, cnt, e, n, rows_sh, svh_g, svh_u, suh_d, xd, N, limit, act_mode); if (TPH < cnt) gu_half<1, NB8>(acc, Eg, mat, col0, cnt, e, n, rows_sh, svh_g, svh_u, suh_d, xd, N, limit, act_mode);
 }
-template <int HF, int NB8> __device__ __forceinline__ void down_half(const float (&acc)[TMT][NB8][4], float* Ed, int cb, int cnt, int e, const int* rows_sh, const half* svh_d, float* y, int D) {
+template <int HF, int NB8, int EPI> __device__ __forceinline__ void down_half(const float (&acc)[TMT][NB8][4], float* Ed, int cb, int cnt, int e, const int* rows_sh, const half* svh_d, float* y, int D) {
+    static_assert(EPI == 0 || EPI == 1, "down epilogue variant");
+    if constexpr (EPI == 0) {
     if (HF) TF_TASK_SYNC(); const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31; pspill<NB8, HF>(Ed, DN_ES, warp * TMT * 16, acc); TF_TASK_SYNC();
     for (int i = warp; i < TPH && HF * TPH + i < cnt; i += TNW) { const int p = rows_sh[HF * TPH + i];
 #pragma unroll
@@ -158,12 +160,60 @@ template <int HF, int NB8> __device__ __forceinline__ void down_half(const float
             for (int j = 0; j < 4; ++j) o[j] = v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]);
         }
     }
+    } else {
+        // Two rows at a time and the same barriers as EPI=0: SMEM is 43,008 B, and two 32-row
+        // 260-float tiles need 66,560 B, so this path keeps one tile and both barriers.
+        static_assert(DN_ES % 4 == 0 && (DN_ES * (int)sizeof(float)) % 16 == 0, "epilogue rows are 16-byte aligned");
+        if ((D & 3) != 0) __trap();
+        if ((reinterpret_cast<uintptr_t>(svh_d) & 7u) != 0) __trap();
+        if ((reinterpret_cast<uintptr_t>(y) & 15u) != 0) __trap();
+        if (HF) TF_TASK_SYNC();
+        const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+        pspill<NB8, HF>(Ed, DN_ES, warp * TMT * 16, acc);
+        TF_TASK_SYNC();
+        for (int i = warp; i < TPH && HF * TPH + i < cnt; i += 2 * TNW) {
+            const int i1 = i + TNW;
+            const bool has1 = i1 < TPH && HF * TPH + i1 < cnt;
+            const int p0 = rows_sh[HF * TPH + i];
+            const int p1 = has1 ? rows_sh[HF * TPH + i1] : -1;
+#pragma unroll
+            for (int blk = 0; blk < 2; ++blk) {
+                float v0[4], v1[4];
+                *reinterpret_cast<float4*>(v0) = *reinterpret_cast<const float4*>(Ed + (size_t)i * DN_ES + blk * 128 + 4 * lane);
+                if (has1) *reinterpret_cast<float4*>(v1) = *reinterpret_cast<const float4*>(Ed + (size_t)i1 * DN_ES + blk * 128 + 4 * lane);
+                else { v1[0] = 0.0f; v1[1] = 0.0f; v1[2] = 0.0f; v1[3] = 0.0f; }
+                fwht128x2(v0, v1, lane);
+                const int n = cb * 256 + blk * 128 + 4 * lane;
+                const uint2 q = *reinterpret_cast<const uint2*>(svh_d + (size_t)e * D + n);
+                const float2 s0 = __half22float2(*reinterpret_cast<const __half2*>(&q.x));
+                const float2 s1 = __half22float2(*reinterpret_cast<const __half2*>(&q.y));
+                if (p0 >= 0) *reinterpret_cast<float4*>(y + (size_t)p0 * D + n) =
+                    make_float4(v0[0] * HAD_SCALE * s0.x, v0[1] * HAD_SCALE * s0.y, v0[2] * HAD_SCALE * s1.x, v0[3] * HAD_SCALE * s1.y);
+                if (p1 >= 0) *reinterpret_cast<float4*>(y + (size_t)p1 * D + n) =
+                    make_float4(v1[0] * HAD_SCALE * s0.x, v1[1] * HAD_SCALE * s0.y, v1[2] * HAD_SCALE * s1.x, v1[3] * HAD_SCALE * s1.y);
+            }
+        }
+    }
 }
-template <int NB8, int CB> __device__ __forceinline__ void down_body(const half* Xd, const uint64_t* Td, int cnt, int e, const half* svh_d, float* y, int K, int D, int k2, unsigned char* smem_raw, const int* rows_sh) {
+template <int NB8, int CB, int KO = 0, int EPI = 0> __device__ __forceinline__ void down_body(const half* Xd, const uint64_t* Td, int cnt, int e, const half* svh_d, float* y, int K, int D, int k2, unsigned char* smem_raw, const int* rows_sh) {
     const int cb = TF_VBID.x, warp = threadIdx.x >> 5; float acc[TMT][NB8][4];
     const uint32_t* T = reinterpret_cast<const uint32_t*>(Td[e]);
-    pmain<1, TPM, NB8, CB>(Xd, Xd, T, T, rows_sh, K, D >> 4, cb, k2, k2, reinterpret_cast<half*>(smem_raw), acc); float* Ed = reinterpret_cast<float*>(smem_raw);
-    down_half<0>(acc, Ed, cb, cnt, e, rows_sh, svh_d, y, D); if (TPH < cnt) down_half<1>(acc, Ed, cb, cnt, e, rows_sh, svh_d, y, D);
+    pmain<1, TPM, NB8, CB>(Xd, Xd, T, T, rows_sh, K, D >> 4, cb, k2, k2, reinterpret_cast<half*>(smem_raw), acc);
+    // KO16 NOEPI: fold every accumulator word so the GEMM stays live, then skip the spill and the
+    // fp16/fp32 stores. Timing only; output is wrong by design.
+    if constexpr ((KO & 16) != 0) {
+        uint32_t x = 0;
+#pragma unroll
+        for (int i = 0; i < TMT; ++i)
+#pragma unroll
+            for (int j = 0; j < NB8; ++j)
+#pragma unroll
+                for (int c = 0; c < 4; ++c) x ^= __float_as_uint(acc[i][j][c]);
+        if (threadIdx.x == 0) y[(size_t)TF_VBID.y * gridDim.x + TF_VBID.x] = __uint_as_float(x);
+        return;
+    }
+    float* Ed = reinterpret_cast<float*>(smem_raw);
+    down_half<0, NB8, EPI>(acc, Ed, cb, cnt, e, rows_sh, svh_d, y, D); if (TPH < cnt) down_half<1, NB8, EPI>(acc, Ed, cb, cnt, e, rows_sh, svh_d, y, D);
 }
 template <int CB> __device__ __forceinline__ void gu_entry(const half* __restrict__ Xg, const half* __restrict__ Xu, const uint64_t* __restrict__ Tg, const uint64_t* __restrict__ Tu,
         const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d,
@@ -181,14 +231,14 @@ template <int CB> __device__ __forceinline__ void gu_entry(const half* __restric
         default: break;
     }
 }
-template <int CB> __device__ __forceinline__ void down_entry(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
+template <int CB, int KO = 0, int EPI = 0> __device__ __forceinline__ void down_entry(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
         const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
         float* __restrict__ y, int K, int D, int ys, const int* __restrict__ k2d) {
     (void)ys; __shared__ __align__(16) unsigned char smem_raw[SMEM]; __shared__ int rows_sh[TPM];
     const int item = TF_VBID.y; if (item >= counts[0]) return; const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2]; if (cnt > SMALL_MAX) return;
     if (threadIdx.x < TPM) rows_sh[threadIdx.x] = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1; TF_TASK_SYNC(); const int k2 = k2d[e];
     switch ((cnt + 7) >> 3) {
-#define P5A_DN_CASE(NB) case NB: down_body<NB, CB>(Xd, Td, cnt, e, svh_d, y, K, D, k2, smem_raw, rows_sh); break
+#define P5A_DN_CASE(NB) case NB: down_body<NB, CB, KO, EPI>(Xd, Td, cnt, e, svh_d, y, K, D, k2, smem_raw, rows_sh); break
         P5A_DN_CASE(1); P5A_DN_CASE(2); P5A_DN_CASE(3); P5A_DN_CASE(4); P5A_DN_CASE(5); P5A_DN_CASE(6); P5A_DN_CASE(7); P5A_DN_CASE(8);
 #undef P5A_DN_CASE
         default: break;
@@ -211,4 +261,14 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_glm53_p5a_down_mcg(const
 extern "C" __global__ void __launch_bounds__(256, 2) tf_glm53_p5a_down_e4m3(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
         const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d, float* __restrict__ y, int K, int D, int ys, const int* __restrict__ k2d) {
     TF_VBLOCK_ENTER(); tf_glm53_p5a::down_entry<tf_exl3::CB_MCG_E4M3>(Xd, Td, items, counts, members, svh_d, y, K, D, ys, k2d);
+}
+// Timing-only ablation: same launch shape as tf_glm53_p5a_down_e4m3 with the epilogue removed.
+extern "C" __global__ void __launch_bounds__(256, 2) tf_glm53_p5a_down_e4m3_noepi(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
+        const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d, float* __restrict__ y, int K, int D, int ys, const int* __restrict__ k2d) {
+    TF_VBLOCK_ENTER(); tf_glm53_p5a::down_entry<tf_exl3::CB_MCG_E4M3, 16>(Xd, Td, items, counts, members, svh_d, y, K, D, ys, k2d);
+}
+// TF_GLM53_DN_EPI=1: same values as tf_glm53_p5a_down_e4m3, paired FWHT chains, one 8-B scale load and one 16-B store a block.
+extern "C" __global__ void __launch_bounds__(256, 2) tf_glm53_p5a_down_epi_e4m3(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
+        const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d, float* __restrict__ y, int K, int D, int ys, const int* __restrict__ k2d) {
+    TF_VBLOCK_ENTER(); tf_glm53_p5a::down_entry<tf_exl3::CB_MCG_E4M3, 0, 1>(Xd, Td, items, counts, members, svh_d, y, K, D, ys, k2d);
 }

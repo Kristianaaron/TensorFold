@@ -111,6 +111,60 @@ __device__ void rmsnorm(const __nv_bfloat16* x, int64_t x_stride, const __nv_bfl
   }
 }
 
+template <int D, int BLOCK, int NW, int S>
+__device__ void rmsnorm_regs(const float* vin, const __nv_bfloat16* w, __nv_bfloat16* out, int64_t o_stride,
+                             float* xs, float eps, int sums, int64_t r) {
+  constexpr int T = NW * 32, TILE = S * T, REPS = BLOCK / TILE, N = REPS * S, G = 64 / S;
+  static_assert(D % S == 0, "a thread's values all inside D or all past it");
+  __shared__ float smem[NW];
+  const int t = threadIdx.x;
+  const bool wv = packed<S>(w, 0), ov = packed<S>(out, o_stride);
+  float v[N];
+#pragma unroll
+  for (int rep = 0; rep < REPS; ++rep) {
+    const int d = rep * TILE + t * S;
+#pragma unroll
+    for (int j = 0; j < S; ++j) v[rep * S + j] = d < D ? vin[rep * S + j] : 0.0f;
+  }
+  float acc = __fmul_rn(v[1], v[1]);
+  acc = __fmaf_rn(v[0], v[0], acc);
+#pragma unroll
+  for (int k = 2; k < N; ++k) acc = __fmaf_rn(v[k], v[k], acc);
+  const float total = block_sum<NW>(acc, smem);
+  const float rinv = div_full(1.0f, sqrt_approx(eps + div_full(total, (float)D)));
+  float y[N];
+#pragma unroll
+  for (int rep = 0; rep < REPS; ++rep) {
+    const int d = rep * TILE + t * S;
+    if (d >= D) {
+#pragma unroll
+      for (int j = 0; j < S; ++j) y[rep * S + j] = 0.0f;
+      continue;
+    }
+    float wf[S];
+    __nv_bfloat16 o[S];
+    load_s<S>(w + d, wf, wv);
+#pragma unroll
+    for (int j = 0; j < S; ++j) {
+      o[j] = __float2bfloat16_rn(__fmul_rn(wf[j], rbf(__fmul_rn(rinv, v[rep * S + j]))));
+      y[rep * S + j] = bf(o[j]);
+    }
+    store_s<S>(out + r * o_stride + d, o, ov);
+  }
+  if (!sums) return;
+#pragma unroll
+  for (int rep = 0; rep < REPS; ++rep) {
+    const float* q = y + rep * S;
+    float g = q[1];
+    g = q[0] + g;
+#pragma unroll
+    for (int j = 2; j < S; ++j) g = q[j] + g;
+    for (int o = G / 2; o > 0; o >>= 1) g += __shfl_xor_sync(0xffffffffu, g, o);
+    const int group = (rep * TILE + t * S) / 64;
+    if (t % G == 0 && group < D / 64) xs[r * (D / 64) + group] = g;
+  }
+}
+
 }  // namespace glm_glue
 
 #define RMSNORM(D, BLOCK, NW, S)                                                                                   \

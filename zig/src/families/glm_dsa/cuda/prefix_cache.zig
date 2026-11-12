@@ -9,6 +9,7 @@ const uma = @import("uma");
 pub const kvsave = @import("kvsave");
 
 pub const max_nodes = 4096;
+/// Saved-file pieces stay at 512 rows; 1024 and 2048 are multiples, so every save/load body stays aligned.
 pub const piece_rows = 512;
 pub const Node = struct {
     key: u64,
@@ -28,9 +29,22 @@ pub const Node = struct {
 
 pub const PlanOptions = struct {
     expert_rows: usize,
+    /// Engine piece rows: cuts must land on both an expert group and an engine piece boundary.
+    engine_piece_rows: usize = piece_rows,
     step: usize = 0,
     span: usize = 16384,
 };
+
+/// A saved cut is valid only when it is a multiple of the expert group and of the engine piece (a 1024-row
+/// engine still writes 512-row cache pieces, so the file body alignment is unchanged).
+pub fn cutGrain(expert_rows: usize, engine_piece_rows: usize) !usize {
+    const a = try kvsave.cutAlignment(expert_rows);
+    if (engine_piece_rows == 0) return a;
+    var x = a;
+    var y = engine_piece_rows;
+    while (y != 0) : ({ const rem = x % y; x = y; y = rem; }) {}
+    return a / x * engine_piece_rows;
+}
 
 /// Per-rank owner for the fixed staging pool and the identical saved-file index.
 /// Call `init` during native setup; request paths reuse the pool and its fixed-size
@@ -75,13 +89,13 @@ pub const Runtime = struct {
     }
 
     pub fn lookup(r: *Runtime, ids: []const u32, after: usize) ?Node {
-        const node = r.index.lookup(ids, after, kvsave.cutAlignment(r.options.expert_rows) catch return null) orelse return null;
+        const node = r.index.lookup(ids, after, cutGrain(r.options.expert_rows, r.options.engine_piece_rows) catch return null) orelse return null;
         r.index.touchChain(node.key);
         return node;
     }
 
     pub fn plan(r: *Runtime, prompt: []const u32, start: usize, shared: []const u32, history_len: usize) ![]const Cut {
-        const a = try kvsave.cutAlignment(r.options.expert_rows);
+        const a = try cutGrain(r.options.expert_rows, r.options.engine_piece_rows);
         var deepest: ?Node = null;
         const count = r.index.existingOnPrefix(prompt, a, start, r.existing[0..], &deepest);
         r.planned_len = try cutsInto(r.planned[0..], prompt.len, start, shared, history_len, r.options, r.existing[0..count]);
@@ -92,7 +106,7 @@ pub const Runtime = struct {
     }
 
     pub fn saveHeader(r: *Runtime, at: usize) !kvsave.Header {
-        if (at == 0 or at > r.planned_ids.len or at % (try kvsave.cutAlignment(r.options.expert_rows)) != 0) return error.BadNode;
+        if (at == 0 or at > r.planned_ids.len or at % (try cutGrain(r.options.expert_rows, r.options.engine_piece_rows)) != 0) return error.BadNode;
         const key = kvsave.keyOf(r.planned_ids[0..at]);
         const existing = r.index.get(key);
         if (existing) |node| {
@@ -192,7 +206,7 @@ pub fn cuts(gpa: std.mem.Allocator, prompt_len: usize, start: usize, shared: []c
 /// Allocation-free cut planner used by Runtime after setup. `out` must hold 18 cuts.
 pub fn cutsInto(out: []Cut, prompt_len: usize, start: usize, shared: []const u32, history_len: usize, options: PlanOptions, existing: []const usize) !usize {
     if (out.len < 18) return error.CutBufferTooSmall;
-    const a = try kvsave.cutAlignment(options.expert_rows);
+    const a = try cutGrain(options.expert_rows, options.engine_piece_rows);
     const min_step: usize = @max(2048, a);
     const min_span: usize = @max(16384, a);
     const step: usize = if (options.step == 0) ceilMultiple(min_step, a) else options.step;
@@ -565,8 +579,8 @@ pub const Index = struct {
     }
 
     /// Read v2 headers from a single rank directory. Corrupt or foreign files are logged and skipped.
-    pub fn reconcile(i: *Index, io: std.Io, dir_path: []const u8, identity: kvsave.Digest, rank: u32, expert_rows: usize, peer_digest: ?kvsave.Digest) !void {
-        const a = try kvsave.cutAlignment(expert_rows);
+    pub fn reconcile(i: *Index, io: std.Io, dir_path: []const u8, identity: kvsave.Digest, rank: u32, expert_rows: usize, engine_piece_rows: usize, peer_digest: ?kvsave.Digest) !void {
+        const a = try cutGrain(expert_rows, engine_piece_rows);
         var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
         defer dir.close(io);
         var records: std.ArrayList(Node) = .empty;
@@ -615,6 +629,36 @@ test "save alignment is the lcm of 512 and expert_rows" {
     try std.testing.expectEqual(@as(usize, 2048), try kvsave.roundCutDown(2559, 1024));
     try std.testing.expectEqual(@as(usize, 2048), try kvsave.roundCutDown(4095, 2048));
     try std.testing.expectEqual(@as(usize, 4096), try kvsave.roundCutDown(8191, 4096));
+}
+
+test "1024-row engine pieces keep 512-row cache pieces and raise only the cut grain" {
+    try std.testing.expectEqual(@as(usize, 512), try cutGrain(512, 512));
+    try std.testing.expectEqual(@as(usize, 1024), try cutGrain(512, 1024));
+    try std.testing.expectEqual(@as(usize, 1024), try cutGrain(1024, 512));
+    try std.testing.expectEqual(@as(usize, 2048), try cutGrain(2048, 1024));
+    try std.testing.expectEqual(@as(usize, 512), piece_rows);
+
+    const options: PlanOptions = .{ .expert_rows = 512, .engine_piece_rows = 1024 };
+    var out: [18]Cut = undefined;
+    const len = try cutsInto(&out, 40000, 0, &.{}, 40000, options, &.{});
+    try std.testing.expect(len != 0);
+    for (out[0..len]) |cut| {
+        try std.testing.expectEqual(@as(usize, 0), cut.at % 1024);
+        try std.testing.expectEqual(@as(usize, 0), cut.at % piece_rows);
+    }
+}
+
+test "adaptive groups keep cuts valid for 1024-row adaptive and 512-row plain pieces" {
+    // Adaptive groups are 4096 rows; plain groups stay at 1024 rows with 512-row pieces.
+    const adaptive = try cutGrain(4096, 1024);
+    try std.testing.expectEqual(@as(usize, 4096), adaptive);
+    try std.testing.expectEqual(@as(usize, 0), adaptive % 4096);
+    try std.testing.expectEqual(@as(usize, 0), adaptive % 1024);
+    try std.testing.expectEqual(@as(usize, 0), adaptive % piece_rows);
+    const plain = try cutGrain(1024, 1024);
+    try std.testing.expectEqual(@as(usize, 1024), plain);
+    try std.testing.expectEqual(@as(usize, 0), plain % piece_rows);
+    try std.testing.expectEqual(@as(usize, 0), adaptive % plain);
 }
 
 test "victim order is stable and respects child and pin state" {
@@ -891,7 +935,7 @@ test "reconcile indexes valid v2 headers and skips a corrupt file" {
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = corrupt, .data = "not a v2 header" });
     var actual = Index.init(gpa);
     defer actual.deinit();
-    try actual.reconcile(io, root, identity, 0, 512, expected.startupDigest());
+    try actual.reconcile(io, root, identity, 0, 512, 512, expected.startupDigest());
     try std.testing.expectEqual(@as(usize, 2), actual.nodes.items.len);
     try std.testing.expect(actual.get(kvsave.keyOf(ids_a)) != null);
     try std.testing.expect(actual.get(kvsave.keyOf(ids_b)) != null);
@@ -905,7 +949,7 @@ test "reconcile indexes valid v2 headers and skips a corrupt file" {
 //   Writer.writeChunkAt(i, aligned_buf, n), Writer.seal(), Writer.publish(), Writer.abort()
 //   kvsave.Reader.open(gpa,path,identity,rank,world,ids_full,base_at,at,body_len)
 //   Reader.readChunkAt(i, aligned_buf), Reader.close()
-//   cutAlignment(expert_rows), roundCutDown(cut,expert_rows), Pool.init(driver,context), Pool.run(...), Pool.deinit()
+//   cutGrain(expert_rows, engine_piece_rows), roundCutDown(cut,expert_rows), Pool.init(driver,context), Pool.run(...), Pool.deinit()
 // Ring device hooks: drafts.Host.ringView(ctx) -> {ptr,len,from}; drafts.Host.ringAdopt(ctx,from).
 
 pub const Pool = struct {

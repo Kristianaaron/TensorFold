@@ -487,7 +487,7 @@ fn benchCall(lab: *const Lab, phase: BenchPhase, l: exl3e.Layer, sc: exl3e.promp
         .ref_gu => try pmxGateUp(lab, l, sc, plan, rows),
         .ref_down => try lab.exp.prompt.downWide(lab.r.s, l, rows, sc, plan),
         .new_gu => try lab.exp.prompt.gateUpP5a(lab.pmx, lab.p5a, lab.r.s, l, rows, sc, plan),
-        .new_down => try lab.exp.prompt.downP5a(lab.p5a, lab.r.s, l, rows, sc, plan),
+        .new_down => try lab.exp.prompt.downP5a(lab.p5a, lab.r.s, l, rows, sc, plan, false),
     }
 }
 fn timed(lab: *const Lab, ev: *const [2]cuda.Event, phase: BenchPhase, l: exl3e.Layer, sc: exl3e.prompt.Scratch, plan: cuda.grouped.Plan, rows: usize) !f64 {

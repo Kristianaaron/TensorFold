@@ -121,7 +121,7 @@ const Call = struct {
     scale1: u64 = 0,
 };
 
-const Which = enum { rot_in, gu, rot_a8, gu_a8, gu_w8, rot_w8s, gu_w8s, down, xd_w8s, down_w8s };
+const Which = enum { rot_in, gu, rot_a8, gu_a8, gu_w8, rot_w8s, rot_dd, gu_w8s, gu_w8s_pf, down, xd_w8s, down_w8s };
 
 const Metrics = struct {
     max_abs: f64 = 0,
@@ -304,15 +304,40 @@ fn launchRotW8s(c: *const Call) !void {
     try cuda.launch.launch(c.exp.rot_in_w8s, .{ .grid = .{ .x = @intCast(pairs), .y = 2, .z = 1 }, .block = .{ .x = 512 } }, c.stream, &args);
 }
 
+// TF_GLM53_ROT_DD: one 512-thread CTA a row, the same RotA8Args and output bytes as launchRotW8s.
+fn launchRotW8sDd(c: *const Call) !void {
+    var args: cuda.launch.Args = .{};
+    args.add(exl3e.RotA8Args{
+        .x = c.x,
+        .x_stride = D,
+        .x_dtype = @intFromEnum(exl3e.DType.bf16),
+        .pick = c.picks,
+        .suh0 = c.layer.suh_g,
+        .suh1 = c.layer.suh_u,
+        .out0 = c.code0,
+        .out1 = c.code1,
+        .sc0 = c.scale0,
+        .sc1 = c.scale1,
+        .k = D,
+        .slots = SLOTS,
+        .experts = E,
+    });
+    try cuda.launch.launch(c.exp.rot_in_w8s_row, .{ .grid = .{ .x = @intCast(c.rows), .y = 1, .z = 1 }, .block = .{ .x = 512 } }, c.stream, &args);
+}
+
 fn launchGuW8(c: *const Call) !void {
-    return launchGuCodes(c, false);
+    return launchGuCodes(c, c.pmx.gu_w8);
 }
 
 fn launchGuW8s(c: *const Call) !void {
-    return launchGuCodes(c, true);
+    return launchGuCodes(c, c.pmx.gu_w8s);
 }
 
-fn launchGuCodes(c: *const Call, permuted: bool) !void {
+fn launchGuW8sPf(c: *const Call) !void {
+    return launchGuCodes(c, c.pmx.gu_w8s_pf);
+}
+
+fn launchGuCodes(c: *const Call, fun: anytype) !void {
     const items = cuda.grouped.maxItems(c.rows * SLOTS, E, exl3e.prompt.wide_tile);
     var args: cuda.launch.Args = .{};
     args.add(exl3e.pmx.PmxA8Args{
@@ -338,7 +363,7 @@ fn launchGuCodes(c: *const Call, permuted: bool) !void {
         .limit = c.layer.limit,
         .act_mode = c.layer.act_mode,
     });
-    try cuda.launch.launch(if (permuted) c.pmx.gu_w8s else c.pmx.gu_w8, .{ .grid = .{ .x = I / 128, .y = @intCast(items), .z = 1 }, .block = .{ .x = 512 }, .shared = @as(u32, @intCast(exl3e.pmx.gu_w8_smem)) }, c.stream, &args);
+    try cuda.launch.launch(fun, .{ .grid = .{ .x = I / 128, .y = @intCast(items), .z = 1 }, .block = .{ .x = 512 }, .shared = @as(u32, @intCast(exl3e.pmx.gu_w8_smem)) }, c.stream, &args);
 }
 
 // Release down of the items > 64 members (=2's wide down on fp16 xd), as exl3_prompt.downP5a launches it.
@@ -362,6 +387,21 @@ fn launchDownW8s(c: *const Call) !void {
     var args: cuda.launch.Args = .{};
     args.add(exl3e.pmx.DownW8Args{ .xq = c.sc.xg, .td = c.layer.down, .k2 = c.layer.down_k2, .items = c.route_plan.items, .counts = c.route_plan.counts, .members = c.route_plan.members, .svh = c.layer.svh_d, .y = c.sc.y, .K = I, .D = D, .xs = 2 * D });
     try cuda.launch.launch(c.pmx.down_w8s, .{ .grid = .{ .x = D / 256, .y = @intCast(items), .z = 1 }, .block = .{ .x = 512 }, .shared = @as(u32, @intCast(exl3e.pmx.down_w8_smem)) }, c.stream, &args);
+}
+
+fn launchDownW8sFun(c: *const Call, fun: anytype) !void {
+    const items = cuda.grouped.maxItems(c.rows * SLOTS, E, exl3e.prompt.wide_tile);
+    var args: cuda.launch.Args = .{};
+    args.add(exl3e.pmx.DownW8Args{ .xq = c.sc.xg, .td = c.layer.down, .k2 = c.layer.down_k2, .items = c.route_plan.items, .counts = c.route_plan.counts, .members = c.route_plan.members, .svh = c.layer.svh_d, .y = c.sc.y, .K = I, .D = D, .xs = 2 * D });
+    try cuda.launch.launch(fun, .{ .grid = .{ .x = D / 256, .y = @intCast(items), .z = 1 }, .block = .{ .x = 512 }, .shared = @as(u32, @intCast(exl3e.pmx.down_w8_smem)) }, c.stream, &args);
+}
+
+// p5a small-item down on the release fp16 xd, at =10's launch shape (dims / 256, 256 threads).
+fn launchP5aDownFun(c: *const Call, fun: anytype) !void {
+    const items = cuda.grouped.maxItems(c.rows * SLOTS, E, exl3e.prompt.wide_tile);
+    var args: cuda.launch.Args = .{};
+    inline for (.{ c.sc.xd, c.layer.down, c.route_plan.items, c.route_plan.counts, c.route_plan.members, c.layer.svh_d, c.sc.y, @as(i32, I), @as(i32, D), @as(i32, SLOTS), c.layer.down_k2 }) |v| args.add(v);
+    try cuda.launch.launch(fun, .{ .grid = .{ .x = D / 256, .y = @intCast(items), .z = 1 }, .block = .{ .x = 256 } }, c.stream, &args);
 }
 
 fn fetchF32(r: *Rig, ptr: u64, len: usize) ![]f32 {
@@ -477,7 +517,9 @@ fn once(c: *const Call, which: Which) !void {
         .gu_a8 => try launchGuA8(c),
         .gu_w8 => try launchGuW8(c),
         .rot_w8s => try launchRotW8s(c),
+        .rot_dd => try launchRotW8sDd(c),
         .gu_w8s => try launchGuW8s(c),
+        .gu_w8s_pf => try launchGuW8sPf(c),
         .down => try launchDown(c),
         .xd_w8s => try launchXdW8s(c),
         .down_w8s => try launchDownW8s(c),
@@ -488,6 +530,33 @@ fn timed(c: *const Call, ev: *const [2]cuda.Event, which: Which) !f64 {
     for (0..2) |_| try once(c, which);
     try ev[0].record(c.stream);
     for (0..10) |_| try once(c, which);
+    try ev[1].record(c.stream);
+    try c.stream.synchronize();
+    return @as(f64, try ev[0].elapsedMs(ev[1])) * 100.0;
+}
+
+fn timedFun(c: *const Call, ev: *const [2]cuda.Event, fun: anytype) !f64 {
+    for (0..2) |_| try launchGuCodes(c, fun);
+    try ev[0].record(c.stream);
+    for (0..10) |_| try launchGuCodes(c, fun);
+    try ev[1].record(c.stream);
+    try c.stream.synchronize();
+    return @as(f64, try ev[0].elapsedMs(ev[1])) * 100.0;
+}
+
+fn timedDownFun(c: *const Call, ev: *const [2]cuda.Event, fun: anytype) !f64 {
+    for (0..2) |_| try launchDownW8sFun(c, fun);
+    try ev[0].record(c.stream);
+    for (0..10) |_| try launchDownW8sFun(c, fun);
+    try ev[1].record(c.stream);
+    try c.stream.synchronize();
+    return @as(f64, try ev[0].elapsedMs(ev[1])) * 100.0;
+}
+
+fn timedP5aDown(c: *const Call, ev: *const [2]cuda.Event, fun: anytype) !f64 {
+    for (0..2) |_| try launchP5aDownFun(c, fun);
+    try ev[0].record(c.stream);
+    for (0..10) |_| try launchP5aDownFun(c, fun);
     try ev[1].record(c.stream);
     try c.stream.synchronize();
     return @as(f64, try ev[0].elapsedMs(ev[1])) * 100.0;
@@ -541,6 +610,81 @@ fn firstMismatch(live: []const i32, a: []const u16, b: []const u16) ?usize {
         for (0..I) |col| {
             const idx = start + col;
             if (a[idx] != b[idx]) return idx;
+        }
+    }
+    return null;
+}
+
+fn firstByteDiff(a: []const u8, b: []const u8) ?usize {
+    const n = @min(a.len, b.len);
+    for (0..n) |at| {
+        if (a[at] != b[at]) return at;
+    }
+    return if (a.len == b.len) null else n;
+}
+
+fn rotddCompare(rows: usize, mat: usize, kind: []const u8, stride: usize, ref: []const u8, got: []const u8) bool {
+    const at = firstByteDiff(ref, got) orelse return false;
+    if (at >= ref.len or at >= got.len) {
+        std.debug.print("FAIL glm53-rotdd rows={d} mat={d} {s} len={d}/{d}\n", .{ rows, mat, kind, got.len, ref.len });
+        return true;
+    }
+    std.debug.print("FAIL glm53-rotdd rows={d} mat={d} {s} pair={d} byte={d} got={d} ref={d}\n", .{ rows, mat, kind, at / stride, at % stride, got[at], ref[at] });
+    return true;
+}
+
+const DownLive = struct { large: []i32, small: []i32 };
+
+// The pair indices the two down paths write: pmx down_w8s owns items > 64 members, p5a owns items <= 64.
+fn downLive(r: *Rig, route_plan: cuda.grouped.Plan, pairs: usize) !DownLive {
+    const count_bytes = try fetch(r, route_plan.counts, 16);
+    defer r.gpu.gpa.free(count_bytes);
+    const counts = try copyI32(r.a, count_bytes);
+    if (counts[0] < 0) return error.Ra8Plan;
+    if (counts[0] == 0) return error.Ra8Empty;
+    const nitems: usize = @intCast(counts[0]);
+    const cap = cuda.grouped.maxItems(PAIRS_MAX, E, exl3e.prompt.tile);
+    if (nitems > cap) return error.Ra8Plan;
+    const item_bytes = try fetch(r, route_plan.items, nitems * 12);
+    defer r.gpu.gpa.free(item_bytes);
+    const triples = try copyI32(r.a, item_bytes);
+    const member_bytes = try fetch(r, route_plan.members, pairs * 4);
+    defer r.gpu.gpa.free(member_bytes);
+    const members = try copyI32(r.a, member_bytes);
+    const seen = try r.a.alloc(u8, pairs);
+    @memset(seen, 0);
+    var large: std.ArrayList(i32) = .empty;
+    var small: std.ArrayList(i32) = .empty;
+    for (0..nitems) |item| {
+        const cnt = triples[item * 3 + 2];
+        if (cnt < 0) return error.Ra8Plan;
+        const off: usize = @intCast(triples[item * 3 + 1]);
+        const n: usize = @intCast(cnt);
+        if (off > members.len or n > members.len - off) return error.Ra8Plan;
+        for (0..n) |j| {
+            const row = members[off + j];
+            if (row < 0) return error.Ra8Plan;
+            const idx: usize = @intCast(row);
+            if (idx >= pairs or seen[idx] != 0) return error.Ra8Plan;
+            seen[idx] = 1;
+            if (cnt > 64) {
+                try large.append(r.a, row);
+            } else {
+                try small.append(r.a, row);
+            }
+        }
+    }
+    return .{ .large = try large.toOwnedSlice(r.a), .small = try small.toOwnedSlice(r.a) };
+}
+
+fn firstDownMismatch(live: []const i32, a: []const u8, b: []const u8, dims: usize) ?struct { pair: i32, col: usize } {
+    for (live) |pair| {
+        const row: usize = @intCast(pair);
+        for (0..dims) |col| {
+            const off: usize = (row * dims + col) * 4;
+            if (a[off] != b[off] or a[off + 1] != b[off + 1] or a[off + 2] != b[off + 2] or a[off + 3] != b[off + 3]) {
+                return .{ .pair = pair, .col = col };
+            }
         }
     }
     return null;
@@ -645,6 +789,70 @@ fn oneRow(r: *Rig, c: *const Call, ev: *const [2]cuda.Event) !Outcome {
         std.debug.print("FAIL glm53-ra8 rows={d} w8s nonfinite={d}\n", .{ c.rows, ms.nonfinite });
         failed = true;
     }
+    // TF_GLM53_ROT_DD: the row kernel must write the pair kernel's code and scale bytes. benchPicks has no negative
+    // ids, so every pair of this run is live.
+    {
+        const code_len = pairs * D;
+        const scale_len = pairs * 4;
+        try wipe(r, c.code0, code_len);
+        try wipe(r, c.code1, code_len);
+        try wipe(r, c.scale0, scale_len);
+        try wipe(r, c.scale1, scale_len);
+        try launchRotW8s(c);
+        const ref_code0 = try fetch(r, c.code0, code_len);
+        const ref_code1 = try fetch(r, c.code1, code_len);
+        const ref_scale0 = try fetch(r, c.scale0, scale_len);
+        const ref_scale1 = try fetch(r, c.scale1, scale_len);
+        try wipe(r, c.code0, code_len);
+        try wipe(r, c.code1, code_len);
+        try wipe(r, c.scale0, scale_len);
+        try wipe(r, c.scale1, scale_len);
+        try launchRotW8sDd(c);
+        {
+            const got_code0 = try fetch(r, c.code0, code_len);
+            defer r.gpu.gpa.free(got_code0);
+            if (rotddCompare(c.rows, 0, "codes", D, ref_code0, got_code0)) failed = true;
+        }
+        {
+            const got_code1 = try fetch(r, c.code1, code_len);
+            defer r.gpu.gpa.free(got_code1);
+            if (rotddCompare(c.rows, 1, "codes", D, ref_code1, got_code1)) failed = true;
+        }
+        {
+            const got_scale0 = try fetch(r, c.scale0, scale_len);
+            defer r.gpu.gpa.free(got_scale0);
+            if (rotddCompare(c.rows, 0, "scale", 4, ref_scale0, got_scale0)) failed = true;
+        }
+        {
+            const got_scale1 = try fetch(r, c.scale1, scale_len);
+            defer r.gpu.gpa.free(got_scale1);
+            if (rotddCompare(c.rows, 1, "scale", 4, ref_scale1, got_scale1)) failed = true;
+        }
+        r.gpu.gpa.free(ref_code0);
+        r.gpu.gpa.free(ref_code1);
+        r.gpu.gpa.free(ref_scale0);
+        r.gpu.gpa.free(ref_scale1);
+        if (!failed) std.debug.print("INFO glm53-ra8 rows={d} rotdd byte=equal pairs={d}\n", .{ c.rows, pairs });
+    }
+    try wipe(r, c.sc.xd, xd_len);
+    try launchRotW8s(c);
+    try launchGuW8sPf(c);
+    const got_pf = try fetchHalves(r, c.sc.xd, xd_len);
+    defer r.gpu.gpa.free(got_pf);
+    try wipe(r, c.sc.xd, xd_len);
+    try launchRotW8s(c);
+    try launchGuW8sPf(c);
+    const again_pf = try fetchHalves(r, c.sc.xd, xd_len);
+    defer r.gpu.gpa.free(again_pf);
+    if (firstMismatch(set.rows, got_pf, got_s)) |at| {
+        std.debug.print("FAIL glm53-ra8 rows={d} w8s_pf differs at {d}\n", .{ c.rows, at });
+        failed = true;
+    } else if (firstMismatch(set.rows, again_pf, got_s)) |at| {
+        std.debug.print("FAIL glm53-ra8 rows={d} w8s_pf differs at {d}\n", .{ c.rows, at });
+        failed = true;
+    } else {
+        std.debug.print("INFO glm53-ra8 rows={d} w8s_pf byte=equal\n", .{c.rows});
+    }
     const us_rot = try timed(c, ev, .rot_in);
     const us_gu = try timed(c, ev, .gu);
     const us_rot_a8 = try timed(c, ev, .rot_a8);
@@ -656,12 +864,16 @@ fn oneRow(r: *Rig, c: *const Call, ev: *const [2]cuda.Event) !Outcome {
     const a8_speed = release_us / a8_us;
     const w8_speed = release_us / w8_us;
     std.debug.print("BENCH glm53-ra8 rows={d} | rot_in {d:.1} + gu {d:.1} = {d:.1} us | a8 {d:.1} + {d:.1} = {d:.1} us {d:.2}x | w8 {d:.1} + {d:.1} = {d:.1} us {d:.2}x\n", .{ c.rows, us_rot, us_gu, release_us, us_rot_a8, us_gu_a8, a8_us, a8_speed, us_rot_a8, us_gu_w8, w8_us, w8_speed });
-    // The w8s pair runs last: it overwrites the code and scale buffers the a8 and w8 kernels read.
+    // The w8s and rot_dd runs come last: they overwrite the code and scale buffers the a8 and w8 kernels read.
     const us_rot_w8s = try timed(c, ev, .rot_w8s);
+    const us_rot_dd = try timed(c, ev, .rot_dd);
+    std.debug.print("BENCH glm53-rotdd rows={d} | rot_in_w8s {d:.1} | rot_dd {d:.1} us {d:.3}x\n", .{ c.rows, us_rot_w8s, us_rot_dd, us_rot_w8s / us_rot_dd });
     const us_gu_w8s = try timed(c, ev, .gu_w8s);
     const w8s_us = us_rot_w8s + us_gu_w8s;
     const w8s_speed = release_us / w8s_us;
     std.debug.print("BENCH glm53-ra8 rows={d} | w8s {d:.1} + {d:.1} = {d:.1} us {d:.2}x of release {d:.1} us\n", .{ c.rows, us_rot_w8s, us_gu_w8s, w8s_us, w8s_speed, release_us });
+    const us_gu_w8s_pf = try timed(c, ev, .gu_w8s_pf);
+    std.debug.print("BENCH glm53-ra8 rows={d} | gu_w8s {d:.1} | gu_w8s_pf {d:.1} us {d:.3}x\n", .{ c.rows, us_gu_w8s, us_gu_w8s_pf, us_gu_w8s / us_gu_w8s_pf });
     if (try downCheck(r, c, ev, set.rows)) failed = true;
     var slow = false;
     if (c.rows == 4096 and w8s_speed < 1.25) {
@@ -732,4 +944,194 @@ pub fn run(gpu: anytype) !void {
     }
     if (failed) return error.Ra8Check;
     if (slow) return error.Ra8Slow;
+}
+
+/// Timing only: rot_w8s runs once for each row set, then the full gu_w8s and every KO ablation.
+/// The KO variants write wrong output by design, so there is no correctness check here.
+pub fn runKo(gpu: anytype) !void {
+    if (!cuda.kernels.available or cuda.kernels.exl3_experts.len == 0 or cuda.kernels.glm53_pmx.len == 0) return error.KernelsNotEmbedded;
+    var exp = try exl3e.Experts.load(gpu.d);
+    defer exp.unload();
+    var pmx = try exl3e.pmx.Pmx.load(gpu.d);
+    defer pmx.unload();
+    var arena = std.heap.ArenaAllocator.init(gpu.gpa);
+    defer arena.deinit();
+    var prng = std.Random.DefaultPrng.init(0x4B4F);
+    const rig = try arena.allocator().create(Rig);
+    rig.* = .{ .gpu = gpu, .a = arena.allocator(), .s = try cuda.Stream.init(gpu.d, false), .rng = prng.random() };
+    defer rig.s.deinit();
+    defer {
+        for (rig.bufs.items) |*buf| buf.free();
+        rig.bufs.deinit(gpu.gpa);
+    }
+    const weights = try buildWeights(rig, wbench);
+    const layer = layerOf(weights, .mcg_e4m3, 0, 0);
+    const scratch_bytes = try exl3e.prompt.bytes(layer, ROWS_MAX, SLOTS, false);
+    const scratch_ptr = try rig.zeros(scratch_bytes);
+    const sc = try exl3e.prompt.scratch(scratch_ptr, layer, ROWS_MAX, SLOTS, false);
+    const x_host = try rig.bfs(ROWS_MAX * D, 0.5);
+    const x = try rig.dev(std.mem.sliceAsBytes(x_host));
+    const code_bytes = PAIRS_MAX * D;
+    const scale_bytes = PAIRS_MAX * (D / 128) * 4;
+    const code0 = try rig.zeros(code_bytes);
+    const code1 = try rig.zeros(code_bytes);
+    const scale0 = try rig.zeros(scale_bytes);
+    const scale1 = try rig.zeros(scale_bytes);
+    const route_plan = try planOf(rig);
+    var ev: [2]cuda.Event = undefined;
+    for (&ev) |*event| event.* = try cuda.Event.init(gpu.d, true);
+    defer {
+        for (&ev) |*event| event.deinit();
+    }
+    const row_counts = [_]usize{ 2048, 4096 };
+    for (row_counts) |rows| {
+        const host_pick = try benchPicks(rig.a, rows);
+        const call = Call{
+            .exp = &exp,
+            .pmx = &pmx,
+            .stream = rig.s,
+            .layer = layer,
+            .x = x,
+            .picks = try rig.dev(std.mem.sliceAsBytes(host_pick)),
+            .rows = rows,
+            .sc = sc,
+            .route_plan = route_plan,
+            .code0 = code0,
+            .code1 = code1,
+            .scale0 = scale0,
+            .scale1 = scale1,
+        };
+        const pairs = rows * SLOTS;
+        try exp.router.route(rig.s, call.picks, pairs, E, exl3e.prompt.wide_tile, route_plan);
+        try launchRotW8s(&call);
+        const full = try timedFun(&call, &ev, call.pmx.gu_w8s);
+        const nodecode = try timedFun(&call, &ev, call.pmx.gu_w8s_ko[0]);
+        const nomma = try timedFun(&call, &ev, call.pmx.gu_w8s_ko[1]);
+        const noload = try timedFun(&call, &ev, call.pmx.gu_w8s_ko[2]);
+        const noguard = try timedFun(&call, &ev, call.pmx.gu_w8s_ko[3]);
+        const noepi = try timedFun(&call, &ev, call.pmx.gu_w8s_ko[4]);
+        const nodecode_nomma = try timedFun(&call, &ev, call.pmx.gu_w8s_ko[5]);
+        const nodecode_noguard = try timedFun(&call, &ev, call.pmx.gu_w8s_ko[6]);
+        const noldsm = try timedFun(&call, &ev, call.pmx.gu_w8s_ko[7]);
+        const noldsm_nodecode_nomma = try timedFun(&call, &ev, call.pmx.gu_w8s_ko[8]);
+        const noldsm_nodecode_nomma_noload = try timedFun(&call, &ev, call.pmx.gu_w8s_ko[9]);
+        const nobar = try timedFun(&call, &ev, call.pmx.gu_w8s_ko[10]);
+        const loop_epi = try timedFun(&call, &ev, call.pmx.gu_w8s_ko[11]);
+        const loop_only = try timedFun(&call, &ev, call.pmx.gu_w8s_ko[12]);
+        const noloopaddr = try timedFun(&call, &ev, call.pmx.gu_w8s_ko[13]);
+        const empty_grid = try timedFun(&call, &ev, call.pmx.gu_w8s_empty);
+        std.debug.print("BENCH glm53-ra8-ko rows={d} | full {d:.1} | ko1 nodecode {d:.1} | ko2 nomma {d:.1} | ko4 noload {d:.1} | ko8 noguard {d:.1} | ko16 noepi {d:.1} | ko3 nodecode+nomma {d:.1} | ko9 nodecode+noguard {d:.1} | ko32 noldsm {d:.1} | ko35 noldsm+nodecode+nomma {d:.1} | ko39 noldsm+nodecode+nomma+noload {d:.1} | ko64 nobar {d:.1} | ko103 noldsm+nodecode+nomma+noload+nobar {d:.1} | ko119 ko103+noepi {d:.1} | ko128 noloopaddr {d:.1} | empty {d:.1} us\n", .{ rows, full, nodecode, nomma, noload, noguard, noepi, nodecode_nomma, nodecode_noguard, noldsm, noldsm_nodecode_nomma, noldsm_nodecode_nomma_noload, nobar, loop_epi, loop_only, noloopaddr, empty_grid });
+    }
+}
+
+/// Timing only: the release rotation and gate/up run once to fill fp16 xd, then xd_w8s, the full
+/// down_w8s, every down KO ablation and the p5a small-item down (full and no-epilogue). No checks:
+/// the KO variants write wrong output by design.
+pub fn runDnKo(gpu: anytype) !void {
+    if (!cuda.kernels.available or cuda.kernels.exl3_experts.len == 0 or cuda.kernels.glm53_pmx.len == 0 or cuda.kernels.glm53_p5a.len == 0) return error.KernelsNotEmbedded;
+    var exp = try exl3e.Experts.load(gpu.d);
+    defer exp.unload();
+    var pmx = try exl3e.pmx.Pmx.load(gpu.d);
+    defer pmx.unload();
+    var small = try exl3e.p5a.P5a.load(gpu.d);
+    defer small.unload();
+    const p5a_noepi = try small.mod.function("tf_glm53_p5a_down_e4m3_noepi");
+    var arena = std.heap.ArenaAllocator.init(gpu.gpa);
+    defer arena.deinit();
+    var prng = std.Random.DefaultPrng.init(0x444E4B4F);
+    const rig = try arena.allocator().create(Rig);
+    rig.* = .{ .gpu = gpu, .a = arena.allocator(), .s = try cuda.Stream.init(gpu.d, false), .rng = prng.random() };
+    defer rig.s.deinit();
+    defer {
+        for (rig.bufs.items) |*buf| buf.free();
+        rig.bufs.deinit(gpu.gpa);
+    }
+    const weights = try buildWeights(rig, wbench);
+    const layer = layerOf(weights, .mcg_e4m3, 0, 0);
+    const scratch_bytes = try exl3e.prompt.bytes(layer, ROWS_MAX, SLOTS, false);
+    const scratch_ptr = try rig.zeros(scratch_bytes);
+    const sc = try exl3e.prompt.scratch(scratch_ptr, layer, ROWS_MAX, SLOTS, false);
+    const x_host = try rig.bfs(ROWS_MAX * D, 0.5);
+    const x = try rig.dev(std.mem.sliceAsBytes(x_host));
+    const route_plan = try planOf(rig);
+    var ev: [2]cuda.Event = undefined;
+    for (&ev) |*event| event.* = try cuda.Event.init(gpu.d, true);
+    defer {
+        for (&ev) |*event| event.deinit();
+    }
+    const row_counts = [_]usize{ 2048, 4096 };
+    var failed = false;
+    for (row_counts) |rows| {
+        const host_pick = try benchPicks(rig.a, rows);
+        const call = Call{
+            .exp = &exp,
+            .pmx = &pmx,
+            .stream = rig.s,
+            .layer = layer,
+            .x = x,
+            .picks = try rig.dev(std.mem.sliceAsBytes(host_pick)),
+            .rows = rows,
+            .sc = sc,
+            .route_plan = route_plan,
+        };
+        const pairs = rows * SLOTS;
+        try exp.router.route(rig.s, call.picks, pairs, E, exl3e.prompt.wide_tile, route_plan);
+        const live = try downLive(rig, route_plan, pairs);
+        // The gate/up path fills fp16 xd: release rotation then release PMX gate/up, once.
+        try launchRot(&call);
+        try launchGu(&call);
+        // xd_w8s first: it writes the e4m3 codes and scales the down kernels read from sc.xg.
+        const us_xd = try timed(&call, &ev, .xd_w8s);
+        const us_full = try timedDownFun(&call, &ev, call.pmx.down_w8s);
+        const ko1 = try timedDownFun(&call, &ev, call.pmx.down_w8s_ko[0]);
+        const ko2 = try timedDownFun(&call, &ev, call.pmx.down_w8s_ko[1]);
+        const ko4 = try timedDownFun(&call, &ev, call.pmx.down_w8s_ko[2]);
+        const ko16 = try timedDownFun(&call, &ev, call.pmx.down_w8s_ko[3]);
+        const ko32 = try timedDownFun(&call, &ev, call.pmx.down_w8s_ko[4]);
+        const ko64 = try timedDownFun(&call, &ev, call.pmx.down_w8s_ko[5]);
+        const ko35 = try timedDownFun(&call, &ev, call.pmx.down_w8s_ko[6]);
+        const ko39 = try timedDownFun(&call, &ev, call.pmx.down_w8s_ko[7]);
+        const us_empty = try timedDownFun(&call, &ev, call.pmx.down_w8s_empty);
+        const us_p5a = try timedP5aDown(&call, &ev, small.down[1]);
+        const us_p5a_noepi = try timedP5aDown(&call, &ev, p5a_noepi);
+        const us_epi = try timedDownFun(&call, &ev, call.pmx.down_w8s_epi);
+        const us_p5a_epi = try timedP5aDown(&call, &ev, small.down_epi);
+        std.debug.print("BENCH glm53-dn-ko rows={d} | xd {d:.1} | full {d:.1} | ko1 nodecode {d:.1} | ko2 nomma {d:.1} | ko4 noload {d:.1} | ko16 noepi {d:.1} | ko32 noldsm {d:.1} | ko64 nobar {d:.1} | ko35 nodecode+nomma+noldsm {d:.1} | ko39 nodecode+nomma+noload+noldsm {d:.1} | empty {d:.1} | p5a {d:.1} | p5a noepi {d:.1} us\n", .{ rows, us_xd, us_full, ko1, ko2, ko4, ko16, ko32, ko64, ko35, ko39, us_empty, us_p5a, us_p5a_noepi });
+        std.debug.print("BENCH glm53-dn-epi rows={d} | down {d:.1} | down_epi {d:.1} | p5a {d:.1} | p5a_epi {d:.1} us\n", .{ rows, us_full, us_epi, us_p5a, us_p5a_epi });
+        const y_len = pairs * D * 4;
+        var row_failed = false;
+        {
+            try wipe(rig, call.sc.y, y_len);
+            try launchXdW8s(&call);
+            try launchDownW8sFun(&call, call.pmx.down_w8s);
+            const y_down = try fetch(rig, call.sc.y, y_len);
+            defer rig.gpu.gpa.free(y_down);
+            try wipe(rig, call.sc.y, y_len);
+            try launchXdW8s(&call);
+            try launchDownW8sFun(&call, call.pmx.down_w8s_epi);
+            const y_epi = try fetch(rig, call.sc.y, y_len);
+            defer rig.gpu.gpa.free(y_epi);
+            if (firstDownMismatch(live.large, y_down, y_epi, D)) |m| {
+                std.debug.print("FAIL glm53-dn-epi rows={d} down_w8s pair={d} col={d}\n", .{ rows, m.pair, m.col });
+                row_failed = true;
+            }
+        }
+        {
+            try wipe(rig, call.sc.y, y_len);
+            try launchP5aDownFun(&call, small.down[1]);
+            const y_p5a = try fetch(rig, call.sc.y, y_len);
+            defer rig.gpu.gpa.free(y_p5a);
+            try wipe(rig, call.sc.y, y_len);
+            try launchP5aDownFun(&call, small.down_epi);
+            const y_p5a_epi = try fetch(rig, call.sc.y, y_len);
+            defer rig.gpu.gpa.free(y_p5a_epi);
+            if (firstDownMismatch(live.small, y_p5a, y_p5a_epi, D)) |m| {
+                std.debug.print("FAIL glm53-dn-epi rows={d} p5a pair={d} col={d}\n", .{ rows, m.pair, m.col });
+                row_failed = true;
+            }
+        }
+        if (!row_failed) std.debug.print("INFO glm53-dn-epi rows={d} large_pairs={d} small_pairs={d} byte=equal\n", .{ rows, live.large.len, live.small.len });
+        failed = failed or row_failed;
+    }
+    if (failed) return error.Ra8Mismatch;
 }

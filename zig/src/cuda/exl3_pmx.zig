@@ -22,6 +22,38 @@ pub const gu_w8_smem: usize = 2 * (2 * bm * 128 + 2 * 8 * 8 * 24 * 4);
 pub const dn_smem: usize = 38_912;
 /// TF_GLM53_DOWN_W8S: three stages. One stage is a 128-K block: e4m3 X (128*128) and 8 x 16 trellis tiles (8*16*24*4).
 pub const down_w8_smem: usize = 3 * (bm * 128 + 8 * 16 * 24 * 4);
+/// gu_w8s knockout masks, in the order the glm53-ra8-ko bench prints them.
+pub const gu_w8s_ko_masks = [_]u8{ 1, 2, 4, 8, 16, 3, 9, 32, 35, 39, 64, 103, 119, 128 };
+const gu_w8s_ko_syms = [_][:0]const u8{
+    "tf_glm53_pmx_gu_w8s_ko1_e4m3",
+    "tf_glm53_pmx_gu_w8s_ko2_e4m3",
+    "tf_glm53_pmx_gu_w8s_ko4_e4m3",
+    "tf_glm53_pmx_gu_w8s_ko8_e4m3",
+    "tf_glm53_pmx_gu_w8s_ko16_e4m3",
+    "tf_glm53_pmx_gu_w8s_ko3_e4m3",
+    "tf_glm53_pmx_gu_w8s_ko9_e4m3",
+    "tf_glm53_pmx_gu_w8s_ko32_e4m3",
+    "tf_glm53_pmx_gu_w8s_ko35_e4m3",
+    "tf_glm53_pmx_gu_w8s_ko39_e4m3",
+    "tf_glm53_pmx_gu_w8s_ko64_e4m3",
+    "tf_glm53_pmx_gu_w8s_ko103_e4m3",
+    "tf_glm53_pmx_gu_w8s_ko119_e4m3",
+    "tf_glm53_pmx_gu_w8s_ko128_e4m3",
+};
+
+/// down_w8s knockout masks, in the order the glm53-dn-ko bench prints them: KO1 NODECODE,
+/// KO2 NOMMA, KO4 NOLOADS, KO16 NOEPI, KO32 NOLDSM, KO64 NOBAR, KO35 = 1|2|32, KO39 = 1|2|4|32.
+pub const dn_ko_masks = [_]u8{ 1, 2, 4, 16, 32, 64, 35, 39 };
+const dn_ko_syms = [_][:0]const u8{
+    "tf_glm53_pmx_down_w8s_ko1_e4m3",
+    "tf_glm53_pmx_down_w8s_ko2_e4m3",
+    "tf_glm53_pmx_down_w8s_ko4_e4m3",
+    "tf_glm53_pmx_down_w8s_ko16_e4m3",
+    "tf_glm53_pmx_down_w8s_ko32_e4m3",
+    "tf_glm53_pmx_down_w8s_ko64_e4m3",
+    "tf_glm53_pmx_down_w8s_ko35_e4m3",
+    "tf_glm53_pmx_down_w8s_ko39_e4m3",
+};
 
 pub fn eligibleWidths(k2: []const i32) bool {
     if (k2.len == 0) return false;
@@ -164,9 +196,22 @@ pub const Pmx = struct {
     gu_a8: Function = undefined,
     gu_w8: Function = undefined,
     gu_w8s: Function = undefined,
+    /// gu_w8s with the k32 decode split into two pairs, interleaved with the MMA sweep. Same bits and smem.
+    gu_w8s_pf: Function = undefined,
+    /// gu_w8s timing ablations indexed by gu_w8s_ko_masks: KO1, KO2, KO4, KO8, KO16, KO3, KO9,
+    /// KO32 (NOLDSM), KO35, KO39, KO64 (NOBAR), KO103, KO119, KO128 (NOLOOPADDR).
+    gu_w8s_ko: [gu_w8s_ko_masks.len]Function = undefined,
+    /// gu_w8s with only the item/count reads: launch and grid cost.
+    gu_w8s_empty: Function = undefined,
     /// TF_GLM53_DOWN_W8S: tf_glm53_pmx_xd_w8s (xd -> e4m3 codes + one scale a pair) and the e4m3 down.
     xd_w8s: Function = undefined,
     down_w8s: Function = undefined,
+    /// TF_GLM53_DN_EPI=1: down_w8s with the paired-FWHT, vector-store epilogue (same bytes).
+    down_w8s_epi: Function = undefined,
+    /// down_w8s timing ablations indexed by dn_ko_masks.
+    down_w8s_ko: [dn_ko_masks.len]Function = undefined,
+    /// down_w8s with only the item/count reads: launch and grid cost.
+    down_w8s_empty: Function = undefined,
 
     pub fn load(d: *const Driver) !Pmx {
         if (!kernels.available) return error.BuiltWithoutKernels;
@@ -183,9 +228,25 @@ pub const Pmx = struct {
         try p.gu_w8.allowDynamicShared(@as(u32, @intCast(gu_w8_smem)));
         p.gu_w8s = try p.mod.function("tf_glm53_pmx_gu_w8s_e4m3");
         try p.gu_w8s.allowDynamicShared(@as(u32, @intCast(gu_w8_smem)));
+        p.gu_w8s_pf = try p.mod.function("tf_glm53_pmx_gu_w8s_pf_e4m3");
+        try p.gu_w8s_pf.allowDynamicShared(@as(u32, @intCast(gu_w8_smem)));
+        for (gu_w8s_ko_syms, 0..) |sym, i| {
+            p.gu_w8s_ko[i] = try p.mod.function(sym);
+            try p.gu_w8s_ko[i].allowDynamicShared(@as(u32, @intCast(gu_w8_smem)));
+        }
+        p.gu_w8s_empty = try p.mod.function("tf_glm53_pmx_gu_w8s_empty_e4m3");
+        try p.gu_w8s_empty.allowDynamicShared(@as(u32, @intCast(gu_w8_smem)));
         p.xd_w8s = try p.mod.function("tf_glm53_pmx_xd_w8s");
         p.down_w8s = try p.mod.function("tf_glm53_pmx_down_w8s_e4m3");
         try p.down_w8s.allowDynamicShared(@as(u32, @intCast(down_w8_smem)));
+        p.down_w8s_epi = try p.mod.function("tf_glm53_pmx_down_w8s_epi_e4m3");
+        try p.down_w8s_epi.allowDynamicShared(@as(u32, @intCast(down_w8_smem)));
+        for (dn_ko_syms, 0..) |sym, i| {
+            p.down_w8s_ko[i] = try p.mod.function(sym);
+            try p.down_w8s_ko[i].allowDynamicShared(@as(u32, @intCast(down_w8_smem)));
+        }
+        p.down_w8s_empty = try p.mod.function("tf_glm53_pmx_down_w8s_empty_e4m3");
+        try p.down_w8s_empty.allowDynamicShared(@as(u32, @intCast(down_w8_smem)));
         // TODO(P2): resolve down-kernel entries when the down/combine path is added.
         p.dn = .{ undefined, undefined };
         p.dequant = .{

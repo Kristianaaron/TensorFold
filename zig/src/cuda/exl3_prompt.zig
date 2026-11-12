@@ -173,11 +173,12 @@ pub const Kernels = struct {
     }
 
     /// =10 down: items <= 64 members on p5a, larger ones on =2's wide down.
-    pub fn downP5a(k: Kernels, small: *const p5a_mod.P5a, s: Stream, l: ex.Layer, rows: usize, sc: Scratch, p: grouped.Plan) !void {
+    pub fn downP5a(k: Kernels, small: *const p5a_mod.P5a, s: Stream, l: ex.Layer, rows: usize, sc: Scratch, p: grouped.Plan, dn_epi: bool) !void {
         const w = k.wide orelse return error.Exl3PromptWideMissing;
         const c: usize = if (l.codebook == .mcg_e4m3) 1 else 0;
         const items = grouped.maxItems(rows * sc.slots, l.experts, wide_tile);
-        try go(small.down[c], s, .{ l.dims / 256, items, 1 }, p5a_mod.threads, downArgs(l, sc, p));
+        const small_down = if (dn_epi and c == 1) small.down_epi else small.down[c];
+        try go(small_down, s, .{ l.dims / 256, items, 1 }, p5a_mod.threads, downArgs(l, sc, p));
         try goShared(w.down[c], s, .{ l.dims / 128, items, 1 }, wide_threads, wide_smem, .{ sc.xd, l.down, p.items, p.counts, p.members, l.svh_d, sc.y, i(l.width), i(l.dims), l.down_k2 });
     }
 
@@ -195,31 +196,34 @@ pub const Kernels = struct {
             try k.gateUpP5a(pmx, small, s, l, rows, sc, p);
         }
         if (e.w8s and e.down_w8s and l.codebook == .mcg_e4m3) {
-            try k.downW8s(pmx, small, s, l, picks, rows, sc, p);
+            try k.downW8s(pmx, small, s, l, picks, rows, sc, p, e.down_epi);
         } else {
-            try k.downP5a(small, s, l, rows, sc, p);
+            try k.downP5a(small, s, l, rows, sc, p, e.down_epi);
         }
     }
 
     /// TF_GLM53_DOWN_W8S: p5a down for items <= 64 members (fp16 xd, =10's bits), then xd_w8s writes every local pair's
     /// e4m3 codes and fp32 scale into its sc.xg slot (free once gate/up is done: 2 * dims bytes a pair, codes at bytes
     /// 0..width, scale at byte width) and down_w8s runs the items > 64 members, 256 model columns a CTA.
-    pub fn downW8s(k: Kernels, pmx: *const pmx_mod.Pmx, small: *const p5a_mod.P5a, s: Stream, l: ex.Layer, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan) !void {
+    pub fn downW8s(k: Kernels, pmx: *const pmx_mod.Pmx, small: *const p5a_mod.P5a, s: Stream, l: ex.Layer, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan, dn_epi: bool) !void {
         _ = k;
         if (l.width % 128 != 0 or l.width > 4096 or l.dims % 256 != 0 or l.width + 4 > 2 * l.dims) return error.Exl3Shape;
         const pairs = rows * sc.slots;
         const items = grouped.maxItems(pairs, l.experts, wide_tile);
-        try go(small.down[1], s, .{ l.dims / 256, items, 1 }, p5a_mod.threads, downArgs(l, sc, p));
+        const small_down = if (dn_epi) small.down_epi else small.down[1];
+        try go(small_down, s, .{ l.dims / 256, items, 1 }, p5a_mod.threads, downArgs(l, sc, p));
         var q: launch.Args = .{};
         inline for (.{ sc.xd, picks, sc.xg, i(l.width), i(2 * l.dims) }) |v| q.add(v);
         try launch.launch(pmx.xd_w8s, .{ .grid = .{ .x = @intCast(pairs), .y = 1, .z = 1 }, .block = .{ .x = 128 } }, s, &q);
         var args: launch.Args = .{};
         args.add(pmx_mod.DownW8Args{ .xq = sc.xg, .td = l.down, .k2 = l.down_k2, .items = p.items, .counts = p.counts, .members = p.members, .svh = l.svh_d, .y = sc.y, .K = i(l.width), .D = i(l.dims), .xs = i(2 * l.dims) });
-        try launch.launch(pmx.down_w8s, .{ .grid = .{ .x = @intCast(l.dims / 256), .y = @intCast(items), .z = 1 }, .block = .{ .x = 512 }, .shared = @intCast(pmx_mod.down_w8_smem) }, s, &args);
+        const down_fn = if (dn_epi) pmx.down_w8s_epi else pmx.down_w8s;
+        try launch.launch(down_fn, .{ .grid = .{ .x = @intCast(l.dims / 256), .y = @intCast(items), .z = 1 }, .block = .{ .x = 512 }, .shared = @intCast(pmx_mod.down_w8_smem) }, s, &args);
     }
 
     /// TF_GLM53_GU_W8S phase 1: the plan, then two rotations into the same pair slots of sc.xg/sc.xu (2 * dims bytes a
     /// pair). rot_in_w8s writes every local pair as e4m3 codes (bytes 0..dims) with its fp32 scale at byte dims;
+    /// TF_GLM53_ROT_DD=1 runs the same bits on rot_in_w8s_row, one CTA a row with x staged once.
     /// rot_in_w4s then overwrites the slots of small items' pairs (<= 64 members) with =10's fp16 rotation.
     pub fn prepareW8s(k: Kernels, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan) !void {
         _ = k;
@@ -227,11 +231,16 @@ pub const Kernels = struct {
         // rot_in_w8s holds a whole row in one CTA: 16 warps x 3 blocks of 128 K. The scale sits 4-byte aligned after the codes.
         if (l.dims % 128 != 0 or l.dims / 128 > 48 or 2 * l.dims > std.math.maxInt(i32)) return error.Exl3Shape;
         _ = try bytes(l, rows, sc.slots, false);
+        if (e.rot_dd and !e.w8s_all) return error.RotDdNeedsGuW8s;
         const pairs = rows * sc.slots;
         try router.route(s, picks, pairs, l.experts, wide_tile, p);
         var codes: launch.Args = .{};
         codes.add(ex.RotA8Args{ .x = x, .x_stride = i(stride), .x_dtype = @intFromEnum(ex.DType.bf16), .pick = picks, .suh0 = l.suh_g, .suh1 = l.suh_u, .out0 = sc.xg, .out1 = sc.xu, .sc0 = sc.xg + l.dims, .sc1 = sc.xu + l.dims, .k = i(l.dims), .slots = i(sc.slots), .experts = i(l.experts), .ostride = i(2 * l.dims) });
-        try launch.launch(e.rot_in_w8s, .{ .grid = .{ .x = @intCast(pairs), .y = 2, .z = 1 }, .block = .{ .x = 512 } }, s, &codes);
+        if (e.rot_dd) {
+            try launch.launch(e.rot_in_w8s_row, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = 512 } }, s, &codes);
+        } else {
+            try launch.launch(e.rot_in_w8s, .{ .grid = .{ .x = @intCast(pairs), .y = 2, .z = 1 }, .block = .{ .x = 512 } }, s, &codes);
+        }
         if (e.w8s_all) return;
         const items = grouped.maxItems(pairs, l.experts, wide_tile);
         var small: launch.Args = .{};

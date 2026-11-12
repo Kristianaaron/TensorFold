@@ -243,6 +243,27 @@ __device__ __forceinline__ void fwht128(float (&v)[4], int lane) {
     }
 }
 
+// Two independent 128-value transforms, interleaved stage by stage. Each list takes exactly fwht128's
+// operations in the same order, so both results are fwht128's bits; only issue slots are shared.
+__device__ __forceinline__ void fwht128x2(float (&v0)[4], float (&v1)[4], int lane) {
+    const float a0 = v0[0] + v0[1], b0 = v0[0] - v0[1], c0 = v0[2] + v0[3], d0 = v0[2] - v0[3];
+    const float a1 = v1[0] + v1[1], b1 = v1[0] - v1[1], c1 = v1[2] + v1[3], d1 = v1[2] - v1[3];
+    v0[0] = a0 + c0; v1[0] = a1 + c1;
+    v0[1] = b0 + d0; v1[1] = b1 + d1;
+    v0[2] = a0 - c0; v1[2] = a1 - c1;
+    v0[3] = b0 - d0; v1[3] = b1 - d1;
+#pragma unroll
+    for (int m = 1; m < 32; m <<= 1) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float o0 = __shfl_xor_sync(0xffffffffu, v0[j], m);
+            const float o1 = __shfl_xor_sync(0xffffffffu, v1[j], m);
+            v0[j] = (lane & m) ? o0 - v0[j] : v0[j] + o0;
+            v1[j] = (lane & m) ? o1 - v1[j] : v1[j] + o1;
+        }
+    }
+}
+
 constexpr float HAD_SCALE = 0.08838834764831845f;   // 1 / sqrt(128)
 
 }  // namespace tf_exl3

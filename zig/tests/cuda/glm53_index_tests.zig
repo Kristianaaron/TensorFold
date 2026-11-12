@@ -21,6 +21,7 @@ pub fn run(gpu: anytype) !void {
     try scoresQsParityCases(gpu, stream, &kernels);
     try tileSkipCases(gpu, stream, &kernels);
     try topkCases(gpu, stream, &kernels);
+    try topkEptParity(gpu, stream, &kernels);
     try mergeCase(gpu, stream, &kernels);
     try merge2Cases(gpu, stream, &kernels);
     try merge2BlockRowsCase(gpu, stream, &kernels, 130, 64);
@@ -242,6 +243,94 @@ fn topkCases(gpu: anytype, stream: cuda.Stream, kernels: *const index.Index) !vo
     }
 }
 
+fn fillFitScores(scores: []f32, rows: usize, nkeys: usize, rnd: std.Random, fixture: u8) void {
+    for (scores) |*v| v.* = rnd.float(f32) * 2 - 1;
+    for (0..rows) |r| {
+        const row = scores[r * nkeys ..][0..nkeys];
+        switch (fixture) {
+            0 => {
+                const n = @min(@as(usize, 64), nkeys);
+                for (0..n) |i| row[i] = 0.25;
+            },
+            1 => {
+                if (nkeys >= 2) {
+                    row[0] = 0.0;
+                    row[1] = -0.0;
+                }
+            },
+            2 => @memset(row, 1.5),
+            3 => {
+                if (nkeys > 0) {
+                    const v = row[0];
+                    var i: usize = if (nkeys > 64) nkeys - 64 else 0;
+                    while (i < nkeys) : (i += 1) row[i] = v;
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+fn topkEptParity(gpu: anytype, stream: cuda.Stream, kernels: *const index.Index) !void {
+    const k = index.top_k;
+    const rows_cases = [_]usize{ 1, 7, 64, 512 };
+    const nkeys_cases = [_]usize{ 1024, 8192, 16896, 16897 };
+    var prng = std.Random.DefaultPrng.init(0x51535_f17);
+    const rnd = prng.random();
+    for (rows_cases) |rows| {
+        const positions = try gpu.gpa.alloc(i64, rows);
+        defer gpu.gpa.free(positions);
+        @memset(positions, @as(i64, 2 * 16897));
+        var dpos = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(positions));
+        defer dpos.free();
+        var tokens_off = try cuda.DeviceBuffer.alloc(gpu.d, rows * k * 4);
+        defer tokens_off.free();
+        var tokens_on = try cuda.DeviceBuffer.alloc(gpu.d, rows * k * 4);
+        defer tokens_on.free();
+        var counts_off = try cuda.DeviceBuffer.alloc(gpu.d, rows * 4);
+        defer counts_off.free();
+        var counts_on = try cuda.DeviceBuffer.alloc(gpu.d, rows * 4);
+        defer counts_on.free();
+        var records_off = try cuda.DeviceBuffer.alloc(gpu.d, rows * k * 8);
+        defer records_off.free();
+        var records_on = try cuda.DeviceBuffer.alloc(gpu.d, rows * k * 8);
+        defer records_on.free();
+        var off = kernels.*;
+        off.topk_fit = false;
+        var on = kernels.*;
+        on.topk_fit = true;
+        for (nkeys_cases) |nkeys| {
+            const scores = try gpu.gpa.alloc(f32, rows * nkeys);
+            defer gpu.gpa.free(scores);
+            var dscores = try cuda.DeviceBuffer.alloc(gpu.d, scores.len * 4);
+            defer dscores.free();
+            for (0..2) |rank| for (0..4) |fixture| {
+                fillFitScores(scores, rows, nkeys, rnd, @intCast(fixture));
+                try dscores.upload(0, std.mem.sliceAsBytes(scores));
+                try off.topk(stream, dscores.ptr, nkeys, tokens_off.ptr, counts_off.ptr, records_off.ptr, dpos.ptr, rows, nkeys, k, rank, 2);
+                try on.topk(stream, dscores.ptr, nkeys, tokens_on.ptr, counts_on.ptr, records_on.ptr, dpos.ptr, rows, nkeys, k, rank, 2);
+                try stream.synchronize();
+                const t_off = try download(gpu, tokens_off);
+                defer gpu.gpa.free(t_off);
+                const t_on = try download(gpu, tokens_on);
+                defer gpu.gpa.free(t_on);
+                const c_off = try download(gpu, counts_off);
+                defer gpu.gpa.free(c_off);
+                const c_on = try download(gpu, counts_on);
+                defer gpu.gpa.free(c_on);
+                const r_off = try download(gpu, records_off);
+                defer gpu.gpa.free(r_off);
+                const r_on = try download(gpu, records_on);
+                defer gpu.gpa.free(r_on);
+                try expect(std.mem.eql(u8, t_off, t_on), "topk fit token bytes rows={d} nkeys={d} rank={d} fixture={d}", .{ rows, nkeys, rank, fixture });
+                try expect(std.mem.eql(u8, c_off, c_on), "topk fit count bytes rows={d} nkeys={d} rank={d} fixture={d}", .{ rows, nkeys, rank, fixture });
+                try expect(std.mem.eql(u8, r_off, r_on), "topk fit record bytes rows={d} nkeys={d} rank={d} fixture={d}", .{ rows, nkeys, rank, fixture });
+            };
+        }
+    }
+    pass("glm53-index: fitted top-k entry tiles are byte-equal to the 33-entry tile", .{});
+}
+
 fn mergeCase(gpu: anytype, stream: cuda.Stream, kernels: *const index.Index) !void {
     const k = 64;
     const records = try gpu.gpa.alloc(index.PackedCandidate, 2 * k);
@@ -269,7 +358,7 @@ fn mergeCase(gpu: anytype, stream: cuda.Stream, kernels: *const index.Index) !vo
     var dposition = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.asBytes(&position));
     defer dposition.free();
     try kernels.merge(stream, drecords.ptr, global.ptr, global_count.ptr, local.ptr, local_count.ptr, dposition.ptr, 0, 2, 1, k);
-    try kernels.merge2(stream, drecords.ptr, global2.ptr, global_count2.ptr, local2.ptr, local_count2.ptr, dposition.ptr, 0, 2, 1, k, 1);
+    try merge2FastParity(gpu, stream, kernels, drecords.ptr, global2, global_count2, local2, local_count2, dposition.ptr, 0, 2, 1, k, 1);
     try stream.synchronize();
     const got_global = try download(gpu, global);
     defer gpu.gpa.free(got_global);
@@ -323,7 +412,7 @@ fn merge2Cases(gpu: anytype, stream: cuda.Stream, kernels: *const index.Index) !
     var dposition = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.asBytes(&position));
     defer dposition.free();
     try kernels.merge(stream, drecords.ptr, global.ptr, global_count.ptr, local.ptr, local_count.ptr, dposition.ptr, 1, 2, 1, k);
-    try kernels.merge2(stream, drecords.ptr, global2.ptr, global_count2.ptr, local2.ptr, local_count2.ptr, dposition.ptr, 1, 2, 1, k, 1);
+    try merge2FastParity(gpu, stream, kernels, drecords.ptr, global2, global_count2, local2, local_count2, dposition.ptr, 1, 2, 1, k, 1);
     try stream.synchronize();
     try compareBuffers(gpu, global, global2, "merge2 k=2048 global parity");
     try compareBuffers(gpu, global_count, global_count2, "merge2 k=2048 global count parity");
@@ -404,7 +493,7 @@ fn merge2BlockRowsCase(gpu: anytype, stream: cuda.Stream, kernels: *const index.
     var lc2 = try cuda.DeviceBuffer.alloc(gpu.d, rows * 4);
     defer lc2.free();
     try kernels.merge(stream, rank_buf.ptr, global.ptr, gc.ptr, local.ptr, lc.ptr, positions.ptr, 0, 2, rows, k);
-    try kernels.merge2(stream, piped.ptr, global2.ptr, gc2.ptr, local2.ptr, lc2.ptr, positions.ptr, 0, 2, rows, k, sr);
+    try merge2FastParity(gpu, stream, kernels, piped.ptr, global2, gc2, local2, lc2, positions.ptr, 0, 2, rows, k, sr);
     try stream.synchronize();
     try compareBuffers(gpu, global, global2, "block-major merge2 global byte parity");
     try compareBuffers(gpu, gc, gc2, "block-major merge2 global counts byte parity");
@@ -472,7 +561,7 @@ fn topkMerge2RandomCase(gpu: anytype, stream: cuda.Stream, kernels: *const index
     var lc2 = try cuda.DeviceBuffer.alloc(gpu.d, rows * 4);
     defer lc2.free();
     try kernels.merge(stream, rank_buf.ptr, global.ptr, gc.ptr, local.ptr, lc.ptr, dpos.ptr, 0, 2, rows, k);
-    try kernels.merge2(stream, tiled.ptr, global2.ptr, gc2.ptr, local2.ptr, lc2.ptr, dpos.ptr, 0, 2, rows, k, rows);
+    try merge2FastParity(gpu, stream, kernels, tiled.ptr, global2, gc2, local2, lc2, dpos.ptr, 0, 2, rows, k, rows);
     try stream.synchronize();
     try compareBuffers(gpu, global, global2, "random topk->merge global byte parity");
     try compareBuffers(gpu, gc, gc2, "random topk->merge global-count byte parity");
@@ -486,6 +575,28 @@ fn compareBuffers(gpu: anytype, old_buffer: cuda.DeviceBuffer, new_buffer: cuda.
     const new = try download(gpu, new_buffer);
     defer gpu.gpa.free(new);
     try expect(std.mem.eql(u8, old, new), label, .{});
+}
+
+fn merge2FastParity(gpu: anytype, stream: cuda.Stream, kernels: *const index.Index, candidate_records: u64, global: cuda.DeviceBuffer, global_counts: cuda.DeviceBuffer, out: cuda.DeviceBuffer, counts: cuda.DeviceBuffer, positions: u64, rank: usize, world: usize, rows: usize, topk_count: usize, block_rows: usize) !void {
+    var base = kernels.*;
+    base.merge2_fast = false;
+    try base.merge2(stream, candidate_records, global.ptr, global_counts.ptr, out.ptr, counts.ptr, positions, rank, world, rows, topk_count, block_rows);
+    var fast = kernels.*;
+    fast.merge2_fast = true;
+    var fglobal = try cuda.DeviceBuffer.alloc(gpu.d, rows * topk_count * 4);
+    defer fglobal.free();
+    var fgc = try cuda.DeviceBuffer.alloc(gpu.d, rows * 4);
+    defer fgc.free();
+    var fout = try cuda.DeviceBuffer.alloc(gpu.d, rows * topk_count * 4);
+    defer fout.free();
+    var flc = try cuda.DeviceBuffer.alloc(gpu.d, rows * 4);
+    defer flc.free();
+    try fast.merge2(stream, candidate_records, fglobal.ptr, fgc.ptr, fout.ptr, flc.ptr, positions, rank, world, rows, topk_count, block_rows);
+    try stream.synchronize();
+    try compareBuffers(gpu, global, fglobal, "merge2_fast global parity");
+    try compareBuffers(gpu, global_counts, fgc, "merge2_fast global count parity");
+    try compareBuffers(gpu, out, fout, "merge2_fast local parity");
+    try compareBuffers(gpu, counts, flc, "merge2_fast local count parity");
 }
 
 fn merge2EdgeCases(gpu: anytype, stream: cuda.Stream, kernels: *const index.Index) !void {
@@ -539,7 +650,7 @@ fn merge2EdgeCase(gpu: anytype, stream: cuda.Stream, kernels: *const index.Index
     var dposition = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.asBytes(&position));
     defer dposition.free();
     try kernels.merge(stream, input.ptr, global_old.ptr, global_count_old.ptr, local_old.ptr, local_count_old.ptr, dposition.ptr, rank, 2, 1, k);
-    try kernels.merge2(stream, input.ptr, global_new.ptr, global_count_new.ptr, local_new.ptr, local_count_new.ptr, dposition.ptr, rank, 2, 1, k, 1);
+    try merge2FastParity(gpu, stream, kernels, input.ptr, global_new, global_count_new, local_new, local_count_new, dposition.ptr, rank, 2, 1, k, 1);
     try stream.synchronize();
     try compareBuffers(gpu, global_old, global_new, "merge2 edge global parity");
     try compareBuffers(gpu, global_count_old, global_count_new, "merge2 edge global count parity");

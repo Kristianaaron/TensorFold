@@ -46,6 +46,8 @@ test "sample candidate K defaults to 256 and rejects invalid or oversized widths
 }
 pub const dcp_world = 2;
 pub const default_chunk_rows = 4096;
+/// Attention and FFN piece rows. Kept explicit so the env switch and the workspace tests name the same value.
+pub const default_piece_rows = 512;
 pub const dense_limit = index.dense_limit;
 pub const kv_row_bytes = (mla.latent_dim + mla.rope_dim) * 2;
 pub const latent_row_bytes = mla.latent_dim * 2;
@@ -338,7 +340,7 @@ pub const Geometry = struct {
     chunk_rows: usize = default_chunk_rows,
     /// Attention and FFN run in pieces of this many rows inside a chunk, cut at absolute multiples (row-local
     /// kernels, so the bits do not depend on it; only the workspace does).
-    piece_rows: usize = 512,
+    piece_rows: usize = default_piece_rows,
     /// DtoD side-call park capacity in positions; zero disables the allocation.
     park_rows: usize = 0,
     park_tail_slot: usize = 0,
@@ -376,8 +378,14 @@ pub const Geometry = struct {
     qa_shard: bool = false,
     /// Overlap grouped-prefill attention gathers with the next piece's attention.
     piece_pipe: bool = false,
-    /// Run deferred grouped-prefill shared expert MLPs while the final attention gather runs.
+    /// Deferred grouped-prefill shared expert MLPs that cover an attention gather: 0 off, 1 at the group tail only,
+    /// 2 also before each piece wait (and pipes the dense piece gathers).
     gather_ovl: u8 = 0,
+    /// TF_GLM53_GATHER_SUM=1: the piece-pipe gathers write one sum block (fp32 attention, bf16 MoE; needs
+    /// piece_pipe and gather_ovl 1).
+    gather_sum: bool = false,
+    /// TF_GLM53_RMS_REG=1: the residual consumer keeps its bf16-rounded row in registers.
+    rms_reg: bool = false,
     /// Overlap grouped-prefill MoE all-gathers on the communication stream.
     moe_pipe: bool = false,
     /// Number of in-flight MoE gather slots. Two preserves the original workspace layout.
@@ -404,11 +412,17 @@ pub const Geometry = struct {
     /// captured once during setup and carried into Forward; setup refuses it without smla_p or with smla_fp8. Carves the
     /// union table (mla.smlaP3TableBytes(piece rows)) at the end of the attention phase; off carves nothing.
     smla_p3: bool = false,
+    /// TF_GLM53_SMLA_K8: prefill SMLA-P attends from once-written e4m3 key copies (tf_glm53_kv_k8 + tf_glm53_smla_k8),
+    /// captured once during setup and carried into Forward; setup refuses it without smla_p. Carves the owner and
+    /// stage copy spans (2 * smlaK8CopySlots(context) * mla.smla_k8_row_bytes) at the arena tail; off carves nothing.
+    smla_k8: bool = false,
     /// TF_GLM53_PREFILL_W8A8=1 captured once during setup and carried into Forward (prefill o_proj in W8A8).
     /// It does not change allocation geometry: the e4m3 rows and scales reuse the attention partials (`part`).
     prefill_w8a8: bool = false,
     /// TF_GLM53_PREFILL_W8A8=2. Carves w8a8_scratch after prefill_weight. Off carves a zero-length region.
     prefill_w8a8_all: bool = false,
+    /// TF_GLM53_IQ_FOLD=1 (needs prefill_w8a8_all): fold index_q into the wq_b W8A8 epilogue. No workspace change.
+    iq_fold: bool = false,
     qmmf_var: u8 = 0,
     /// no workspace effect; carried to Forward
     pre_fuse: PreFuse = .off,
@@ -459,11 +473,16 @@ pub const Geometry = struct {
 pub fn validateMoePipeGeometry(g: Geometry) !void {
     if (g.moe_ring < 2 or g.moe_ring > Workspace.max_moe_pipe_ring_slots) return error.BadMoeRing;
     if (!g.moe_pipe) return;
-    const pr: u64 = @intCast(@max(@min(g.piece_rows, @max(g.chunk_rows, g.decode_rows)), g.decode_rows));
-    if (!groupedExperts(g.expert_rows, @intCast(pr))) return error.MoePipeRequiresGroupedExperts;
-    const pieces = (g.expert_rows + @as(usize, @intCast(pr)) - 1) / @as(usize, @intCast(pr));
+    // Plain groups use 512-row pieces when adapt is on; adaptive groups use piece_rows. The ring and the
+    // per-piece events are sized for the larger of the two, and the group cut for the larger group.
+    const plain_piece: usize = plainPieceRows(g.piece_rows, g.expert_rows_adapt);
+    const group_rows: usize = if (g.expert_rows_adapt != 0) g.expert_rows_adapt else g.expert_rows;
+    const raw_piece: usize = if (g.expert_rows_adapt != 0) g.piece_rows else plain_piece;
+    const piece: usize = @max(@min(raw_piece, @max(g.chunk_rows, g.decode_rows)), g.decode_rows);
+    if (!groupedExperts(g.expert_rows, plain_piece) or !groupedExperts(group_rows, piece)) return error.MoePipeRequiresGroupedExperts;
+    const pieces: usize = (group_rows + piece - 1) / piece;
     if (pieces > Workspace.max_moe_pipe_pieces) return error.MoePipeTooManyPieces;
-    const stride = std.math.mul(u64, pr, hidden * 2) catch return error.MoePipeRingTooLarge;
+    const stride = std.math.mul(u64, piece, hidden * 2) catch return error.MoePipeRingTooLarge;
     const slot_bytes = std.math.mul(u64, stride, if (g.moe_post) dcp_world else 1 + dcp_world) catch return error.MoePipeRingTooLarge;
     _ = std.math.mul(u64, slot_bytes, @as(u64, g.moe_ring)) catch return error.MoePipeRingTooLarge;
 }
@@ -518,6 +537,23 @@ pub fn stageRows(context: usize) usize {
 /// The single sizing rule for the stage plane allocation (both pairs).
 pub fn stagePlaneBytes(geometry: Geometry, context: usize) u64 {
     return @as(u64, @intCast(stagePairsFor(geometry) * stageRows(context))) * kv_row_bytes;
+}
+
+/// TF_GLM53_SMLA_K8 copies both KV planes at the kernel's slot, key / world (glm53_stage_plane_slot, mla.cu
+/// uslot0). A context-sized prompt needs at most context / world slots; two extra absorb the end rounding.
+pub fn smlaK8CopySlots(context: usize) usize {
+    return context / dcp_world + 2;
+}
+
+/// Bytes of one e4m3 copy plane (mla.smla_k8_row_bytes a slot); zero when the switch is off.
+pub fn smlaK8PlaneBytes(geometry: Geometry, context: usize) u64 {
+    if (!geometry.smla_k8) return 0;
+    return @as(u64, @intCast(smlaK8CopySlots(context) * mla.smla_k8_row_bytes));
+}
+
+/// Both copy planes (owner then stage); zero when the switch is off.
+pub fn smlaK8CopyBytes(geometry: Geometry, context: usize) u64 {
+    return 2 * smlaK8PlaneBytes(geometry, context);
 }
 
 /// The shared StagePlanes carved from one allocation at `base`: pair b = latent [rows][512], then rope [rows][64].
@@ -599,6 +635,7 @@ pub const Breakdown = struct {
     latent_rope: u64,
     index_keys: u64,
     stage: u64,
+    smla_k8: u64 = 0,
     workspace: u64,
     expert_batch: u64,
     prefill_weight: u64,
@@ -614,7 +651,7 @@ pub const Breakdown = struct {
     }
 
     pub fn logicalState(b: Breakdown) u64 {
-        return b.latent_rope + b.index_keys + b.stage + b.workspace + b.prefill_weight + b.park;
+        return b.latent_rope + b.index_keys + b.stage + b.smla_k8 + b.workspace + b.prefill_weight + b.park;
     }
 
     pub fn report(b: Breakdown, context: usize) void {
@@ -640,6 +677,7 @@ pub const Breakdown = struct {
             .{ "runtime: CUDA context, module images, load gap (measured)", b.runtime },
         };
         inline for (more) |r| std.debug.print("  {s:<48} {d:>8.2}\n", .{ r[0], gib(r[1]) });
+        if (b.smla_k8 != 0) std.debug.print("  {s:<48} {d:>8.2}\n", .{ "prefill SMLA-K8 key copies (e4m3, two planes)", gib(b.smla_k8) });
         if (b.park != 0) std.debug.print("  {s:<48} {d:>8.2}\n", .{ "side park (TF_GLM53_SIDE_ROWS)", gib(b.park) });
         std.debug.print("  {s:<48} {d:>8.2} (logical {d:.4}, rounded {d:.4})\n", .{ "State arenas as allocated (2 MiB rounding)", gib(b.state_arenas), gib(b.logicalState()), gib(b.state_arenas) });
         std.debug.print("  {s:<48} {d:>8.2}\n", .{ "total (allocated)", gib(b.total()) });
@@ -651,6 +689,7 @@ pub fn breakdown(geometry: Geometry, context: usize, w: WeightClasses) Breakdown
     const planes = planeBytes(context, geometry.layers, geometry.full_index_layers, geometry.cache_format);
     const lr = planes.latent + planes.rope;
     const stage = stagePlaneBytes(geometry, context);
+    const smla_k8 = smlaK8CopyBytes(geometry, context);
     const prefill_weight = if (geometry.prefill_bf16) prefill_weight_scratch_bytes else 0;
     const ws = workspaceLayout(geometry, context).bytes - prefill_weight;
     var baseline = geometry;
@@ -660,17 +699,17 @@ pub fn breakdown(geometry: Geometry, context: usize, w: WeightClasses) Breakdown
     const kv = std.mem.alignForward(u64, planes.latent, tensor_alignment) + std.mem.alignForward(u64, planes.rope, tensor_alignment) + planes.index;
     const park: u64 = if (geometry.park_rows == 0 or geometry.park_tail_slot != 0) 0 else parkBytes(geometry.layers, geometry.full_index_layers, geometry.park_rows);
     const park_arena: u64 = if (park == 0) 0 else arenaBytes(park);
-    return .{ .weights = w, .latent_rope = lr, .index_keys = planes.index, .stage = stage, .workspace = ws, .expert_batch = expert_batch, .prefill_weight = prefill_weight, .park = park, .graphs = geometry.graphs_bytes, .runtime = geometry.runtime_bytes, .state_arenas = arenaBytes(kv) + arenaBytes(stage) + arenaBytes(ws + prefill_weight) + park_arena };
+    return .{ .weights = w, .latent_rope = lr, .index_keys = planes.index, .stage = stage, .smla_k8 = smla_k8, .workspace = ws, .expert_batch = expert_batch, .prefill_weight = prefill_weight, .park = park, .graphs = geometry.graphs_bytes, .runtime = geometry.runtime_bytes, .state_arenas = arenaBytes(kv) + arenaBytes(stage) + arenaBytes(smla_k8) + arenaBytes(ws + prefill_weight) + park_arena };
 }
 
 /// State arenas: KV planes (latent, rope, index keys), stage pairs, workspace and optional park, each rounded once.
-pub const StateArenas = struct { kv: u64, stage: u64, workspace: u64, park: u64 = 0 };
+pub const StateArenas = struct { kv: u64, stage: u64, workspace: u64, park: u64 = 0, smla_k8: u64 = 0 };
 
 pub fn stateArenas(geometry: Geometry, context: usize) StateArenas {
     const planes = planeBytes(context, geometry.layers, geometry.full_index_layers, geometry.cache_format);
     const kv = std.mem.alignForward(u64, planes.latent, tensor_alignment) + std.mem.alignForward(u64, planes.rope, tensor_alignment) + planes.index;
     const park_arena: u64 = if (geometry.park_rows == 0 or geometry.park_tail_slot != 0) 0 else arenaBytes(parkBytes(geometry.layers, geometry.full_index_layers, geometry.park_rows));
-    return .{ .kv = arenaBytes(kv), .stage = arenaBytes(stagePlaneBytes(geometry, context)), .workspace = arenaBytes(workspaceLayout(geometry, context).bytes), .park = park_arena };
+    return .{ .kv = arenaBytes(kv), .stage = arenaBytes(stagePlaneBytes(geometry, context)), .workspace = arenaBytes(workspaceLayout(geometry, context).bytes), .park = park_arena, .smla_k8 = arenaBytes(smlaK8CopyBytes(geometry, context)) };
 }
 
 pub const AdaptTail = struct { kv_offset: u64, len: u64 };
@@ -739,10 +778,10 @@ pub fn adaptPool(slots: usize, bases: [3]u64, counts: [3]u64, rows: [3]u64, plan
     return sum;
 }
 
-/// The bytes State.init allocates: its three arenas as rounded.
+/// The bytes State.init allocates: its arenas as rounded.
 pub fn stateBytes(geometry: Geometry, context: usize) u64 {
     const a = stateArenas(geometry, context);
-    return a.kv + a.stage + a.workspace + a.park;
+    return a.kv + a.stage + a.workspace + a.park + a.smla_k8;
 }
 
 pub fn parseSideRows(raw: ?[]const u8, piece_rows: usize, context: usize) !usize {
@@ -808,6 +847,7 @@ pub const Admission = struct {
 
 pub fn admitRank(geometry: Geometry, context: usize, weights: WeightClasses, mem_available: u64, r: Reserve) !Admission {
     if (context == 0) return error.DcpShape;
+    if (!validPieceRows(geometry)) return error.BadPieceRows;
     if (geometry.expert_rows > geometry.chunk_rows) {
         if (!builtin.is_test) std.log.err("expert_rows {d} exceeds chunk_rows {d}; set TF_GLM53_CHUNK_ROWS >= expert_rows on both ranks", .{ geometry.expert_rows, geometry.chunk_rows });
         return error.ExpertRowsExceedChunkRows;
@@ -828,12 +868,43 @@ pub fn groupedExperts(expert_rows: usize, piece_rows: usize) bool {
     return expert_rows > 512 and expert_rows > piece_rows;
 }
 
+/// Piece rows for a plain (non-adaptive) MoE group. With expert_rows_adapt set, those groups keep the
+/// 512-row grain, so expert_rows (1024) still exceeds piece_rows; adaptive groups use `piece_rows`.
+pub fn plainPieceRows(piece_rows: usize, adapt_rows: usize) usize {
+    return if (adapt_rows != 0) @min(piece_rows, default_piece_rows) else piece_rows;
+}
+
 pub fn validExpertRows(g: Geometry) bool {
-    const er = g.expert_rows;
+    const er: usize = g.expert_rows;
+    const pr: usize = plainPieceRows(g.piece_rows, g.expert_rows_adapt);
     if (er == 0 or er > 8192) return false;
     if (er > g.chunk_rows) return false;
-    if (er > g.piece_rows) return g.piece_rows != 0 and er % g.piece_rows == 0;
+    if (er > pr) return pr != 0 and er % pr == 0;
     return er % 16 == 0;
+}
+
+/// Parse TF_GLM53_PIECE_ROWS: 512 (the default), 1024 or 2048. Anything else is refused before admission.
+pub fn parsePieceRows(raw: ?[]const u8) error{BadPieceRows}!usize {
+    const value = raw orelse return default_piece_rows;
+    const rows = std.fmt.parseInt(usize, value, 10) catch return error.BadPieceRows;
+    if (rows == default_piece_rows or rows == 2 * default_piece_rows or rows == 4 * default_piece_rows) return rows;
+    return error.BadPieceRows;
+}
+
+pub fn pieceRowsFromEnv() error{BadPieceRows}!usize {
+    const raw = std.c.getenv("TF_GLM53_PIECE_ROWS");
+    return parsePieceRows(if (raw) |v| std.mem.span(v) else null);
+}
+
+/// A piece must divide the chunk and hold at least a decode window, so every piece edit and cut is absolute.
+pub fn validPieceRows(g: Geometry) bool {
+    const pr = g.piece_rows;
+    if (pr == 0 or pr > g.chunk_rows or g.chunk_rows % pr != 0) return false;
+    return pr >= g.decode_rows;
+}
+
+pub fn validatePieceRows(g: Geometry) !void {
+    if (!validPieceRows(g)) return error.BadPieceRows;
 }
 
 /// Parse TF_GLM53_MEM_FLOOR_GIB; unset uses the design's 4 GiB safety floor.
@@ -1147,7 +1218,7 @@ pub const Workspace = struct {
         const pr: u64 = @intCast(@max(@min(g.piece_rows, @max(g.chunk_rows, g.decode_rows)), g.decode_rows));
         const dr: u64 = @intCast(g.decode_rows);
         const sr: u64 = @intCast(@min(g.score_rows, pr));
-        const grouped = groupedExperts(g.expert_rows, @intCast(pr));
+        const grouped = groupedExperts(g.expert_rows, @intCast(pr)) or groupedExperts(g.expert_rows, plainPieceRows(g.piece_rows, g.expert_rows_adapt));
         const trim_generic = g.ws_trim or g.slim_generic;
         if (grouped) std.debug.assert(g.expert_rows <= @as(usize, @intCast(r)));
         const er: usize = if (grouped) @min(g.expert_rows, @as(usize, @intCast(r))) else @min(g.expert_rows, @as(usize, @intCast(pr)));
@@ -1266,7 +1337,7 @@ pub const Workspace = struct {
             w.picks_local = take(&at, w.sizes.picks_local);
             w.sizes.shared_out = batch_rows * hidden * 4;
             w.shared_out = take(&at, w.sizes.shared_out);
-            w.sizes.routed_out = if (g.moe_post) 0 else if (g.expert_rows > @as(usize, @intCast(pr))) batch_rows * hidden * 4 else 0;
+            w.sizes.routed_out = if (g.moe_post or !grouped) 0 else batch_rows * hidden * 4;
             w.routed_out = take(&at, w.sizes.routed_out);
             w.sizes.lowrank_mid = if (trim_generic) @max(8 * batch_rows, @as(u64, lowrank_decode_splits) * dr) * lowrank_max * 4 else 128 * batch_rows * lowrank_max * 4;
             w.lowrank_mid = take(&at, w.sizes.lowrank_mid);
@@ -1355,7 +1426,7 @@ pub const Workspace = struct {
             w.picks_local = take(&at, w.sizes.picks_local);
             w.sizes.shared_out = batch_rows * hidden * 4;
             w.shared_out = take(&at, w.sizes.shared_out);
-            w.sizes.routed_out = if (g.moe_post) 0 else if (g.expert_rows > @as(usize, @intCast(pr))) batch_rows * hidden * 4 else 0;
+            w.sizes.routed_out = if (g.moe_post or !grouped) 0 else batch_rows * hidden * 4;
             w.routed_out = take(&at, w.sizes.routed_out);
             w.sizes.lowrank_mid = if (trim_generic) @max(8 * batch_rows, @as(u64, lowrank_decode_splits) * dr) * lowrank_max * 4 else 128 * batch_rows * lowrank_max * 4;
             w.lowrank_mid = take(&at, w.sizes.lowrank_mid);
@@ -1426,7 +1497,7 @@ pub const Workspace = struct {
         if (g.drafter_share_bytes != 0) at = @max(at, phase + g.drafter_share_bytes);
         w.sizes.prefill_weight = if (g.prefill_bf16) prefill_weight_scratch_bytes else 0;
         w.prefill_weight = take(&at, w.sizes.prefill_weight);
-        w.sizes.w8a8_scratch = if (g.prefill_w8a8_all) @as(u64, @intCast(cuda.w8a8.scratchBytes(g.piece_rows, cuda.w8a8.level2_k))) else 0;
+        w.sizes.w8a8_scratch = if (g.prefill_w8a8_all) @as(u64, @intCast(cuda.w8a8.scratchBytes(@intCast(pr), cuda.w8a8.level2_k))) else 0;
         w.w8a8_scratch = take(&at, w.sizes.w8a8_scratch);
         w.bytes = at - base;
         w.phase = phase;
@@ -1530,6 +1601,9 @@ pub const State = struct {
     workspace: cuda.DeviceBuffer,
     /// Prefill mirror of peer DCP keys at absolute slots p / 2 (latent rows, then rope rows), stagePlaneBytes long.
     stage_plane: cuda.DeviceBuffer,
+    /// TF_GLM53_SMLA_K8: the owner copy then the stage copy, each smla_k8_slots * mla.smla_k8_row_bytes; empty when off.
+    smla_k8_copy: cuda.DeviceBuffer,
+    smla_k8_slots: usize = 0,
     /// Dedicated weight-dequant stream and event. Main compute waits on `ready` before the BF16 GEMM reads scratch.
     dequant_stream: ?cuda.Stream = null,
     dequant_ready: ?cuda.Event = null,
@@ -1607,6 +1681,7 @@ pub const State = struct {
             .park = empty,
             .workspace = empty,
             .stage_plane = empty,
+            .smla_k8_copy = empty,
             .ws = layout,
             .capacity = context,
             .rank = rank,
@@ -1661,6 +1736,10 @@ pub const State = struct {
         out.park_slots = geometry.park_rows / 2;
         out.park_tail_slot = geometry.park_tail_slot;
         out.stage_plane = try cuda.DeviceBuffer.alloc(driver, @intCast(arenas.stage));
+        if (arenas.smla_k8 != 0) {
+            out.smla_k8_slots = smlaK8CopySlots(context);
+            out.smla_k8_copy = try cuda.DeviceBuffer.alloc(driver, @intCast(arenas.smla_k8));
+        }
         out.ws = Workspace.carve(out.workspace.ptr, geometry, context);
         if (pending_adapt) |*ad| {
             ad.ws = adaptWorkspace(out.ws, ad.b, geometry, context);
@@ -1766,6 +1845,7 @@ pub const State = struct {
             ad.vmm.close();
         }
         s.stage_plane.free();
+        s.smla_k8_copy.free();
         s.park.free();
         s.workspace.free();
         s.kv_arena.free(); // latent, rope and index_keys are spans of it
@@ -1794,6 +1874,15 @@ pub const State = struct {
         }
     }
 
+    /// TF_GLM53_SMLA_K8 owner-plane e4m3 copy (this rank's key slots); 0 when the switch is off.
+    pub fn smlaK8OwnerCopy(s: *const State) u64 {
+        return s.smla_k8_copy.ptr;
+    }
+    /// TF_GLM53_SMLA_K8 stage-plane e4m3 copy (peer key slots); 0 when the switch is off.
+    pub fn smlaK8StageCopy(s: *const State) u64 {
+        if (s.smla_k8_copy.ptr == 0) return 0;
+        return s.smla_k8_copy.ptr + @as(u64, @intCast(s.smla_k8_slots * mla.smla_k8_row_bytes));
+    }
     /// Plane `layer`'s latent rows [slots][512] bf16 (`layer` < layers; Forward checks with checkLayers first).
     pub fn latentAt(s: *const State, layer: usize) u64 {
         std.debug.assert(layer < s.layers);
@@ -2043,6 +2132,22 @@ test "stage plane sizing: one pair in order, two pairs with a prefetch stream, a
     try std.testing.expectError(error.StageBuffersAliased, validateStage(&overlap, true));
 }
 
+test "SMLA-K8 copies carve zero bytes off and two aligned planes on" {
+    const context = 262144;
+    const off: Geometry = .{};
+    const on: Geometry = .{ .smla_k8 = true };
+    const slots = smlaK8CopySlots(context);
+    try std.testing.expectEqual(@as(usize, 131074), slots);
+    try std.testing.expectEqual(@as(u64, 0), smlaK8PlaneBytes(off, context));
+    try std.testing.expectEqual(@as(u64, 0), smlaK8CopyBytes(off, context));
+    try std.testing.expectEqual(@as(u64, 0), stateArenas(off, context).smla_k8);
+    try std.testing.expectEqual(@as(u64, @intCast(slots)) * 592, smlaK8PlaneBytes(on, context));
+    try std.testing.expectEqual(@as(u64, @intCast(2 * slots)) * 592, smlaK8CopyBytes(on, context));
+    try std.testing.expectEqual(arenaBytes(smlaK8CopyBytes(on, context)), stateArenas(on, context).smla_k8);
+    try std.testing.expectEqual(stateBytes(off, context) + stateArenas(on, context).smla_k8, stateBytes(on, context));
+    try std.testing.expectEqual(breakdown(off, context, .{}).logicalState(), breakdown(on, context, .{}).logicalState() - smlaK8CopyBytes(on, context));
+}
+
 test "workspace regions are aligned, inside the allocation, and phases share one union region" {
     const g: Geometry = .{};
     const w = Workspace.carve(0x10000, g, 262144);
@@ -2231,6 +2336,45 @@ test "expert rows admit through 8192 and reject unsupported shapes" {
     try std.testing.expectError(error.ExpertRowsExceedChunkRows, admitRank(.{ .expert_rows = 8192, .chunk_rows = 4096 }, 8192, .{}, 1 << 40, reserveFor(1 << 40, false, 0)));
     try std.testing.expect(!validExpertRows(.{ .expert_rows = 16384 }));
     try std.testing.expect(!validExpertRows(.{ .expert_rows = 4100 }));
+}
+
+test "piece rows parse only 512 1024 and 2048" {
+    try std.testing.expectEqual(@as(usize, 512), try parsePieceRows(null));
+    try std.testing.expectEqual(@as(usize, 512), try parsePieceRows("512"));
+    try std.testing.expectEqual(@as(usize, 1024), try parsePieceRows("1024"));
+    try std.testing.expectEqual(@as(usize, 2048), try parsePieceRows("2048"));
+    try std.testing.expectError(error.BadPieceRows, parsePieceRows("0"));
+    try std.testing.expectError(error.BadPieceRows, parsePieceRows("256"));
+    try std.testing.expectError(error.BadPieceRows, parsePieceRows("1536"));
+    try std.testing.expectError(error.BadPieceRows, parsePieceRows("4096"));
+    try std.testing.expectError(error.BadPieceRows, parsePieceRows("nope"));
+}
+
+test "1024-row pieces validate with a 4096 chunk, 1024 expert rows and 4096 adapt rows" {
+    const g: Geometry = .{ .piece_rows = 1024, .chunk_rows = 4096, .expert_rows = 1024, .expert_rows_adapt = 4096, .decode_rows = 8, .moe_pipe = true, .moe_ring = 2 };
+    try std.testing.expect(validPieceRows(g));
+    try std.testing.expect(validExpertRows(g));
+    try std.testing.expectEqual(@as(usize, 512), plainPieceRows(g.piece_rows, g.expert_rows_adapt));
+    try std.testing.expect(!groupedExperts(g.expert_rows, g.piece_rows));
+    try std.testing.expect(groupedExperts(g.expert_rows, plainPieceRows(g.piece_rows, g.expert_rows_adapt)));
+    try std.testing.expect(validExpertRows(.{ .expert_rows = g.expert_rows_adapt, .piece_rows = g.piece_rows, .chunk_rows = g.chunk_rows }));
+    try std.testing.expect(groupedExperts(g.expert_rows_adapt, g.piece_rows));
+    try validateMoePipeGeometry(g);
+    const ws = workspaceLayout(g, 262144);
+    try std.testing.expectEqual(@as(usize, 1024), ws.piece_rows);
+    try std.testing.expect(ws.sizes.routed_out > 0);
+    try std.testing.expectError(error.BadPieceRows, admitRank(.{ .piece_rows = 1000, .chunk_rows = 4096 }, 4096, .{}, 1 << 40, reserveFor(1 << 40, false, 0)));
+}
+
+test "1024-row adaptive pieces fit the 262k headroom with 1024 expert rows" {
+    const context: usize = 262144;
+    const before: Geometry = .{ .expert_rows = 1024, .chunk_rows = 4096, .piece_rows = 512, .expert_rows_adapt = 4096, .moe_pipe = true, .moe_post = true };
+    const after: Geometry = .{ .expert_rows = 1024, .chunk_rows = 4096, .piece_rows = 1024, .expert_rows_adapt = 4096, .moe_pipe = true, .moe_post = true };
+    const before_ws = workspaceLayout(before, context).bytes;
+    const after_ws = workspaceLayout(after, context).bytes;
+    try std.testing.expect(after_ws > before_ws);
+    try std.testing.expect(after_ws - before_ws < 200 * (1 << 20));
+    try std.testing.expect(stateBytes(after, context) - stateBytes(before, context) < 200 * (1 << 20));
 }
 
 test "expert batch carve totals at 2048 4096 and 8192 rows" {

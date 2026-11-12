@@ -55,6 +55,18 @@ fn scoreKernelFromEnv() !ScoreKernel {
     return error.InvalidIndexKernel;
 }
 
+/// TF_GLM53_TOPK_FIT=1 fits ept to nkeys when a single CTA selects a row; "0" and unset stay off.
+pub fn topkFitFromEnv() bool {
+    const raw = std.c.getenv("TF_GLM53_TOPK_FIT") orelse return false;
+    return std.mem.eql(u8, std.mem.span(raw), "1");
+}
+
+/// TF_GLM53_MERGE2_FAST=1 launches the warp-aggregated merge2; "0" and unset stay off.
+pub fn merge2FastFromEnv() bool {
+    const raw = std.c.getenv("TF_GLM53_MERGE2_FAST") orelse return false;
+    return std.mem.eql(u8, std.mem.span(raw), "1");
+}
+
 pub const Plan = struct {
     grid_x: u32,
     grid_y: u32,
@@ -96,6 +108,18 @@ pub fn topkPlan(keys: usize) !Plan {
 pub fn topkSmem(entries_per_thread: usize) !usize {
     if (entries_per_thread == 0 or entries_per_thread > 33) return error.EntryTile;
     return contract.topk_threads * entries_per_thread * @sizeOf(u32);
+}
+
+/// One CTA a row can shrink its image tile to the keys the row actually has; a cluster keeps 33 for the lo split.
+pub fn topkEpt(nkeys: usize, clusters: u32) usize {
+    if (clusters != 1) return contract.topk_entries_per_thread;
+    return (nkeys + contract.topk_threads - 1) / contract.topk_threads;
+}
+
+/// The fit is only bit-identical when one CTA owns the whole row (CL == 1).
+pub fn topkFitPlan(nkeys: usize) ?Plan {
+    const p = topkPlan(nkeys) catch return null;
+    return if (p.grid_x == 1) p else null;
 }
 
 /// Map a rank-local DCP slot to its global sequence position, as in Python dcp.py.
@@ -435,8 +459,14 @@ pub const Index = struct {
     score_kernel: ScoreKernel = .mma,
     score_oracle: cuda.Function,
     select: cuda.Function,
+    select_fit: cuda.Function,
+    /// TF_GLM53_TOPK_FIT=1: one-CTA-a-row selects with ept fitted to nkeys.
+    topk_fit: bool = false,
     merge_fn: cuda.Function,
     merge2_fn: cuda.Function,
+    merge2_fast_fn: cuda.Function,
+    /// TF_GLM53_MERGE2_FAST=1: warp-aggregated count and parallel bin select.
+    merge2_fast: bool = false,
 
     pub fn load(module: cuda.Module, score_mma_rows: usize) !Index {
         if (score_mma_rows != 4 and score_mma_rows != 8 and score_mma_rows != 16) return error.BadIndexRows;
@@ -456,10 +486,15 @@ pub const Index = struct {
             .score_kernel = try scoreKernelFromEnv(),
             .score_oracle = try module.function("tf_glm53_index_scores_oracle"),
             .select = try module.function(topkSymbol()),
+            .select_fit = try module.function("tf_glm53_topk_fit"),
+            .topk_fit = topkFitFromEnv(),
             .merge_fn = try module.function("tf_glm53_merge"),
             .merge2_fn = try module.function("tf_glm53_merge2"),
+            .merge2_fast_fn = try module.function("tf_glm53_merge2_fast"),
+            .merge2_fast = merge2FastFromEnv(),
         };
         try result.select.allowDynamicShared(contract.topk_dynamic_smem);
+        try result.select_fit.allowDynamicShared(contract.topk_dynamic_smem);
         try result.score_mma_4.allowDynamicShared(score_mma_smem);
         try result.score_mma_8.allowDynamicShared(score_mma_smem);
         try result.score_mma_16.allowDynamicShared(score_mma_smem);
@@ -552,11 +587,15 @@ pub const Index = struct {
         if (rows == 0) return;
         if (world == 0 or rank >= world or nkeys > max_local_keys or topk_count == 0 or topk_count > top_k or score_stride < nkeys) return error.KeyCapacity;
         const p = try topkPlan(nkeys);
-        const job: Job = .{ .scores = scores_ptr, .score_stride = @intCast(score_stride), .positions = 0, .position_stride = 0, .tokens = tokens, .token_stride = @intCast(topk_count), .counts = counts, .candidate_records = candidate_records, .nkeys = @intCast(nkeys), .k = @intCast(topk_count), .mode = 0, .entries_per_thread = contract.topk_entries_per_thread };
+        const fit = k.topk_fit and topkFitPlan(nkeys) != null;
+        const ept: usize = if (fit) topkEpt(nkeys, p.grid_x) else contract.topk_entries_per_thread;
+        const shared: u32 = @intCast(try topkSmem(ept));
+        const job: Job = .{ .scores = scores_ptr, .score_stride = @intCast(score_stride), .positions = 0, .position_stride = 0, .tokens = tokens, .token_stride = @intCast(topk_count), .counts = counts, .candidate_records = candidate_records, .nkeys = @intCast(nkeys), .k = @intCast(topk_count), .mode = 0, .entries_per_thread = @intCast(ept) };
         const args: TopkArgs = .{ .jobs = .{ job, job }, .positions = positions, .ratio = @intCast(world), .block_size = 1, .owner = @intCast(rank) };
         var a: cuda.Args = .{};
         a.add(args);
-        try cuda.launch.launch(k.select, .{ .grid = .{ .x = p.grid_x, .y = @intCast(rows), .z = 1 }, .block = .{ .x = p.block }, .shared = p.dynamic_smem, .cluster = .{ .x = p.grid_x, .y = 1, .z = 1 } }, stream, &a);
+        const select_fn = if (fit) k.select_fit else k.select;
+        try cuda.launch.launch(select_fn, .{ .grid = .{ .x = p.grid_x, .y = @intCast(rows), .z = 1 }, .block = .{ .x = p.block }, .shared = shared, .cluster = .{ .x = p.grid_x, .y = 1, .z = 1 } }, stream, &a);
     }
 
     /// Merge rank-major packed candidates and fuse sparse filter plus owner-slot remap.
@@ -593,7 +632,8 @@ pub const Index = struct {
         a.add(@as(i32, @intCast(rows)));
         a.add(@as(i32, @intCast(topk_count)));
         a.add(@as(i32, @intCast(block_rows)));
-        try cuda.launch.launch(k.merge2_fn, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = 512 }, .shared = 4096 * @sizeOf(Pick) }, stream, &a);
+        const m2_fn = if (k.merge2_fast) k.merge2_fast_fn else k.merge2_fn;
+        try cuda.launch.launch(m2_fn, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = 512 }, .shared = 4096 * @sizeOf(Pick) }, stream, &a);
     }
 
     /// GPU timing entry point for the 262k DCP2 case: score the local-key capacity and select the local top-k.
@@ -846,6 +886,16 @@ test "K5 launch plans include the full DCP2 verify shard and smem budget" {
     try std.testing.expectEqual(@as(usize, 262143), try slotToGlobal(131071, 1, 2));
     try std.testing.expectEqual(@as(usize, 262142), try slotToGlobal(131071, 0, 2));
     try std.testing.expectError(error.DcpShape, slotToGlobal(0, 2, 2));
+}
+
+test "top-k fit sizes the entry tile only when one CTA owns the row" {
+    try std.testing.expectEqual(@as(usize, 1), topkEpt(64, 1));
+    try std.testing.expectEqual(@as(usize, 16), topkEpt(8192, 1));
+    try std.testing.expectEqual(@as(usize, 33), topkEpt(16896, 1));
+    try std.testing.expectEqual(@as(usize, 33), topkEpt(16897, 8));
+    try std.testing.expectEqual(@as(usize, 32768), try topkSmem(16));
+    try std.testing.expect(topkFitPlan(16896) != null);
+    try std.testing.expect(topkFitPlan(16897) == null);
 }
 
 test "index MMA launch selection uses configured row instance and grid" {

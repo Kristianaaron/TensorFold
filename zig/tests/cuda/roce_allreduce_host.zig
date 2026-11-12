@@ -97,6 +97,42 @@ test "the collective selector defaults to NCCL" {
     try std.testing.expect(tp_group.roceSettingsAllowed(.{ .glm = false, .gather = false }));
 }
 
+test "sumGather gives a comm-stream block to NCCL and counts the route" {
+    const Fake = struct {
+        var calls: usize = 0;
+        var count: usize = 0;
+        var dtype: cuda.nccl.DataType = .u8;
+        fn allReduce(_: cuda.abi.DevicePtr, _: cuda.abi.DevicePtr, n: usize, dt: cuda.nccl.DataType, _: cuda.nccl.RedOp, _: cuda.nccl.Comm, _: cuda.abi.Stream) callconv(.c) cuda.nccl.Result {
+            calls += 1;
+            count = n;
+            dtype = dt;
+            return 0;
+        }
+    };
+    // RoCE is bound to the main stream; the piece pipe issues on the comm stream, so NCCL carries that block.
+    var gat: roce.Gather = undefined;
+    gat.max_bytes = 4 << 20;
+    gat.stream_handle = @ptrFromInt(0x1000);
+    gat.gathers = 0;
+    var group: tp_group.Group = .{ .lib = undefined, .comm = null, .rank = 0, .world = 2, .fast = &gat, .gather_roce = true };
+    group.lib.api.ncclAllReduce = Fake.allReduce;
+    const comm: cuda.Stream = .{ .d = undefined, .handle = @ptrFromInt(0x2000) };
+    Fake.calls = 0;
+    try group.sumGather(comm, 0x4000, 0x8000, 6144, false);
+    try std.testing.expectEqual(@as(usize, 1), Fake.calls);
+    try std.testing.expectEqual(@as(usize, 6144), Fake.count);
+    try std.testing.expectEqual(cuda.nccl.DataType.f32, Fake.dtype);
+    try std.testing.expectEqual(@as(u64, 1), group.routeCounts()[@intFromEnum(tp_group.Route.nccl_stream)]);
+    try group.sumGather(comm, 0x4000, 0x8000, 6144, true);
+    try std.testing.expectEqual(@as(usize, 2), Fake.calls);
+    try std.testing.expectEqual(cuda.nccl.DataType.bf16, Fake.dtype);
+    // No RoCE transport at all: the same block and the same NCCL call, counted by size.
+    group.fast = null;
+    try group.sumGather(comm, 0x4000, 0x8000, 6144, false);
+    try std.testing.expectEqual(@as(usize, 3), Fake.calls);
+    try std.testing.expectEqual(@as(u64, 1), group.routeCounts()[@intFromEnum(tp_group.Route.nccl_size)]);
+}
+
 test {
     std.testing.refAllDecls(roce);
     std.testing.refAllDecls(roce.Gather);

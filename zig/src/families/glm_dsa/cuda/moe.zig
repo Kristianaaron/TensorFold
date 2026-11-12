@@ -129,6 +129,8 @@ pub const Kernels = struct {
     moe_post: ?cuda.Function = null,
     moe_post_ep: ?cuda.Function = null,
     residual_add_bf16: cuda.Function,
+    /// TF_GLM53_GATHER_SUM=1: the same residual boundary over one bf16 sum block.
+    residual_add_bf16_sum: cuda.Function,
 
     pub fn load(module: cuda.Module) !Kernels {
         return .{
@@ -139,6 +141,7 @@ pub const Kernels = struct {
             .moe_post = try module.function("tf_glm53_moe_post"),
             .moe_post_ep = try module.function("tf_glm53_moe_post_ep"),
             .residual_add_bf16 = try module.function("tf_glm53_moe_residual_add"),
+            .residual_add_bf16_sum = try module.function("tf_glm53_moe_residual_add_sum"),
         };
     }
 };
@@ -315,6 +318,15 @@ pub fn residualAddBf16(f: cuda.Function, stream: cuda.Stream, x: u64, parts: u64
     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast((count + 255) / 256) }, .block = .{ .x = 256 } }, stream, &args);
 }
 
+/// Launch the MoE residual boundary when `parts` is one bf16 sum block.
+pub fn residualAddBf16Sum(f: cuda.Function, stream: cuda.Stream, x: u64, parts: u64, rows: usize) !void {
+    const count = rows * hidden;
+    if (rows == 0) return;
+    var args: cuda.Args = .{};
+    inline for (.{ x, x, parts, @as(c_int, @intCast(count)) }) |v| args.add(v);
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast((count + 255) / 256) }, .block = .{ .x = 256 } }, stream, &args);
+}
+
 /// Pick the owner contribution after vocab-sharded BF16 embeds have been gathered.
 pub fn embedPick(f: cuda.Function, stream: cuda.Stream, gathered: u64, owners: u64, out: u64, rows: usize, width: usize, world: usize) !void {
     if (rows == 0 or width == 0 or world == 0) return error.BadEmbedPick;
@@ -418,7 +430,7 @@ test "MoE null profile hooks preserve launches around routed work" {
         .down = .{ .mode = .fp8b, .codes = 0xa000, .scales = 0xb000, .n = hidden, .k = 1024, .npad = hidden },
     };
     const scratch: mlp.Scratch = .{ .gate_up = 0xc000, .activation = 0xd000, .mm_part = 0xe000 };
-    const k: Kernels = .{ .lowrank = .{ .partial = Recording.function(&d, 1), .reduce = Recording.function(&d, 2), .finish = Recording.function(&d, 3), .decode = Recording.function(&d, 1) }, .embed_pick = Recording.function(&d, 3), .lowrank_combine_bf16 = Recording.function(&d, 5), .lowrank_combine_bf16_decode = Recording.function(&d, 5), .residual_add_bf16 = Recording.function(&d, 5) };
+    const k: Kernels = .{ .lowrank = .{ .partial = Recording.function(&d, 1), .reduce = Recording.function(&d, 2), .finish = Recording.function(&d, 3), .decode = Recording.function(&d, 1) }, .embed_pick = Recording.function(&d, 3), .lowrank_combine_bf16 = Recording.function(&d, 5), .lowrank_combine_bf16_decode = Recording.function(&d, 5), .residual_add_bf16 = Recording.function(&d, 5), .residual_add_bf16_sum = Recording.function(&d, 5) };
     var routed: RecordingRouted = .{ .d = &d };
     const common = .{ .x = @as(u64, 0x10000), .x_stride = hidden, .router = @as(u64, 0x20000), .bias = @as(u64, 0x30000), .logits = @as(u64, 0x40000), .router_part = @as(u64, 0x50000), .picks = @as(u64, 0x60000), .weights = @as(u64, 0x70000), .shared_out = @as(u64, 0x80000), .rows = @as(usize, 32), .routed_out = @as(u64, 0x90000), .moe_out = @as(u64, 0xa0000) };
     Recording.count = 0;

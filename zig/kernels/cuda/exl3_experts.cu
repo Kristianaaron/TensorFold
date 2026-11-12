@@ -480,17 +480,18 @@ extern "C" __global__ void tf_exl3_experts_rot_in_a8(const RotInA8Args a) {
 // That is the order one lane's two decode pairs come out in, so the gate/up A register needs no shuffle.
 constexpr int W8S_WARPS = 16;
 constexpr int W8S_BLK = 3;
+// TF_GLM53_ROT_DD: a whole 48-block x row, and the pair slots one CTA may loop over.
+constexpr int ROT_DD_K = W8S_WARPS * W8S_BLK * 128;
+constexpr int ROT_DD_SLOTS = 32;
 
-__device__ __forceinline__ void tf_exl3_experts_rot_in_w8s_task(const RotInA8Args a, float* amax_sh) {
-    const int p = TF_VBID.x, mat = TF_VBID.y;
+__device__ __forceinline__ void tf_exl3_experts_rot_in_w8s_body(const RotInA8Args a, int p, int mat, float* amax_sh,
+                                                                const uint16_t* x_row) {
     const int e = a.pick[p];
     if (e < 0 || e >= a.experts) return;
     const int blocks = a.k >> 7;
     if (blocks > W8S_WARPS * W8S_BLK) __trap();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int row = p / a.slots;
     const half* suh_row = (mat ? a.suh1 : a.suh0) + (size_t)e * a.k;
-    const uint16_t* x_row = reinterpret_cast<const uint16_t*>(a.x) + (size_t)row * a.x_stride;
     float v[W8S_BLK][4];
     float amax = 0.0f;
 #pragma unroll
@@ -550,10 +551,55 @@ __device__ __forceinline__ void tf_exl3_experts_rot_in_w8s_task(const RotInA8Arg
     }
 }
 
+__device__ __forceinline__ void tf_exl3_experts_rot_in_w8s_task(const RotInA8Args a, float* amax_sh) {
+    const int p = TF_VBID.x, mat = TF_VBID.y;
+    const int e = a.pick[p];
+    if (e < 0 || e >= a.experts) return;
+    const int row = p / a.slots;
+    const uint16_t* x_row = reinterpret_cast<const uint16_t*>(a.x) + (size_t)row * a.x_stride;
+    tf_exl3_experts_rot_in_w8s_body(a, p, mat, amax_sh, x_row);
+}
+
 extern "C" __global__ void __launch_bounds__(512) tf_exl3_experts_rot_in_w8s(const RotInA8Args a) {
     TF_VBLOCK_ENTER();
     __shared__ float amax_sh[W8S_WARPS];
     tf_exl3_experts_rot_in_w8s_task(a, amax_sh);
+}
+
+// TF_GLM53_ROT_DD: grid (rows), one 512-thread CTA a token row. The CTA stages its x row once, then runs today's
+// per-(pair, matrix) body for the row's slots. Pair p of (row, slot) is pick[row * slots + slot], the same index the
+// router counts (members then store it as row * 32 + slot). Each slot keeps its own amax buffer, so the body's barrier
+// still orders only its own reduction and the loop needs no extra barrier.
+extern "C" __global__ void __launch_bounds__(512) tf_exl3_experts_rot_in_w8s_row(const RotInA8Args a) {
+    TF_VBLOCK_ENTER();
+    constexpr int X_BYTES = ROT_DD_K * 2;
+    static_assert(X_BYTES == 12288, "rot_dd stages one 6144-half x row");
+    __shared__ __align__(16) uint8_t x_sh[X_BYTES];
+    __shared__ float amax_sh[2 * ROT_DD_SLOTS][W8S_WARPS];
+    static_assert(X_BYTES + (int)sizeof(amax_sh) + 64 <= 48 * 1024, "rot_dd x + amax + the vblock coords stay under 48 KiB");
+    const int row = TF_VBID.x;
+    if (a.slots <= 0 || a.slots > ROT_DD_SLOTS) __trap();
+    if (a.k <= 0 || a.k > ROT_DD_K) __trap();
+    const int nbytes = a.k * 2;
+    if (nbytes > X_BYTES) __trap();
+    const uint16_t* x_row = reinterpret_cast<const uint16_t*>(a.x) + (size_t)row * a.x_stride;
+    if ((reinterpret_cast<uintptr_t>(x_row) & 15) == 0 && (a.x_stride & 7) == 0) {
+        const uint4* src = reinterpret_cast<const uint4*>(x_row);
+        uint4* dst = reinterpret_cast<uint4*>(x_sh);
+        for (int i = threadIdx.x; i < (nbytes >> 4); i += 512) dst[i] = src[i];
+    } else {
+        uint16_t* dst = reinterpret_cast<uint16_t*>(x_sh);
+        for (int i = threadIdx.x; i < (nbytes >> 1); i += 512) dst[i] = x_row[i];
+    }
+    __syncthreads();
+    const uint16_t* staged = reinterpret_cast<const uint16_t*>(x_sh);
+    for (int slot = 0; slot < a.slots; ++slot) {
+        const int p = row * a.slots + slot;
+#pragma unroll
+        for (int mat = 0; mat < 2; ++mat) {
+            tf_exl3_experts_rot_in_w8s_body(a, p, mat, amax_sh[slot * 2 + mat], staged);
+        }
+    }
 }
 
 __device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }

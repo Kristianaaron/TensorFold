@@ -34,14 +34,19 @@ const names = [_][]const u8{
     "tf_exl3_prompt_wup",       "tf_exl3_prompt_wup_e4m3",       "tf_exl3_prompt_wgate",      "tf_exl3_prompt_wgate_e4m3",
     "tf_exl3_prompt_wdown",     "tf_exl3_prompt_wdown_e4m3",
     "tf_glm53_pmx_gu_mcg",       "tf_glm53_pmx_gu_e4m3",
-    "tf_glm53_w8a8_quant",      "tf_glm53_w8a8_gemm",
+    "tf_glm53_w8a8_quant",      "tf_glm53_w8a8_gemm",          "tf_glm53_w8a8_gemm_iq",     "tf_glm53_w8a8_gemm_m64_iq",
     "tf_glm53_smla_union",      "tf_glm53_smla_p3", "tf_qmmf_group_fp8b_16c", "tf_qmmf_group_fp8b_32c", "tf_qmmf_group_fp8b_64c", "tf_qmmf_group_fp8b_64f",
+    "tf_glm53_kv_k8",           "tf_glm53_smla_k8",
     "tf_glm53_attend_verify",
-    "tf_glm53_p5a_gu_mcg", "tf_glm53_p5a_gu_e4m3", "tf_glm53_p5a_down_mcg", "tf_glm53_p5a_down_e4m3",
+    "tf_glm53_p5a_gu_mcg", "tf_glm53_p5a_gu_e4m3", "tf_glm53_p5a_down_mcg", "tf_glm53_p5a_down_e4m3", "tf_glm53_p5a_down_epi_e4m3",
+    "tf_exl3_experts_rot_in_w8s_row",
     "tf_glm53_mask_f32", "tf_glm53_cand2_fill_f32", "tf_glm53_cand2_hist_f32", "tf_glm53_cand2_select_f32",
     "tf_glm53_moe_residual_rmsnorm_6144", "tf_glm53_absorb_qpe_decode_v3",
     "l2pf_segments", "l2pf_paced",
     "tf_glm53_rmsnorm_2048_halves",
+    "tf_glm53_topk_fit", "tf_glm53_merge2_fast",
+    "tf_glm53_residual_rmsnorm_6144_sum", "tf_glm53_moe_residual_add_sum",
+    "tf_glm53_residual_rmsnorm_6144_reg", "tf_glm53_residual_rmsnorm_6144_sum_reg",
 };
 
 fn id(comptime name: []const u8) usize {
@@ -97,6 +102,8 @@ fn layout(name: usize) ?[]const u8 {
         .{ "tf_glm53_smla_p_fp8", "pppppppppppppiiiii" },
         .{ "tf_glm53_smla_union", "ppppiii" },
         .{ "tf_glm53_smla_p3", "pppppppppppppiiiiip" },
+        .{ "tf_glm53_kv_k8", "pppii" },
+        .{ "tf_glm53_smla_k8", "pppppppppppppiiiiipp" },
         .{ "tf_glm53_attend_verify", "ppppppppiiii" },
         .{ "tf_glm53_attend_split_merge", "ppiii" },
         .{ "tf_glm53_mla_merge", "ppppiii" },
@@ -123,9 +130,14 @@ fn layout(name: usize) ?[]const u8 {
         .{ "tf_glm53_index_scores_qs2_k32_s3", "ppiipppiiiiiii" },
         .{ "tf_glm53_merge", "ppppppiiii" },
         .{ "tf_glm53_merge2", "ppppppiiiii" },
+        .{ "tf_glm53_merge2_fast", "ppppppiiiii" },
         .{ "tf_glm_rmsnorm_6144", "plpplpfi" },
         .{ "tf_glm53_residual_rmsnorm_6144", "ppppif" },
+        .{ "tf_glm53_residual_rmsnorm_6144_sum", "ppppif" },
+        .{ "tf_glm53_residual_rmsnorm_6144_reg", "ppppif" },
+        .{ "tf_glm53_residual_rmsnorm_6144_sum_reg", "ppppif" },
         .{ "tf_glm53_moe_residual_rmsnorm_6144", "ppppif" },
+        .{ "tf_glm53_moe_residual_add_sum", "pppi" },
         .{ "tf_glm53_absorb_qpe_decode_v3", "ppppiiippp" },
         .{ "tf_glm_rmsnorm_2048", "plpplpfi" },
         .{ "tf_glm53_rmsnorm_2048_halves", "pplpplf" },
@@ -146,6 +158,8 @@ fn layout(name: usize) ?[]const u8 {
         .{ "exl3_down_combine", "ppppppiiiii" },
         .{ "tf_glm53_w8a8_quant", "pliipp" },
         .{ "tf_glm53_w8a8_gemm", "pppppiiii" },
+        .{ "tf_glm53_w8a8_gemm_iq", "pppppiiiippp" },
+        .{ "tf_glm53_w8a8_gemm_m64_iq", "pppppiiiippp" },
     };
     inline for (table) |t| if (name == id(t[0])) return t[1];
     return null;
@@ -386,12 +400,14 @@ fn fakeExperts() cuda.exl3_experts.Experts {
     e.router = .{ .plan_small = func("group_plan_small"), .plan_rank = func("group_plan_rank"), .plan_offsets = func("group_plan_offsets"), .plan_scatter = func("group_plan_scatter") };
     e.group = func("exl3_group");
     e.rot_in = func("exl3_rot_in");
+    e.rot_in_w8s_row = func("tf_exl3_experts_rot_in_w8s_row");
+    e.rot_dd = false;
     e.grouped = @splat(func("exl3_grouped"));
     e.gateup = func("exl3_gateup");
     e.down_combine = func("exl3_down_combine");
     e.prompt = .{ .rotate = func("tf_exl3_prompt_rotate"), .gateup = func("tf_exl3_prompt_gu"), .down = func("tf_exl3_prompt_down"), .gateup_e4m3 = func("tf_exl3_prompt_gu_e4m3"), .down_e4m3 = func("tf_exl3_prompt_down_e4m3"), .wide = .{ .gu_small = .{ func("tf_exl3_prompt_gu_s"), func("tf_exl3_prompt_gu_s_e4m3") }, .down_small = .{ func("tf_exl3_prompt_down_s"), func("tf_exl3_prompt_down_s_e4m3") }, .up = .{ func("tf_exl3_prompt_wup"), func("tf_exl3_prompt_wup_e4m3") }, .gate = .{ func("tf_exl3_prompt_wgate"), func("tf_exl3_prompt_wgate_e4m3") }, .down = .{ func("tf_exl3_prompt_wdown"), func("tf_exl3_prompt_wdown_e4m3") } } };
     e.pmx = .{ .mod = .{ .d = &driver, .handle = @ptrFromInt(0x6000) }, .plan_mod = .{ .d = &driver, .handle = @ptrFromInt(0x5000) }, .router = e.router, .gu = .{ func("tf_glm53_pmx_gu_mcg"), func("tf_glm53_pmx_gu_e4m3") }, .dn = .{ undefined, undefined }, .dequant = @splat(undefined) };
-    e.p5a = .{ .mod = .{ .d = &driver, .handle = @ptrFromInt(0x7000) }, .gu = .{ func("tf_glm53_p5a_gu_mcg"), func("tf_glm53_p5a_gu_e4m3") }, .down = .{ func("tf_glm53_p5a_down_mcg"), func("tf_glm53_p5a_down_e4m3") } };
+    e.p5a = .{ .mod = .{ .d = &driver, .handle = @ptrFromInt(0x7000) }, .gu = .{ func("tf_glm53_p5a_gu_mcg"), func("tf_glm53_p5a_gu_e4m3") }, .down = .{ func("tf_glm53_p5a_down_mcg"), func("tf_glm53_p5a_down_e4m3") }, .down_epi = func("tf_glm53_p5a_down_epi_e4m3") };
     e.plan_rotate = func("group_plan_small");
     e.plan_finish = func("group_plan_scatter");
     return e;
@@ -400,15 +416,18 @@ fn fakeExperts() cuda.exl3_experts.Experts {
 fn fakeKernels(lane: *const cuda.qmmf.Lane, ex: *const cuda.exl3_experts.Experts) forward.Kernels {
     var k: forward.Kernels = undefined;
     inline for (@typeInfo(forward.Glue).@"struct".field_names) |n| @field(k.glue, n) = func("tf_glm_" ++ n);
-    k.glue53 = .{ .lowrank = .{ .partial = func("tf_glm53_lowrank_partial"), .reduce = func("tf_glm53_lowrank_reduce"), .finish = func("tf_glm53_lowrank_finish"), .decode = func("tf_glm53_lowrank_decode") }, .embed_pick = func("tf_glm53_embed_pick"), .lowrank_combine_bf16 = func("tf_glm53_lowrank_combine_bf16"), .lowrank_combine_bf16_decode = func("tf_glm53_lowrank_combine_bf16_decode"), .residual_add_bf16 = func("tf_glm53_moe_residual_add") };
+    k.glue53 = .{ .lowrank = .{ .partial = func("tf_glm53_lowrank_partial"), .reduce = func("tf_glm53_lowrank_reduce"), .finish = func("tf_glm53_lowrank_finish"), .decode = func("tf_glm53_lowrank_decode") }, .embed_pick = func("tf_glm53_embed_pick"), .lowrank_combine_bf16 = func("tf_glm53_lowrank_combine_bf16"), .lowrank_combine_bf16_decode = func("tf_glm53_lowrank_combine_bf16_decode"), .residual_add_bf16 = func("tf_glm53_moe_residual_add"), .residual_add_bf16_sum = func("tf_glm53_moe_residual_add_sum") };
     k.swiglu_plain = func("tf_glm53_swiglu_plain");
     k.residual_rmsnorm_6144 = func("tf_glm53_residual_rmsnorm_6144");
+    k.residual_rmsnorm_6144_reg = func("tf_glm53_residual_rmsnorm_6144_reg");
+    k.residual_rmsnorm_6144_sum = func("tf_glm53_residual_rmsnorm_6144_sum");
+    k.residual_rmsnorm_6144_sum_reg = func("tf_glm53_residual_rmsnorm_6144_sum_reg");
     k.moe_residual_rmsnorm_6144 = null;
     k.rmsnorm_2048_halves = null;
 
-    k.mla = .{ .prep_fn = func("tf_glm53_kv_write"), .qpe_fn = func("tf_glm53_qpe_pack"), .absorb_fn = func("tf_glm53_absorb"), .absorb_decode_fn = func("tf_glm53_absorb_decode"), .absorb_decode_v2_fn = func("tf_glm53_absorb_decode_v2"), .absorb_decode_v3_fn = func("tf_glm53_absorb_decode_v3"), .attend_fn = func("tf_glm53_attend"), .attend_mma_fn = func("tf_glm53_attend_mma"), .attend_split_merge_fn = func("tf_glm53_attend_split_merge"), .attend_kernel = .scalar, .merge_fn = func("tf_glm53_mla_merge"), .expand_fn = func("tf_glm53_expand_v"), .expand_decode_fn = func("tf_glm53_expand_v_decode"), .expand_decode_v2_fn = func("tf_glm53_expand_v_decode_v2"), .expand_decode_v2_16_fn = func("tf_glm53_expand_v_decode_v2_16"), .absorb_prompt_fn = func("tf_glm53_absorb_prompt_mma"), .expand_prompt_fn = func("tf_glm53_expand_v_prompt_mma"), .smla_p_fn = func("tf_glm53_smla_p"), .smla_fp8_fn = func("tf_glm53_smla_p_fp8"), .absorb_prompt_big_fn = func("tf_glm53_absorb_prompt_mma_big"), .expand_prompt_big_fn = func("tf_glm53_expand_v_prompt_mma_big"), .absorb_prompt_p2_fn = func("tf_glm53_absorb_prompt_p2"), .expand_prompt_p2_fn = func("tf_glm53_expand_v_prompt_p2"), .expand_prompt_p2n_fn = func("tf_glm53_expand_v_prompt_p2n") }; // the recorded contract below is the scalar attend's; the mma path is covered on GPU (glm53-mla, graph replay)
+    k.mla = .{ .prep_fn = func("tf_glm53_kv_write"), .qpe_fn = func("tf_glm53_qpe_pack"), .absorb_fn = func("tf_glm53_absorb"), .absorb_decode_fn = func("tf_glm53_absorb_decode"), .absorb_decode_v2_fn = func("tf_glm53_absorb_decode_v2"), .absorb_decode_v3_fn = func("tf_glm53_absorb_decode_v3"), .attend_fn = func("tf_glm53_attend"), .attend_mma_fn = func("tf_glm53_attend_mma"), .attend_split_merge_fn = func("tf_glm53_attend_split_merge"), .attend_kernel = .scalar, .merge_fn = func("tf_glm53_mla_merge"), .expand_fn = func("tf_glm53_expand_v"), .expand_decode_fn = func("tf_glm53_expand_v_decode"), .expand_decode_v2_fn = func("tf_glm53_expand_v_decode_v2"), .expand_decode_v2_16_fn = func("tf_glm53_expand_v_decode_v2_16"), .absorb_prompt_fn = func("tf_glm53_absorb_prompt_mma"), .expand_prompt_fn = func("tf_glm53_expand_v_prompt_mma"), .smla_p_fn = func("tf_glm53_smla_p"), .smla_fp8_fn = func("tf_glm53_smla_p_fp8"), .kv_k8_fn = func("tf_glm53_kv_k8"), .smla_k8_fn = func("tf_glm53_smla_k8"), .absorb_prompt_big_fn = func("tf_glm53_absorb_prompt_mma_big"), .expand_prompt_big_fn = func("tf_glm53_expand_v_prompt_mma_big"), .absorb_prompt_p2_fn = func("tf_glm53_absorb_prompt_p2"), .expand_prompt_p2_fn = func("tf_glm53_expand_v_prompt_p2"), .expand_prompt_p2n_fn = func("tf_glm53_expand_v_prompt_p2n") }; // the recorded contract below is the scalar attend's; the mma path is covered on GPU (glm53-mla, graph replay)
 
-    k.index = .{ .key = func("tf_glm53_index_key"), .query = func("tf_glm53_index_q"), .score = func("tf_glm53_index_scores"), .score_mma_4 = func("tf_glm53_index_scores_mma_4"), .score_mma_8 = func("tf_glm53_index_scores_mma_8"), .score_mma_16 = func("tf_glm53_index_scores_mma_16"), .score_qs_2 = func("tf_glm53_index_scores_qs_s2"), .score_qs_3 = func("tf_glm53_index_scores_qs_s3"), .score_qs2_k64_s2 = func("tf_glm53_index_scores_qs2_k64_s2"), .score_qs2_k32_s2 = func("tf_glm53_index_scores_qs2_k32_s2"), .score_qs2_k32_s3 = func("tf_glm53_index_scores_qs2_k32_s3"), .score_kernel = .scalar, .score_oracle = func("tf_glm53_index_scores_oracle"), .select = func("tf_glm53_topk"), .merge_fn = func("tf_glm53_merge"), .merge2_fn = func("tf_glm53_merge2") };
+    k.index = .{ .key = func("tf_glm53_index_key"), .query = func("tf_glm53_index_q"), .score = func("tf_glm53_index_scores"), .score_mma_4 = func("tf_glm53_index_scores_mma_4"), .score_mma_8 = func("tf_glm53_index_scores_mma_8"), .score_mma_16 = func("tf_glm53_index_scores_mma_16"), .score_qs_2 = func("tf_glm53_index_scores_qs_s2"), .score_qs_3 = func("tf_glm53_index_scores_qs_s3"), .score_qs2_k64_s2 = func("tf_glm53_index_scores_qs2_k64_s2"), .score_qs2_k32_s2 = func("tf_glm53_index_scores_qs2_k32_s2"), .score_qs2_k32_s3 = func("tf_glm53_index_scores_qs2_k32_s3"), .score_kernel = .scalar, .score_oracle = func("tf_glm53_index_scores_oracle"), .select = func("tf_glm53_topk"), .select_fit = func("tf_glm53_topk_fit"), .merge_fn = func("tf_glm53_merge"), .merge2_fn = func("tf_glm53_merge2"), .merge2_fast_fn = func("tf_glm53_merge2_fast") };
     k.head = .{ .top1_fn = func("tf_glm53_top1_f32"), .mask_fn = func("tf_glm53_mask_f32"), .candidates_fill_fn = func("tf_glm53_cand_fill_f32"), .candidates_part_fn = func("tf_glm53_cand_part_f32"), .candidates_part_fast_fn = func("tf_glm53_cand_part_fast_f32"), .candidates_v2_fill_fn = func("tf_glm53_cand2_fill_f32"), .candidates_v2_hist_fn = func("tf_glm53_cand2_hist_f32"), .candidates_v2_select_fn = func("tf_glm53_cand2_select_f32"), .candidates_merge_fn = func("tf_glm53_cand_merge_f32"), .lse_fn = func("tf_glm53_lse_f32"), .gate_gather_fn = func("tf_glm53_gate_gather_f32"), .gate_mass_fn = func("tf_glm53_gate_mass_f32"), .fast = candFastFromEnv(), .v2 = candV2FromEnv() };
     k.lane = lane;
     k.experts = ex;
@@ -417,7 +436,7 @@ fn fakeKernels(lane: *const cuda.qmmf.Lane, ex: *const cuda.exl3_experts.Experts
 }
 
 fn fakeW8a8() cuda.w8a8.Fns {
-    return .{ .quant = func("tf_glm53_w8a8_quant"), .gemm = func("tf_glm53_w8a8_gemm") };
+    return .{ .quant = func("tf_glm53_w8a8_quant"), .gemm = func("tf_glm53_w8a8_gemm"), .gemm_iq = func("tf_glm53_w8a8_gemm_iq") };
 }
 
 fn w8(n: usize, k: usize, base: u64) cuda.qmmf.Weight {
@@ -552,6 +571,18 @@ fn concat(comptime parts: anytype) []const usize {
         };
     };
     return &S.v;
+}
+
+test "gather sum switch parser is exact and refuses without the level-1 piece pipe" {
+    try std.testing.expect(!forward.parseGatherSum(null));
+    try std.testing.expect(!forward.parseGatherSum("0"));
+    try std.testing.expect(!forward.parseGatherSum("2"));
+    try std.testing.expect(forward.parseGatherSum("1"));
+    try forward.validateGatherSum(true, 1, true);
+    try std.testing.expectError(error.GatherSumNeedsPipe, forward.validateGatherSum(true, 1, false));
+    try std.testing.expectError(error.GatherSumNeedsPipe, forward.validateGatherSum(true, 0, true));
+    try std.testing.expectEqualStrings("TF_GLM53_GATHER_SUM=1", forward.gatherSumDigestToken(true));
+    try std.testing.expectEqualStrings("", forward.gatherSumDigestToken(false));
 }
 
 test "decode window: launch order per layer through the packed DCP2 merge wrappers" {
@@ -2113,6 +2144,68 @@ test "SMLA-FP8 off leaves the SMLA-P launches unchanged; on swaps only the SMLA-
     for (Rec.launches.items) |l| try std.testing.expect(l.name != id("tf_glm53_smla_p") and l.name != id("tf_glm53_smla_p_fp8"));
 }
 
+test "SMLA-K8 accepts only zero and one and refuses setup without SMLA-P" {
+    try std.testing.expect(!(try forward.smlaK8Selected(null)));
+    try std.testing.expect(!(try forward.smlaK8Selected("0")));
+    try std.testing.expect(try forward.smlaK8Selected("1"));
+    try std.testing.expectError(error.BadSmlaK8, forward.smlaK8Selected("true"));
+    try std.testing.expectError(error.BadSmlaK8, forward.smlaK8Selected(""));
+
+    var fx: Fixture = undefined;
+    try fx.init(geometry(), 16384);
+    defer fx.deinit();
+    var f = fx.fwd(1);
+    f.smla_k8 = true;
+    try std.testing.expectError(error.SmlaK8NeedsSmlaP, f.validateSetup());
+}
+
+test "SMLA-K8 quantises both planes and preempts P3 in the prefill dispatch" {
+    var g = geometry();
+    g.smla_k8 = true;
+    g.smla_p3 = true;
+    var fx: Fixture = undefined;
+    try fx.init(g, 16384);
+    defer fx.deinit();
+    fx.k.mla.smla_union_fn = func("tf_glm53_smla_union");
+    fx.k.mla.smla_p3_fn = func("tf_glm53_smla_p3");
+    try std.testing.expectEqual(state.smlaK8CopySlots(16384), fx.st.smla_k8_slots);
+    try std.testing.expect(fx.st.smlaK8StageCopy() != fx.st.smlaK8OwnerCopy());
+    try std.testing.expectEqual(fx.st.smlaK8OwnerCopy() + @as(u64, @intCast(fx.st.smla_k8_slots)) * 592, fx.st.smlaK8StageCopy());
+
+    var f = fx.fwd(1);
+    f.smla_p = true;
+    f.smla_k8 = true;
+    f.smla_p3 = true; // set, but K8 owns the dispatch
+    const pos: [5]usize = .{ 4096, 4097, 4098, 4099, 4100 };
+    const ids: [5]u32 = .{ 7, 8, 9, 10, 11 };
+    try f.pieced(.{ .positions = &pos, .tokens = &ids });
+
+    const expected_layers = 2;
+    const expected_n: u64 = @intCast(4100 / 2 + 1);
+    var owner: usize = 0;
+    var stage: usize = 0;
+    var attend: usize = 0;
+    for (Rec.launches.items) |l| {
+        if (l.name == id("tf_glm53_smla_union") or l.name == id("tf_glm53_smla_p3") or l.name == id("tf_glm53_smla_p") or l.name == id("tf_glm53_smla_p_fp8")) return error.UnexpectedLaunch;
+        if (l.name == id("tf_glm53_kv_k8")) {
+            try std.testing.expectEqual(@as(usize, 5), l.nargs);
+            try std.testing.expectEqual(@as(u64, 0), l.args[3]);
+            try std.testing.expectEqual(expected_n, l.args[4]);
+            if (l.args[2] == fx.st.smlaK8OwnerCopy()) owner += 1 else if (l.args[2] == fx.st.smlaK8StageCopy()) stage += 1 else return error.BadCopyPointer;
+        }
+        if (l.name == id("tf_glm53_smla_k8")) {
+            attend += 1;
+            try std.testing.expectEqual(@as(usize, 20), l.nargs);
+            try std.testing.expectEqual(fx.st.smlaK8OwnerCopy(), l.args[18]);
+            try std.testing.expectEqual(fx.st.smlaK8StageCopy(), l.args[19]);
+            try std.testing.expectEqual(@as(u32, 81600), l.shared); // mla.smla_k8_smem
+        }
+    }
+    try std.testing.expectEqual(@as(usize, expected_layers), owner);
+    try std.testing.expectEqual(@as(usize, expected_layers), stage);
+    try std.testing.expectEqual(@as(usize, expected_layers), attend);
+}
+
 test "SMLA-P3 off launches exactly SMLA-P; on replaces each SMLA-P attend by the union pre-kernel + P3" {
     try std.testing.expect(!forward.smlaP3Selected(null));
     try std.testing.expect(!forward.smlaP3Selected("0"));
@@ -2783,6 +2876,37 @@ test "prefill in 1024-row pieces: buffers fit, exchanges equal the plan per piec
     try expectPlan(p);
     try std.testing.expectEqual(@as(usize, 2 * 4), recorded(.moe_partial)[1]); // 2 layers x 4 pieces
     try std.testing.expectEqual(@as(usize, 4), recorded(.embed)[1]);
+}
+
+test "one 4096-row prefill group halves the per-piece expert calls at 1024 rows" {
+    var calls: [2]usize = .{ 0, 0 };
+    for ([_]usize{ 512, 1024 }, 0..) |piece_rows, which| {
+        var g = geometry();
+        g.layers = 2;
+        g.full_index_layers = 0;
+        g.piece_rows = piece_rows;
+        g.expert_rows = piece_rows;
+        var fx: Fixture = undefined;
+        try fx.init(g, 16384);
+        defer fx.deinit();
+        fx.layer_store[0] = glmLayer(0, false, false);
+        fx.layer_store[1] = glmLayer(1, false, false);
+        fx.model.layers = fx.layer_store[0..2];
+        var pos: [4096]usize = undefined;
+        var ids: [4096]u32 = undefined;
+        for (&pos, &ids, 0..) |*p, *t, i| {
+            p.* = 4096 + i;
+            t.* = @intCast((i * 7919) % 154880);
+        }
+        try fx.fwd(0).pieced(.{ .positions = &pos, .tokens = &ids });
+        var expert_calls: usize = 0;
+        for (Rec.launches.items) |launch| if (launch.name == id("exl3_group")) {
+            expert_calls += 1;
+        };
+        calls[which] = expert_calls;
+        try std.testing.expectEqual(@as(usize, 2 * (4096 / piece_rows)), expert_calls);
+    }
+    try std.testing.expectEqual(@as(usize, 2 * calls[1]), calls[0]);
 }
 
 fn expectAttnPipeMoeRing(moe_ring: u8) !void {

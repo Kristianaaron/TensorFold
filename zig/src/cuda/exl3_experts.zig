@@ -159,6 +159,9 @@ pub const Experts = struct {
     /// TF_GLM53_DOWN_W8S=1 (needs w8s): items > 64 members run the routed down as e4m3 x e4m3 (pmx xd_w8s + down_w8s);
     /// small items keep the fp16 p5a down. Changes output bits.
     down_w8s: bool = false,
+    /// TF_GLM53_DN_EPI=1 (needs down_w8s): the down epilogue pairs two rows' FWHTs, loads the four fp16 scales as one
+    /// 8-B word and stores each block as one 16-B vector. Same output bytes.
+    down_epi: bool = false,
     rot_in_w4s: Function = undefined,
     grouped: [4]Function, // one per codebook
     gateup: Function,
@@ -170,6 +173,10 @@ pub const Experts = struct {
     plan_finish: Function = undefined,
     rot_in_a8: Function = undefined,
     rot_in_w8s: Function = undefined,
+    /// TF_GLM53_ROT_DD: the same rot_in_w8s bits from one CTA a row, x staged in smem once.
+    rot_in_w8s_row: Function = undefined,
+    /// TF_GLM53_ROT_DD=1 (needs w8s_all): prompt rotation runs rot_in_w8s_row.
+    rot_dd: bool = false,
 
     pub fn load(d: *const Driver) !Experts {
         return loadWith(d, false);
@@ -201,6 +208,7 @@ pub const Experts = struct {
         e.rot_in_w4 = try e.mod.function("tf_exl3_experts_rot_in_w4u4");
         e.rot_in_a8 = try e.mod.function("tf_exl3_experts_rot_in_a8");
         e.rot_in_w8s = try e.mod.function("tf_exl3_experts_rot_in_w8s");
+        e.rot_in_w8s_row = try e.mod.function("tf_exl3_experts_rot_in_w8s_row");
         e.rot_in_w4s = try e.mod.function("tf_exl3_experts_rot_in_w4s");
         e.grouped = if (noalloc) .{
             try e.mod.function("tf_exl3_grouped_noalloc_0"),

@@ -60,7 +60,16 @@ struct tf_glm53_ablate_6144_params {
   const __nv_bfloat16* w; __nv_bfloat16* normed; int rows; float eps;
   static constexpr int block_size = 256, smem_bytes = 32;
 };
+struct tf_glm53_residual_rmsnorm_6144_sum_params {
+  __nv_bfloat16* x; const float* parts; const __nv_bfloat16* w;
+  __nv_bfloat16* normed; int rows; float eps;
+  static constexpr int block_size = 256, smem_bytes = 32;
+};
 struct tf_glm53_moe_residual_add_params {
+  const __nv_bfloat16* x; __nv_bfloat16* xout; const __nv_bfloat16* parts; int count;
+  static constexpr int block_size = 256, smem_bytes = 0;
+};
+struct tf_glm53_moe_residual_add_sum_params {
   const __nv_bfloat16* x; __nv_bfloat16* xout; const __nv_bfloat16* parts; int count;
   static constexpr int block_size = 256, smem_bytes = 0;
 };
@@ -221,6 +230,74 @@ __device__ __forceinline__ void tf_glm53_residual_rmsnorm_6144_task(const tf_glm
   glm_glue::rmsnorm<6144, 8192, 8, 8>(p.x, 6144, p.w, p.normed, 6144, nullptr, p.eps, 0, row);
 }
 
+__device__ __forceinline__ void tf_glm53_residual_rmsnorm_6144_reg_task(const tf_glm53_residual_rmsnorm_6144_params& p, int block_idx, int, char*) {
+  constexpr int S = 8, NW = 8, T = NW * 32, TILE = S * T, REPS = (6144 + TILE - 1) / TILE;
+  const int row = block_idx, t = threadIdx.x;
+  const int64_t rs = (int64_t)p.rows * 6144;
+  float residual[REPS * S];
+  float vin[4 * 8] = {};
+#pragma unroll
+  for (int rep = 0; rep < REPS; ++rep) {
+    const int d = rep * TILE + t * S;
+    if (d >= 6144) continue;
+    float a[S], old[S];
+    glm_glue::ld8(p.parts + (int64_t)row * 6144 + d, a);
+    glm_glue::ld8(p.parts + rs + (int64_t)row * 6144 + d, old);
+    glm_glue::ld8(p.x + (int64_t)row * 6144 + d, residual + rep * S);
+#pragma unroll
+    for (int j = 0; j < S; ++j) {
+      const float sum = __fadd_rn(a[j], old[j]);
+      residual[rep * S + j] = __fadd_rn(residual[rep * S + j], glm_glue::rbf(sum));
+      vin[rep * S + j] = glm_glue::bf(__float2bfloat16_rn(residual[rep * S + j]));
+    }
+    glm_glue::st8(p.x + (int64_t)row * 6144 + d, residual + rep * S);
+  }
+  glm_glue::rmsnorm_regs<6144, 8192, 8, 8>(vin, p.w, p.normed, 6144, nullptr, p.eps, 0, row);
+}
+
+// Same residual and RMSNorm as tf_glm53_residual_rmsnorm_6144_task, with `parts` already one fp32 sum block
+// (rank 0's value plus rank 1's, no rounding), so the add rounds exactly as the rank-major task's rbf(a + old).
+__device__ __forceinline__ void tf_glm53_residual_rmsnorm_6144_sum_task(const tf_glm53_residual_rmsnorm_6144_sum_params& p, int block_idx, int, char*) {
+  constexpr int S = 8, NW = 8, T = NW * 32, TILE = S * T, REPS = (6144 + TILE - 1) / TILE;
+  const int row = block_idx, t = threadIdx.x;
+  float residual[REPS * S];
+#pragma unroll
+  for (int rep = 0; rep < REPS; ++rep) {
+    const int d = rep * TILE + t * S;
+    if (d >= 6144) continue;
+    float sum[S];
+    glm_glue::ld8(p.parts + (int64_t)row * 6144 + d, sum);
+    glm_glue::ld8(p.x + (int64_t)row * 6144 + d, residual + rep * S);
+#pragma unroll
+    for (int j = 0; j < S; ++j) residual[rep * S + j] = __fadd_rn(residual[rep * S + j], glm_glue::rbf(sum[j]));
+    glm_glue::st8(p.x + (int64_t)row * 6144 + d, residual + rep * S);
+  }
+  TF_TASK_SYNC();
+  glm_glue::rmsnorm<6144, 8192, 8, 8>(p.x, 6144, p.w, p.normed, 6144, nullptr, p.eps, 0, row);
+}
+
+__device__ __forceinline__ void tf_glm53_residual_rmsnorm_6144_sum_reg_task(const tf_glm53_residual_rmsnorm_6144_sum_params& p, int block_idx, int, char*) {
+  constexpr int S = 8, NW = 8, T = NW * 32, TILE = S * T, REPS = (6144 + TILE - 1) / TILE;
+  const int row = block_idx, t = threadIdx.x;
+  float residual[REPS * S];
+  float vin[4 * 8] = {};
+#pragma unroll
+  for (int rep = 0; rep < REPS; ++rep) {
+    const int d = rep * TILE + t * S;
+    if (d >= 6144) continue;
+    float sum[S];
+    glm_glue::ld8(p.parts + (int64_t)row * 6144 + d, sum);
+    glm_glue::ld8(p.x + (int64_t)row * 6144 + d, residual + rep * S);
+#pragma unroll
+    for (int j = 0; j < S; ++j) {
+      residual[rep * S + j] = __fadd_rn(residual[rep * S + j], glm_glue::rbf(sum[j]));
+      vin[rep * S + j] = glm_glue::bf(__float2bfloat16_rn(residual[rep * S + j]));
+    }
+    glm_glue::st8(p.x + (int64_t)row * 6144 + d, residual + rep * S);
+  }
+  glm_glue::rmsnorm_regs<6144, 8192, 8, 8>(vin, p.w, p.normed, 6144, nullptr, p.eps, 0, row);
+}
+
 __device__ __forceinline__ void tf_glm53_ablate_6144_task(const tf_glm53_ablate_6144_params& p, int row, int, char*) {
   __shared__ float sums[8];
   const int t = threadIdx.x;
@@ -260,6 +337,14 @@ __device__ __forceinline__ void tf_glm53_moe_residual_add_task(const tf_glm53_mo
   if (i >= p.count) return;
   const float rank_sum = __fadd_rn(__bfloat162float(p.parts[i]), __bfloat162float(p.parts[p.count + i]));
   const float residual = __fadd_rn(__bfloat162float(p.x[i]), __bfloat162float(__float2bfloat16_rn(rank_sum)));
+  p.xout[i] = __float2bfloat16_rn(residual);
+}
+
+// MoE residual boundary when `parts` is already one bf16 sum block (the rank sum is the gather's output).
+__device__ __forceinline__ void tf_glm53_moe_residual_add_sum_task(const tf_glm53_moe_residual_add_sum_params& p, int block_idx, int, char*) {
+  const int i = block_idx * tf_glm53_moe_residual_add_sum_params::block_size + threadIdx.x;
+  if (i >= p.count) return;
+  const float residual = __fadd_rn(__bfloat162float(p.x[i]), __bfloat162float(p.parts[i]));
   p.xout[i] = __float2bfloat16_rn(residual);
 }
 

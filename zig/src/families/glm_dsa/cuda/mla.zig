@@ -108,6 +108,15 @@ pub const smla_p_smem: u32 = 2 * 32 * 584 * 2 + 584 * 2 + 4 * 64 * 16 * 4 + 64 *
 /// fp32, and SMLA-P's positions, list lengths and union ring.
 pub const smla_fp8_smem: u32 = 2 * 32 * 520 * 2 + 2 * 32 * 72 * 2 + 32 * 592 + 520 * 2 + 64 * 24 * 2 + 3 * 64 * 4 + 64 * 4 + 32 * 4 + smla_p_rows * 8 + 16 + 3 * 3 * 32 * 4 + 16;
 
+/// tf_glm53_smla_k8 (mla.cu SMK8_*, TF_GLM53_SMLA_K8=1, only with TF_GLM53_SMLA_P=1): SMLA-FP8's scores and softmax
+/// against a once-written e4m3 key copy (592 B a slot: 576 codes, the per-key scale, 12 zero bytes). Same grid, block
+/// and arguments as SMLA-FP8 plus the owner and stage copies. Dynamic shared memory: an e4m3 ring [2][32][592], an fp16
+/// V tile [32][520], the [64][16] fp32 scores, an fp16 zero V row, fp16 P [64][24], max/denominator/alpha, Q scales,
+/// positions, list lengths and SMLA-P's union ring. tf_glm53_kv_k8 (mla.cu) writes the copies: one warp a key row,
+/// 4 rows a block.
+pub const smla_k8_row_bytes: usize = 592;
+pub const smla_k8_smem: u32 = 2 * 32 * 592 + 32 * 520 * 2 + 64 * 16 * 4 + 520 * 2 + 64 * 24 * 2 + 3 * 64 * 4 + 64 * 4 + smla_p_rows * 8 + 16 + 3 * 3 * 32 * 4 + 16;
+
 /// tf_glm53_smla_p3 (mla.cu SMLA3_*, TF_GLM53_SMLA_P3=1, only with TF_GLM53_SMLA_P=1): SMLA-P with the step union
 /// tables precomputed by tf_glm53_smla_union into a workspace table and 1 full + 2 named barriers a step (bit-identical
 /// to SMLA-P). Same grid and block as SMLA-P. Dynamic shared memory: SMLA-P's key buffers, zero row, score partials,
@@ -138,6 +147,12 @@ pub fn smlaP3Plan(rows: usize, local_heads: usize) !Plan {
 pub fn smlaPFp8Plan(rows: usize, local_heads: usize) !Plan {
     var p = try smlaPPlan(rows, local_heads);
     p.dynamic_smem = smla_fp8_smem;
+    return p;
+}
+
+pub fn smlaK8Plan(rows: usize, local_heads: usize) !Plan {
+    var p = try smlaPPlan(rows, local_heads);
+    p.dynamic_smem = smla_k8_smem;
     return p;
 }
 
@@ -541,6 +556,9 @@ pub const Mla = struct {
     /// TF_GLM53_SMLA_P3=1 only (loadSmlaP3 at setup): tf_glm53_smla_union and tf_glm53_smla_p3; null otherwise.
     smla_union_fn: ?cuda.Function = null,
     smla_p3_fn: ?cuda.Function = null,
+    /// TF_GLM53_SMLA_K8=1 only (loadSmlaK8 at setup): tf_glm53_kv_k8 and tf_glm53_smla_k8; null otherwise.
+    kv_k8_fn: ?cuda.Function = null,
+    smla_k8_fn: ?cuda.Function = null,
     /// TF_GLM53_DECODE_UNION=1 only (loadAttendVerify at setup).
     attend_verify_fn: ?cuda.Function = null,
     /// TF_GLM53_QPE_ABSORB_FUSE=1 only (loadAbsorbQpeV3 at setup).
@@ -588,6 +606,16 @@ pub const Mla = struct {
         try p3_fn.allowDynamicShared(smla_p3_smem);
         m.smla_union_fn = union_fn;
         m.smla_p3_fn = p3_fn;
+    }
+
+    /// TF_GLM53_SMLA_K8=1: resolve the copy writer and the K8 attend. Setup calls it only with the switch on, and fails
+    /// here when the image lacks either kernel (a stale fatbin).
+    pub fn loadSmlaK8(m: *Mla, module: cuda.Module) !void {
+        const kv_fn = module.function("tf_glm53_kv_k8") catch return error.MissingSmlaK8Kernels;
+        const k8_fn = module.function("tf_glm53_smla_k8") catch return error.MissingSmlaK8Kernels;
+        try k8_fn.allowDynamicShared(smla_k8_smem);
+        m.kv_k8_fn = kv_fn;
+        m.smla_k8_fn = k8_fn;
     }
 
     /// Resolve tf_glm53_attend_verify only when TF_GLM53_DECODE_UNION=1 is selected.
@@ -731,6 +759,32 @@ pub const Mla = struct {
         try m.launchSmla(true, stream, qa, qpe, latent, rope, stage, positions, global_tokens, local_slots, global_counts, local_counts, dense_len, partial_block, rows, local_heads, rank, world);
     }
 
+    /// SMLA-K8 (TF_GLM53_SMLA_K8=1 with SMLA-P): `attendSmlaPFp8` reading the once-written e4m3 key copy at `copy`
+    /// (owner plane) and `stage_copy` (stage plane), each smla_k8_row_bytes a slot and written by `quantK8`. Same
+    /// arguments and output contract as `attendSmlaPFp8`; scores, LSE and softmax bits are SMLA-FP8's.
+    pub fn attendSmlaK8(m: *const Mla, stream: cuda.Stream, qa: u64, qpe: u64, latent: u64, rope: u64, stage: ?types.StagePlanePair, copy: u64, stage_copy: u64, positions: u64, global_tokens: u64, local_slots: u64, global_counts: u64, local_counts: u64, dense_len: u64, partial_block: u64, rows: usize, local_heads: usize, rank: usize, world: usize) !void {
+        if (rows == 0) return;
+        if (world == 0 or rank >= world) return error.DcpShape;
+        const k8_fn = m.smla_k8_fn orelse return error.MissingSmlaK8Kernels;
+        const stage_ptrs = stagePointers(stage);
+        try validateAttendStage(true, stage_ptrs.latent, stage_ptrs.rope);
+        try validateAttendHeads(true, local_heads);
+        const p = try smlaK8Plan(rows, local_heads);
+        var a: cuda.Args = .{};
+        inline for (.{ qa, qpe, latent, rope, stage_ptrs.latent, stage_ptrs.rope, positions, global_tokens, local_slots, global_counts, local_counts, dense_len, partial_block, @as(i32, @intCast(rows)), @as(i32, @intCast(local_heads)), @as(i32, @intCast(rank)), @as(i32, @intCast(world)), @as(i32, 1), copy, stage_copy }) |v| a.add(v);
+        try cuda.launch.launch(k8_fn, .{ .grid = .{ .x = p.grid[0], .y = p.grid[1], .z = p.grid[2] }, .block = .{ .x = p.block }, .shared = p.dynamic_smem }, stream, &a);
+    }
+
+    /// tf_glm53_kv_k8: quantise slots [slot0, slot0 + n) of one bf16 latent/rope plane into its e4m3 copy. One launch
+    /// a plane; a copy row is smla_k8_row_bytes and depends on the key alone.
+    pub fn quantK8(m: *const Mla, stream: cuda.Stream, latent: u64, rope: u64, copy: u64, slot0: usize, n: usize) !void {
+        if (n == 0) return;
+        const kv_fn = m.kv_k8_fn orelse return error.MissingSmlaK8Kernels;
+        var a: cuda.Args = .{};
+        inline for (.{ latent, rope, copy, @as(i32, @intCast(slot0)), @as(i32, @intCast(n)) }) |v| a.add(v);
+        try cuda.launch.launch(kv_fn, .{ .grid = .{ .x = @intCast((n + 3) / 4) }, .block = .{ .x = 128 } }, stream, &a);
+    }
+
     /// SMLA-P3 (TF_GLM53_SMLA_P3=1 with SMLA-P): `attendSmlaP` in two launches on `stream`, tf_glm53_smla_union (the
     /// step union records of every row pair into `table`, smlaP3TableBytes(rows) <= `table_bytes`) then
     /// tf_glm53_smla_p3 (SMLA-P's arguments + the table). Bit-identical output to `attendSmlaP` (mla.cu SMLA-P3 comment).
@@ -839,6 +893,13 @@ test "MLA launch plans stay under the sm_121 shared-memory budget" {
     try std.testing.expectEqual(@as(u32, 512), (try smlaPFp8Plan(64, 32)).block);
     try std.testing.expectEqual(smla_fp8_smem, (try smlaPFp8Plan(64, 32)).dynamic_smem);
     try std.testing.expectError(error.AttendShape, smlaPFp8Plan(4, 31));
+    try std.testing.expectEqual(@as(u32, 81600), smla_k8_smem); // mla.cu static_assert(SMK8_SMEM == 81600)
+    try std.testing.expect(smla_k8_smem <= 99 * 1024);
+    try std.testing.expectEqual((try smlaPPlan(7, 64)).grid, (try smlaK8Plan(7, 64)).grid);
+    try std.testing.expectEqual(@as(u32, 512), (try smlaK8Plan(64, 32)).block);
+    try std.testing.expectEqual(smla_k8_smem, (try smlaK8Plan(64, 32)).dynamic_smem);
+    try std.testing.expectError(error.AttendShape, smlaK8Plan(4, 31));
+    try std.testing.expectEqual(@as(usize, 592), smla_k8_row_bytes);
     try std.testing.expectEqual(@as(u32, 96704), smla_p3_smem); // mla.cu static_assert(SMLA3_SMEM == 96704)
     try std.testing.expect(smla_p3_smem <= 99 * 1024);
     try std.testing.expectEqual((try smlaPPlan(7, 32)).grid, (try smlaP3Plan(7, 32)).grid);

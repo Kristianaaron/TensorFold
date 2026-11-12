@@ -6,6 +6,7 @@
 // GLM-5.3 MLA K3/K4 kernels. kv_b stays in its checkpoint E4M3 + 128x128 scale form.
 // Tensor-core attend follows the absorbed-MLA head-batched layout used by FlashMLA (DeepSeek, MIT) as a design reference; no code copied.
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <math_constants.h>
@@ -2129,6 +2130,386 @@ extern "C" __global__ void __launch_bounds__(SMLA_THREADS, 1) tf_glm53_smla_p_fp
               float* acc = o[mt][2 * pair + h];
               acc[0] *= al0; acc[1] *= al0; acc[2] *= al1; acc[3] *= al1;
               mla_mma16816(acc, a, bv + 2 * h);
+            }
+          }
+        }
+      }
+    }
+  }
+  __syncthreads();
+  constexpr int group_row_bytes = 32 * LD * sizeof(__nv_bfloat16) + 32 * sizeof(float);
+  const int64_t group_byte = (int64_t)group * rows * group_row_bytes;
+  const int64_t group_partial = group_byte / (int)sizeof(__nv_bfloat16);
+  const int c0 = warp * 32;
+#pragma unroll
+  for (int mt = 0; mt < 2 * SMLA_QB; ++mt) {
+    const int r = row0 + (mt >> 1);
+    if (r >= rows) continue;
+#pragma unroll
+    for (int hh = 0; hh < 2; ++hh) {
+      const int head = (mt & 1) * 16 + g + 8 * hh;
+      const float den = hden[mt * 16 + g + 8 * hh];
+      __nv_bfloat16* dst = partial + group_partial + ((int64_t)r * 32 + head) * LD;
+#pragma unroll
+      for (int nt4 = 0; nt4 < 4; ++nt4) {
+        const int col = c0 + nt4 * 8 + 2 * q;
+        dst[col] = rb(den == 0.f ? 0.f : o[mt][nt4][2 * hh] / den);
+        dst[col + 1] = rb(den == 0.f ? 0.f : o[mt][nt4][2 * hh + 1] / den);
+      }
+    }
+  }
+  if (tid < SMLA_MH && row0 + (tid >> 5) < rows) {
+    float* group_lse = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(partial) + group_byte + rows * 32 * LD * (int)sizeof(__nv_bfloat16));
+    group_lse[(int64_t)(row0 + (tid >> 5)) * 32 + (tid & 31)] = hden[tid] == 0.f ? -CUDART_INF_F : hmax[tid] + logf(hden[tid]);
+  }
+}
+
+// SMLA-K8 (TF_GLM53_SMLA_K8=1, valid only with TF_GLM53_SMLA_P=1): tf_glm53_smla_p_fp8 with the per-step e4m3 key
+// conversion hoisted into a once-per-plane copy, and P.V in fp16 from the raw e4m3 codes. Two kernels:
+//  1. tf_glm53_kv_k8: one warp a key row runs tf_glm53_smla_p_fp8's conversion block, arithmetic unchanged, from the
+//     bf16 latent/rope planes and writes the 592-byte row: 576 e4m3 codes, sk (fp32), 12 zero bytes.
+//  2. tf_glm53_smla_k8: tf_glm53_smla_p_fp8 with
+//     - fetch: a union row is its 592-byte copy row (37 cp.async pieces of 16 B) from copy or stage_copy, not 72
+//       bf16 latent/rope pieces; the e4m3 ring is double-buffered [2][32][592];
+//     - no per-step conversion: ksc[u] is bytes 576..579 of union row u of the step's ring buffer;
+//     - P.V: after the rows land, warps dequantise the step's 512 latent codes to fp16 with no scale
+//       (cvt.rn.f16x2.e4m3x2 is exact on e4m3) into one [32][520] fp16 V tile; P[j] becomes fp16(P[j] *
+//       sk[u(j)]) (sk a power of two, exact except the clamp in smk8_pscale); the MMA is m16n8k16
+//       f32.f16.f16.f32 with the same A/B fragment roles and ldmatrix.trans.
+// Scores, softmax and LSE are bit-identical to tf_glm53_smla_p_fp8: same Q quantisation, warp roles, K halves, the
+// (h0 + h1) order, s = ((h0 + h1) * (sq * sk)) * 0.0625, softmax, 16-entry row tiles, empty-row and invalid-key rules.
+// Output differs only by the e4m3 V rounding and the fp16 P rounding. Row invariance holds as in tf_glm53_smla_p.
+// Shared memory (81,600 B): e4m3 ring [2][32][592], fp16 V [32][520], fp32 scores [64][16], fp16 zero V row, fp16
+// P [64][24], max/denominator/alpha, Q scales, positions, list lengths and the fp8 kernel's union ring. Nothing aliases
+// the scores (the rope buffer is gone).
+constexpr int SMK8_ES = 576 + 16;                         // e4m3 copy row: 576 codes | sk | 12 zero bytes
+constexpr int SMK8_SK = LD + PD;                          // 576: first byte of sk in a copy row
+constexpr int SMK8_VS = 512 + 8;                          // fp16 V row stride: 1,040 B (ldmatrix rows on distinct banks)
+constexpr int SMK8_QUANT_WARPS = 4;                       // tf_glm53_kv_k8: 4 key rows a block
+constexpr int SMK8_OFF_E = 0;                                                     // [2][UK][ES] e4m3 copy rows
+constexpr int SMK8_OFF_V = SMK8_OFF_E + 2 * SMLA_UK * SMK8_ES;                    // [UK][VS] fp16 V tile
+constexpr int SMK8_OFF_S = SMK8_OFF_V + SMLA_UK * SMK8_VS * 2;                    // [MH][KT] fp32 scores
+constexpr int SMK8_OFF_Z = SMK8_OFF_S + SMLA_MH * SMLA_KT * 4;                    // [VS] fp16 zero V row (invalid keys)
+constexpr int SMK8_OFF_P = SMK8_OFF_Z + SMK8_VS * 2;                              // [MH][PS] fp16 P
+constexpr int SMK8_OFF_H = SMK8_OFF_P + SMLA_MH * SMLA_PS * 2;                    // [3][MH] fp32 max, denominator, alpha
+constexpr int SMK8_OFF_QS = SMK8_OFF_H + 3 * SMLA_MH * 4;                         // [MH] fp32 Q scales
+constexpr int SMK8_OFF_POS = SMK8_OFF_QS + SMLA_MH * 4;                           // [QB] int64 positions
+constexpr int SMK8_OFF_N = SMK8_OFF_POS + SMLA_QB * 8;                            // [QB] int list lengths (16 B)
+constexpr int SMK8_OFF_MAP = SMK8_OFF_N + 16;                                     // [META][UK] entry -> union row, -1 invalid
+constexpr int SMK8_OFF_USLOT = SMK8_OFF_MAP + SMLA_META * SMLA_UK * 4;            // [META][UK] union row -> plane slot
+constexpr int SMK8_OFF_UPLANE = SMK8_OFF_USLOT + SMLA_META * SMLA_UK * 4;         // [META][UK] 0 owner plane, 1 stage
+constexpr int SMK8_OFF_UCOUNT = SMK8_OFF_UPLANE + SMLA_META * SMLA_UK * 4;        // [META] union rows (16 B)
+constexpr int SMK8_SMEM = SMK8_OFF_UCOUNT + 16;
+static_assert(SMK8_SMEM == 81600, "mla.zig smla_k8_smem mirrors this layout");
+static_assert(SMK8_SMEM <= 99 * 1024, "SMLA-K8 must fit the sm_120/sm_121 opt-in shared memory");
+static_assert(SMK8_ES / 16 == 37 && SMK8_ES % 16 == 0 && SMK8_VS * 2 % 16 == 0, "16-byte rows for cp.async and ldmatrix");
+static_assert(SMK8_SK + 4 + 12 == SMK8_ES, "copy row: 512 latent codes | 64 rope codes | sk | 12 zero bytes");
+static_assert(SMK8_OFF_E % 16 == 0 && SMK8_OFF_V % 16 == 0 && SMK8_OFF_S % 16 == 0 && SMK8_OFF_Z % 16 == 0 && SMK8_OFF_P % 16 == 0 && SMK8_OFF_POS % 8 == 0, "alignment");
+
+namespace {
+// Two e4m3 codes (packed in a 16-bit register, low byte first) to two fp16, exactly (e4m3 fits fp16).
+__device__ __forceinline__ uint32_t smk8_f16x2(uint32_t w) {
+  uint32_t r;
+  const uint16_t code2 = (uint16_t)w;
+  asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;\n" : "=r"(r) : "h"(code2));
+  return r;
+}
+// P * sk rounded to fp16. sk is a power of two, so p * sk is exact in fp32 unless it leaves the fp16 range: clamp to
+// the fp16 max finite (65,504) and flush below the smallest fp16 subnormal (2^-24).
+__device__ __forceinline__ __half smk8_pscale(float p, float sk) {
+  const float v = fminf(p * sk, 65504.f);
+  return __float2half_rn(v < 0x1p-24f ? 0.f : v);
+}
+__device__ __forceinline__ void smk8_mma16816(float* c, const uint32_t* a, const uint32_t* b) {
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+__device__ __forceinline__ uint32_t smk8_ld32(const __half* p) { return *reinterpret_cast<const uint32_t*>(p); }
+}
+
+// One warp a key row: tf_glm53_smla_p_fp8's conversion arithmetic, unchanged, reading the bf16 latent (stride LD) and
+// rope (stride PD) at slots [slot0, slot0 + n) of one plane and writing copy + slot * 592.
+extern "C" __global__ void __launch_bounds__(SMK8_QUANT_WARPS * 32) tf_glm53_kv_k8(const __nv_bfloat16* latent, const __nv_bfloat16* rope,
+                                                                unsigned char* copy, int slot0, int n) {
+  const int lane = threadIdx.x & 31;
+  const int row = (int)blockIdx.x * SMK8_QUANT_WARPS + (int)(threadIdx.x >> 5);
+  if (row >= n) return;
+  const int slot = slot0 + row;
+  const uint4* lat = reinterpret_cast<const uint4*>(latent + (int64_t)slot * LD + 16 * lane);
+  const uint4 a0 = lat[0], a1 = lat[1];
+  const uint32_t pe = smla_ld32(rope + (int64_t)slot * PD + 2 * lane);
+  const float sk = smf_scale(smf_warp_max(smf_amax18(a0, a1, pe)));
+  const float inv = __frcp_rn(sk);
+  unsigned char* er = copy + (int64_t)slot * SMK8_ES;
+  *reinterpret_cast<uint4*>(er + 16 * lane) = make_uint4(smf_e4m3x4(a0.x, a0.y, inv), smf_e4m3x4(a0.z, a0.w, inv),
+                                                        smf_e4m3x4(a1.x, a1.y, inv), smf_e4m3x4(a1.z, a1.w, inv));
+  *reinterpret_cast<uint16_t*>(er + LD + 2 * lane) = (uint16_t)smf_e4m3x2(pe, inv);
+  if (lane == 0) *reinterpret_cast<uint4*>(er + SMK8_SK) = make_uint4(__float_as_uint(sk), 0u, 0u, 0u);
+}
+
+// Same arguments as tf_glm53_smla_p_fp8 plus the owner and stage plane copies (592 B a slot); dynamic shared memory
+// SMK8_SMEM. The bf16 latent/rope pointers stay for signature compatibility and are not read.
+extern "C" __global__ void __launch_bounds__(SMLA_THREADS, 1) tf_glm53_smla_k8(const __nv_bfloat16* qa, const __nv_bfloat16* qpe,
+                                            const __nv_bfloat16* latent, const __nv_bfloat16* rope,
+                                            const __nv_bfloat16* stage_latent, const __nv_bfloat16* stage_rope,
+                                            const int64_t* positions, const int32_t* global_tokens,
+                                            const int32_t* local_slots, const int32_t* global_counts,
+                                            const int32_t* local_counts, const int32_t* dense_len,
+                                            __nv_bfloat16* partial, int rows,
+                                            int local_heads, int rank, int world, int prefill,
+                                            const unsigned char* copy, const unsigned char* stage_copy) {
+  (void)latent; (void)rope; (void)stage_latent; (void)stage_rope;
+  (void)local_slots; (void)local_counts; (void)dense_len;
+  const int row0 = blockIdx.x * SMLA_QB, group = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  if (prefill == 0) __trap();
+  if (row0 >= rows || group >= local_heads / 32) return;
+  extern __shared__ __align__(16) unsigned char smk8_smem[];
+  unsigned char* ebuf = smk8_smem + SMK8_OFF_E;
+  __half* vbuf = reinterpret_cast<__half*>(smk8_smem + SMK8_OFF_V);
+  float* sc = reinterpret_cast<float*>(smk8_smem + SMK8_OFF_S);
+  __half* vzero = reinterpret_cast<__half*>(smk8_smem + SMK8_OFF_Z);
+  __half* ps = reinterpret_cast<__half*>(smk8_smem + SMK8_OFF_P);
+  float* hmax = reinterpret_cast<float*>(smk8_smem + SMK8_OFF_H);
+  float* hden = hmax + SMLA_MH;
+  float* halpha = hden + SMLA_MH;
+  float* qsc = reinterpret_cast<float*>(smk8_smem + SMK8_OFF_QS);
+  int64_t* rpos = reinterpret_cast<int64_t*>(smk8_smem + SMK8_OFF_POS);
+  int* rn = reinterpret_cast<int*>(smk8_smem + SMK8_OFF_N);
+  int* kmap0 = reinterpret_cast<int*>(smk8_smem + SMK8_OFF_MAP);
+  int* uslot0 = reinterpret_cast<int*>(smk8_smem + SMK8_OFF_USLOT);
+  int* uplane0 = reinterpret_cast<int*>(smk8_smem + SMK8_OFF_UPLANE);
+  int* ucount = reinterpret_cast<int*>(smk8_smem + SMK8_OFF_UCOUNT);
+  const int g = lane >> 2, q = lane & 3;
+
+  if (tid < SMLA_QB) {   // row b: position and list length (dense rows: every key 0..position)
+    const int r = row0 + tid;
+    int64_t qpos = -1;
+    int n = 0;
+    if (r < rows) {
+      qpos = positions[r];
+      n = qpos < 2048 ? (int)(qpos + 1) : global_counts[r];
+    }
+    rpos[tid] = qpos;
+    rn[tid] = n;
+  }
+  if (tid < SMLA_MH) { hmax[tid] = -CUDART_INF_F; hden[tid] = 0.f; halpha[tid] = 1.f; }
+  for (int x = tid; x < SMK8_VS / 8; x += SMLA_THREADS) reinterpret_cast<uint4*>(vzero)[x] = make_uint4(0u, 0u, 0u, 0u);
+  for (int x = tid; x < 2 * SMLA_UK * SMK8_ES / 16; x += SMLA_THREADS) reinterpret_cast<uint4*>(ebuf)[x] = make_uint4(0u, 0u, 0u, 0u);
+  // Q scales: warp w, query-heads 4w .. 4w + 3 (row qh >> 5, head qh & 31); lane: latent dims 16 lane .. 16 lane + 15
+  // and rope dims 2 lane, 2 lane + 1. Unchanged from tf_glm53_smla_p_fp8.
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int qh = warp * 4 + i, r = row0 + (qh >> 5);
+    float amax = 0.f;
+    if (r < rows) {
+      const int64_t qr = ((int64_t)group * rows + r) * 32 + (qh & 31);
+      const uint4* lat = reinterpret_cast<const uint4*>(qa + qr * LD + 16 * lane);
+      amax = smf_amax18(lat[0], lat[1], smla_ld32(qpe + qr * PD + 2 * lane));
+    }
+    amax = smf_warp_max(amax);
+    if (lane == 0) qsc[qh] = smf_scale(amax);
+  }
+  __syncthreads();
+
+  // Score role (as tf_glm53_smla_p_fp8): m-tile smt, row sb, n-tile nt, K half kh.
+  const int smt = warp >> 2, sb = smt >> 1, nt = (warp >> 1) & 1, kh = warp & 1;
+  uint32_t qf[SMF_KSTEPS][4];
+  {
+    const int r = row0 + sb;
+    const int64_t qh0 = ((int64_t)group * rows + r) * 32 + (smt & 1) * 16 + g;
+    const float inv0 = __frcp_rn(qsc[smt * 16 + g]), inv1 = __frcp_rn(qsc[smt * 16 + g + 8]);
+#pragma unroll
+    for (int st = 0; st < SMF_KSTEPS; ++st) {
+      const int k0 = (kh * SMF_KSTEPS + st) * 32 + 4 * q;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int64_t qr = qh0 + 8 * (i & 1);
+        const int kk = k0 + 16 * (i >> 1);
+        uint32_t v = 0u;
+        if (r < rows) {
+          const uint2 x = kk < LD ? *reinterpret_cast<const uint2*>(qa + qr * LD + kk) : *reinterpret_cast<const uint2*>(qpe + qr * PD + (kk - LD));
+          v = smf_e4m3x4(x.x, x.y, (i & 1) ? inv1 : inv0);
+        }
+        qf[st][i] = v;
+      }
+    }
+  }
+  int steps = 0;
+#pragma unroll
+  for (int b = 0; b < SMLA_QB; ++b) steps = max(steps, (rn[b] + SMLA_KT - 1) / SMLA_KT);
+
+  // Union tables: exactly tf_glm53_smla_p_fp8's entry() and meta().
+  auto entry = [&](int step) -> int {
+    const int b = lane / SMLA_KT, j = step * SMLA_KT + lane % SMLA_KT;
+    if (b >= SMLA_QB || j >= rn[b]) return -1;
+    return rpos[b] < 2048 ? j : global_tokens[(int64_t)(row0 + b) * TOPK + j];
+  };
+  auto meta = [&](int step, int raw) {
+    const int mb = step % SMLA_META;
+    const int b = lane / SMLA_KT;
+    const int key = b < SMLA_QB && raw >= 0 && (int64_t)raw <= rpos[b] ? raw : -1;
+    int first = -1;
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+      const int other = __shfl_sync(0xffffffffu, key, i);
+      if (first < 0 && i < lane && key >= 0 && other == key) first = i;
+    }
+    const bool fresh = key >= 0 && first < 0;
+    const unsigned owners = __ballot_sync(0xffffffffu, fresh);
+    const int u = __popc(owners & ((1u << lane) - 1u));
+    const int urow = __shfl_sync(0xffffffffu, u, first >= 0 ? first : lane);
+    kmap0[mb * SMLA_UK + lane] = key >= 0 ? urow : -1;
+    if (fresh) {
+      uslot0[mb * SMLA_UK + u] = glm53_stage_plane_slot(key, world);
+      uplane0[mb * SMLA_UK + u] = key % world == rank ? 0 : 1;
+    }
+    if (lane == 0) ucount[mb] = __popc(owners);
+  };
+  // All threads: the step's union rows' 37 cp.async pieces (16 B) of the copy, buffer step & 1. The row carries its
+  // per-key scale at bytes 576..579, so no bf16 latent/rope load and no per-step conversion remain.
+  auto fetch = [&](int step) {
+    const int mb = step % SMLA_META;
+    unsigned char* eb = ebuf + (step & 1) * SMLA_UK * SMK8_ES;
+    const int count = ucount[mb];
+    for (int x = tid; x < count * (SMK8_ES / 16); x += SMLA_THREADS) {
+      const int u = x / (SMK8_ES / 16), c = x % (SMK8_ES / 16), slot = uslot0[mb * SMLA_UK + u];
+      const bool staged = uplane0[mb * SMLA_UK + u] != 0;
+      const unsigned char* src = (staged ? stage_copy : copy) + (int64_t)slot * SMK8_ES + c * 16;
+      unsigned char* dst = eb + u * SMK8_ES + c * 16;
+      const unsigned d = (unsigned)__cvta_generic_to_shared(dst);
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(d), "l"(src) : "memory");
+    }
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+  };
+
+  float o[2 * SMLA_QB][4][4];
+#pragma unroll
+  for (int m = 0; m < 2 * SMLA_QB; ++m)
+#pragma unroll
+    for (int t = 0; t < 4; ++t)
+#pragma unroll
+      for (int c = 0; c < 4; ++c) o[m][t][c] = 0.f;
+
+  int ahead = -1;   // warp 0: its lane's raw entry for step t + 1 during step t
+  if (steps > 0) {
+    if (warp == 0) { meta(0, entry(0)); ahead = entry(1); }
+    __syncthreads();
+    fetch(0);
+  }
+  for (int t = 0; t < steps; ++t) {
+    const int mb = t % SMLA_META;
+    const bool more = t + 1 < steps;
+    if (more && warp == 0) { meta(t + 1, ahead); ahead = entry(t + 2); }
+    __syncthreads();
+    if (more) { fetch(t + 1); asm volatile("cp.async.wait_group 1;\n" ::: "memory"); }
+    else asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    __syncthreads();   // step t's copy rows are in ring buffer t & 1
+    unsigned char* et = ebuf + (t & 1) * SMLA_UK * SMK8_ES;
+    const int* kmap = kmap0 + mb * SMLA_UK;
+    {   // fp16 V: warp w dequantises union rows w, w + 16, ...; lane: latent codes 16 lane .. 16 lane + 15 (no scale)
+      const int count = ucount[mb];
+      for (int u = warp; u < count; u += SMLA_THREADS / 32) {
+        const uint4 c = *reinterpret_cast<const uint4*>(et + u * SMK8_ES + 16 * lane);
+        uint4* vr = reinterpret_cast<uint4*>(vbuf + u * SMK8_VS + 16 * lane);
+        vr[0] = make_uint4(smk8_f16x2(c.x), smk8_f16x2(c.x >> 16), smk8_f16x2(c.y), smk8_f16x2(c.y >> 16));
+        vr[1] = make_uint4(smk8_f16x2(c.z), smk8_f16x2(c.z >> 16), smk8_f16x2(c.w), smk8_f16x2(c.w >> 16));
+      }
+    }
+    __syncthreads();   // fp16 V tile and ring buffer t & 1 ready; V is single-buffered, so this barrier is required
+    if (t * SMLA_KT < rn[sb]) {   // scores: m-tile smt x the row's keys 8 nt .. 8 nt + 7 over K half kh (as fp8)
+      float acc[4] = {0.f, 0.f, 0.f, 0.f};
+      const int u = kmap[sb * SMLA_KT + nt * 8 + (lane & 7)];
+      const unsigned base = (unsigned)__cvta_generic_to_shared(et + (u < 0 ? 0 : u) * SMK8_ES) + kh * SMF_KSTEPS * 32 + (lane >> 3) * 16;
+#pragma unroll
+      for (int st = 0; st + 1 < SMF_KSTEPS; st += 2) {
+        uint32_t bk[4];
+        smla_ldsm_x4(bk, base + st * 32);
+        smf_mma_e4m3(acc, qf[st], bk);
+        smf_mma_e4m3(acc, qf[st + 1], bk + 2);
+      }
+      {
+        uint32_t bk[2];
+        smf_ldsm_x2(bk, base + (SMF_KSTEPS - 1) * 32);
+        smf_mma_e4m3(acc, qf[SMF_KSTEPS - 1], bk);
+      }
+      float* s0 = sc + (smt * 16 + g) * SMLA_KT + nt * 8 + 2 * q;
+      float* s1 = s0 + 8 * SMLA_KT;
+      const int pair_bar = 1 + (warp >> 1);
+      if (kh == 0) {
+        s0[0] = acc[0]; s0[1] = acc[1]; s1[0] = acc[2]; s1[1] = acc[3];
+        asm volatile("bar.arrive %0, 64;\n" ::"r"(pair_bar) : "memory");
+      } else {
+        asm volatile("bar.sync %0, 64;\n" ::"r"(pair_bar) : "memory");
+        s0[0] = s0[0] + acc[0]; s0[1] = s0[1] + acc[1]; s1[0] = s1[0] + acc[2]; s1[1] = s1[1] + acc[3];
+      }
+    }
+    __syncthreads();
+    {   // online softmax, as tf_glm53_smla_p_fp8; sk is bytes 576..579 of the key's copy row, and P carries it
+      const int qh = tid >> 3, sub = tid & 7, b = qh >> 5;
+      if (t * SMLA_KT < rn[b]) {
+        const float old = hmax[qh], den = hden[qh], qs = qsc[qh];
+        float s[2], sk[2];
+        int ku[2];
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+          const int j = 2 * sub + i;
+          const int u = kmap[b * SMLA_KT + j];
+          ku[i] = u;
+          if (u < 0) {
+            s[i] = -CUDART_INF_F;
+            sk[i] = 0.f;
+          } else {
+            sk[i] = *reinterpret_cast<const float*>(et + u * SMK8_ES + SMK8_SK);
+            s[i] = (sc[qh * SMLA_KT + j] * (qs * sk[i])) * 0.0625f;
+          }
+        }
+        float mx = fmaxf(s[0], s[1]);
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 4));
+        const float m = fmaxf(old, mx);
+        const float alpha = isinf(old) ? 0.f : expf(old - m);
+        const float p0 = isinf(s[0]) ? 0.f : expf(s[0] - m);
+        const float p1 = isinf(s[1]) ? 0.f : expf(s[1] - m);
+        float sum = p0 + p1;
+        sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+        sum += __shfl_xor_sync(0xffffffffu, sum, 2);
+        sum += __shfl_xor_sync(0xffffffffu, sum, 4);
+        ps[qh * SMLA_PS + 2 * sub] = ku[0] < 0 ? __float2half_rn(0.f) : smk8_pscale(p0, sk[0]);
+        ps[qh * SMLA_PS + 2 * sub + 1] = ku[1] < 0 ? __float2half_rn(0.f) : smk8_pscale(p1, sk[1]);
+        __syncwarp();
+        if (sub == 0) {
+          if (isinf(m)) { halpha[qh] = 1.f; }   // nothing valid yet: O and the denominator stay zero
+          else { halpha[qh] = alpha; hden[qh] = den * alpha + sum; hmax[qh] = m; }
+        }
+      }
+    }
+    __syncthreads();
+    {   // O = O * alpha + P . V (fp16 raw codes, key scale in P), as fp8's P.V
+      const int c0 = warp * 32;
+#pragma unroll
+      for (int b = 0; b < SMLA_QB; ++b) {
+        if (t * SMLA_KT >= rn[b]) continue;
+        const int u = kmap[b * SMLA_KT + (lane & 15)];
+        const __half* vr = u < 0 ? vzero : vbuf + u * SMK8_VS;
+        const unsigned vbase = (unsigned)__cvta_generic_to_shared(vr + c0 + (lane >> 4) * 8);
+#pragma unroll
+        for (int pair = 0; pair < 2; ++pair) {
+          uint32_t bv[4];
+          smla_ldsm_x4_trans(bv, vbase + pair * 32);
+#pragma unroll
+          for (int mt2 = 0; mt2 < 2; ++mt2) {
+            const int mt = 2 * b + mt2;
+            const __half* p0 = ps + (mt * 16 + g) * SMLA_PS + 2 * q;
+            const __half* p1 = p0 + 8 * SMLA_PS;
+            const uint32_t a[4] = {smk8_ld32(p0), smk8_ld32(p1), smk8_ld32(p0 + 8), smk8_ld32(p1 + 8)};
+            const float al0 = halpha[mt * 16 + g], al1 = halpha[mt * 16 + g + 8];
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+              float* acc = o[mt][2 * pair + h];
+              acc[0] *= al0; acc[1] *= al0; acc[2] *= al1; acc[3] *= al1;
+              smk8_mma16816(acc, a, bv + 2 * h);
             }
           }
         }

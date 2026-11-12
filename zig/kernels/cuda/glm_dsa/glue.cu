@@ -85,6 +85,33 @@ tf_glm53_residual_rmsnorm_6144(__nv_bfloat16* x, const float* parts, const __nv_
 }
 
 extern "C" __global__ void __launch_bounds__(256)
+tf_glm53_residual_rmsnorm_6144_reg(__nv_bfloat16* x, const float* parts, const __nv_bfloat16* w,
+    __nv_bfloat16* normed, int rows, float eps) {
+    TF_VBLOCK_ENTER();
+  extern __shared__ char smem[];
+  const tf_glm53_residual_rmsnorm_6144_params p{x, parts, w, normed, rows, eps};
+  tf_glm53_residual_rmsnorm_6144_reg_task(p, TF_VBID.x, TF_VNBLK.x, smem);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+tf_glm53_residual_rmsnorm_6144_sum(__nv_bfloat16* x, const float* parts, const __nv_bfloat16* w,
+    __nv_bfloat16* normed, int rows, float eps) {
+    TF_VBLOCK_ENTER();
+  extern __shared__ char smem[];
+  const tf_glm53_residual_rmsnorm_6144_sum_params p{x, parts, w, normed, rows, eps};
+  tf_glm53_residual_rmsnorm_6144_sum_task(p, TF_VBID.x, TF_VNBLK.x, smem);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+tf_glm53_residual_rmsnorm_6144_sum_reg(__nv_bfloat16* x, const float* parts, const __nv_bfloat16* w,
+    __nv_bfloat16* normed, int rows, float eps) {
+  TF_VBLOCK_ENTER();
+  extern __shared__ char smem[];
+  const tf_glm53_residual_rmsnorm_6144_sum_params p{x, parts, w, normed, rows, eps};
+  tf_glm53_residual_rmsnorm_6144_sum_reg_task(p, TF_VBID.x, TF_VNBLK.x, smem);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
 tf_glm53_ablate_6144(__nv_bfloat16* x, const void* parts, int kind, const float* r, const float* a,
     const __nv_bfloat16* w, __nv_bfloat16* normed, int rows, float eps) {
     TF_VBLOCK_ENTER();
@@ -99,6 +126,14 @@ extern "C" __global__ void tf_glm53_moe_residual_add(const __nv_bfloat16* x, __n
   extern __shared__ char smem[];
   const tf_glm53_moe_residual_add_params p{x, xout, parts, count};
   tf_glm53_moe_residual_add_task(p, TF_VBID.x, TF_VNBLK.x, smem);
+}
+
+extern "C" __global__ void tf_glm53_moe_residual_add_sum(const __nv_bfloat16* x, __nv_bfloat16* xout,
+    const __nv_bfloat16* parts, int count) {
+    TF_VBLOCK_ENTER();
+  extern __shared__ char smem[];
+  const tf_glm53_moe_residual_add_sum_params p{x, xout, parts, count};
+  tf_glm53_moe_residual_add_sum_task(p, TF_VBID.x, TF_VNBLK.x, smem);
 }
 
 // TF_GLM53_ADD_NORM_FUSE=1: tf_glm53_moe_residual_add on one row, then the next layer's input norm on the stored

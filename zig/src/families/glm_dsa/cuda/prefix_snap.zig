@@ -284,7 +284,7 @@ pub fn Snap(comptime E: type) type {
         pub fn ops(s: *Self) engine.SnapOps { return .{ .ctx = s, .save_fn = saveThunk, .load_fn = loadThunk, .commit_fn = commitThunk }; }
 
         pub fn save(s: *Self, cut: engine.SnapCut) !void {
-            const align_rows = kvsave.cutAlignment(s.runtime.options.expert_rows) catch return error.SnapInvariant;
+            const align_rows = prefix_cache.cutGrain(s.runtime.options.expert_rows, s.runtime.options.engine_piece_rows) catch return error.SnapInvariant;
             var slot: ?usize = null;
             for (s.jobs, 0..) |job, idx| {
                 if (job.state == .free) { slot = idx; break; }
@@ -490,7 +490,7 @@ pub fn Snap(comptime E: type) type {
         fn hasIncomplete(s: *Self) bool { for (s.pending[0..s.pending_len]) |idx| if (s.jobs[idx].state != .done) return true; return false; }
         fn countTrue(items: []const bool) usize { var count: usize = 0; for (items) |value| count += @intFromBool(value); return count; }
         pub fn load(s: *Self, r: usize, ids: []const u32, leaf_key: u64) !usize {
-            const align_rows = kvsave.cutAlignment(s.runtime.options.expert_rows) catch 0;
+            const align_rows = prefix_cache.cutGrain(s.runtime.options.expert_rows, s.runtime.options.engine_piece_rows) catch 0;
             s.closeReaders();
             s.load_fba.reset();
             s.chain_len = 0;
