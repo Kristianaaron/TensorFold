@@ -344,6 +344,8 @@ pub const Geometry = struct {
     /// DtoD side-call park capacity in positions; zero disables the allocation.
     park_rows: usize = 0,
     park_tail_slot: usize = 0,
+    /// TF_GLM53_PARK_HOLE=1: an adapt borrow skips the parked KV-tail slots instead of moving the park to its own arena.
+    park_hole: bool = false,
     index_slots: usize = 131073,
     decode_rows: usize = 8,
     /// Decode graph pool reservation, computed from verify rows and context buckets by native setup.
@@ -730,24 +732,77 @@ pub fn adaptNeedBytes(g: Geometry, context: usize) u64 {
     return total;
 }
 
+pub const AdaptLimit = struct { slot: usize, position: usize, need: u64 };
+
+/// The parked KV-tail slots an adapt borrow must skip, as [first, end), when the park hole is on.
+pub fn parkHole(g: Geometry) ?[2]usize {
+    if (!g.park_hole or g.park_rows == 0 or g.park_tail_slot == 0) return null;
+    return .{ g.park_tail_slot, g.park_tail_slot + g.park_rows / 2 };
+}
+
+/// One layer's leasable byte ranges past `slots` (at most two: below and above the hole), granularity-aligned
+/// inward so no parked byte and no layer's last row is ever leased.
+fn layerTails(lb: u64, row: u64, slots: usize, plane_slots: usize, gran: u64, hole: ?[2]usize) [2]AdaptTail {
+    var out = [2]AdaptTail{ .{ .kv_offset = 0, .len = 0 }, .{ .kv_offset = 0, .len = 0 } };
+    const stride: u64 = @as(u64, @intCast(plane_slots)) * row;
+    const last: u64 = lb + stride - row;
+    if (hole) |h| {
+        const s0 = std.mem.alignForward(u64, lb + @as(u64, @intCast(slots)) * row, gran);
+        if (slots < h[0]) {
+            const e0 = std.mem.alignBackward(u64, lb + @as(u64, @intCast(h[0])) * row, gran);
+            if (e0 > s0) out[0] = .{ .kv_offset = s0, .len = e0 - s0 };
+        }
+        const s1 = std.mem.alignForward(u64, lb + @as(u64, @intCast(@max(slots, h[1]))) * row, gran);
+        const e1 = std.mem.alignBackward(u64, last, gran);
+        if (e1 > s1) out[1] = .{ .kv_offset = s1, .len = e1 - s1 };
+        return out;
+    }
+    const start = std.mem.alignForward(u64, lb + @as(u64, @intCast(slots)) * row, gran);
+    const end = std.mem.alignBackward(u64, last, gran);
+    if (end > start) out[1] = .{ .kv_offset = start, .len = end - start };
+    return out;
+}
+
+/// The slot the borrowed adapt tail starts at and the position that bounds adaptive expert rows. Pure: the slot
+/// search reads no allocator and allocates nothing, so a caller can refuse a configuration before taking memory.
+pub fn adaptLimit(g: Geometry, context: usize, granularity: u64) !AdaptLimit {
+    if (granularity == 0) return error.AdaptBadGranularity;
+    const p = planeBytes(context, g.layers, g.full_index_layers, g.cache_format);
+    const elem: u64 = if (g.cache_format == .bf16) 2 else 1;
+    const row_bytes = [_]u64{ @as(u64, mla.latent_dim) * elem, @as(u64, mla.rope_dim) * elem, @as(u64, index.dim) * elem };
+    const bases = [_]u64{ 0, std.mem.alignForward(u64, p.latent, tensor_alignment), std.mem.alignForward(u64, std.mem.alignForward(u64, p.latent, tensor_alignment) + p.rope, tensor_alignment) };
+    // Planes are layer-major (State.latentAt: base + layer * slots * row): each layer of a plane has its own tail past
+    // the limit slot, and each layer's last row stays out of the lease.
+    const counts = [_]u64{ @intCast(g.layers), @intCast(g.layers), @intCast(g.full_index_layers) };
+    const need = adaptNeedBytes(g, context);
+    const hole = parkHole(g);
+    if (adaptPoolHole(1, bases, counts, row_bytes, p.slots, granularity, hole) < need) return error.AdaptPoolTooSmall;
+    var lo: usize = 1;
+    var hi: usize = p.slots - 1;
+    while (lo < hi) {
+        const mid = lo + (hi - lo + 1) / 2;
+        if (adaptPoolHole(mid, bases, counts, row_bytes, p.slots, granularity, hole) >= need) lo = mid else hi = mid - 1;
+    }
+    const maxpos = if (g.expert_rows_adapt_maxpos == 0) 2 * lo else @min(2 * lo, g.expert_rows_adapt_maxpos);
+    return .{ .slot = lo, .position = maxpos, .need = need };
+}
+
 pub fn planAdapt(gpa: std.mem.Allocator, g: Geometry, context: usize, granularity: u64) !AdaptPlan {
+    return planAdaptAt(gpa, g, context, granularity, try adaptLimit(g, context, granularity));
+}
+
+/// Tails for an already-decided limit. The caller owns the returned slice.
+pub fn planAdaptAt(gpa: std.mem.Allocator, g: Geometry, context: usize, granularity: u64, limit: AdaptLimit) !AdaptPlan {
     if (granularity == 0) return error.AdaptBadGranularity;
     const p = planeBytes(context, g.layers, g.full_index_layers, g.cache_format);
     const elem: u64 = if (g.cache_format == .bf16) 2 else 1;
     const row_bytes = [_]u64{ @as(u64, mla.latent_dim) * elem, @as(u64, mla.rope_dim) * elem, @as(u64, index.dim) * elem };
     const plane_lens = [_]u64{ p.latent, p.rope, p.index };
     const bases = [_]u64{ 0, std.mem.alignForward(u64, p.latent, tensor_alignment), std.mem.alignForward(u64, std.mem.alignForward(u64, p.latent, tensor_alignment) + p.rope, tensor_alignment) };
-    // Planes are layer-major (State.latentAt: base + layer * slots * row): each layer of a plane has its own tail past
-    // the limit slot, and each layer's last row stays out of the lease.
     const counts = [_]u64{ @intCast(g.layers), @intCast(g.layers), @intCast(g.full_index_layers) };
-    const need = adaptNeedBytes(g, context);
-    if (adaptPool(1, bases, counts, row_bytes, p.slots, granularity) < need) return error.AdaptPoolTooSmall;
-    var lo: usize = 1;
-    var hi: usize = p.slots - 1;
-    while (lo < hi) {
-        const mid = lo + (hi - lo + 1) / 2;
-        if (adaptPool(mid, bases, counts, row_bytes, p.slots, granularity) >= need) lo = mid else hi = mid - 1;
-    }
+    const hole = parkHole(g);
+    const pool = adaptPoolHole(limit.slot, bases, counts, row_bytes, p.slots, granularity, hole);
+    if (pool < limit.need) return error.AdaptPoolTooSmall;
     var tails: std.ArrayList(AdaptTail) = .empty;
     errdefer tails.deinit(gpa);
     for (0..3) |i| {
@@ -755,13 +810,55 @@ pub fn planAdapt(gpa: std.mem.Allocator, g: Geometry, context: usize, granularit
         const stride = @as(u64, @intCast(p.slots)) * row_bytes[i];
         for (0..@intCast(counts[i])) |l| {
             const lb = bases[i] + @as(u64, @intCast(l)) * stride;
-            const start = std.mem.alignForward(u64, lb + @as(u64, @intCast(lo)) * row_bytes[i], granularity);
-            const end = std.mem.alignBackward(u64, lb + stride - row_bytes[i], granularity);
-            if (end > start) try tails.append(gpa, .{ .kv_offset = start, .len = end - start });
+            for (layerTails(lb, row_bytes[i], limit.slot, p.slots, granularity, hole)) |t| {
+                if (t.len != 0) try tails.append(gpa, t);
+            }
         }
     }
-    const maxpos = if (g.expert_rows_adapt_maxpos == 0) 2 * lo else @min(2 * lo, g.expert_rows_adapt_maxpos);
-    return .{ .limit_slot = lo, .limit_position = maxpos, .need = need, .pool = adaptPool(lo, bases, counts, row_bytes, p.slots, granularity), .tails = try tails.toOwnedSlice(gpa), .kv_bytes = stateArenas(g, context).kv };
+    return .{ .limit_slot = limit.slot, .limit_position = limit.position, .need = limit.need, .pool = pool, .tails = try tails.toOwnedSlice(gpa), .kv_bytes = stateArenas(g, context).kv };
+}
+
+/// The adapt plan a State may borrow: the park's KV-tail slots, when any, must sit entirely above the borrow's
+/// first slot. The refusal happens before the tails allocation, so the error path takes nothing to free.
+pub fn planAdaptBorrowed(gpa: std.mem.Allocator, g: Geometry, context: usize, granularity: u64) !AdaptPlan {
+    const limit = try adaptLimit(g, context, granularity);
+    if (g.park_tail_slot != 0 and parkHole(g) == null) {
+        const slots = planeBytes(context, g.layers, g.full_index_layers, g.cache_format).slots;
+        if (!parkTailFits(g.park_tail_slot, g.park_rows / 2, slots, limit.slot)) return error.LongTierParkTail;
+    }
+    return planAdaptAt(gpa, g, context, granularity, limit);
+}
+
+pub const ParkPlacement = struct { slot: usize, own_arena: bool, adapt_from: usize = 0 };
+
+/// Where the side park lives. A long tier parks it in the KV plane's tail past the long-context rows; when an
+/// adaptive borrow needs that same tail, the park moves to its own arena instead (same bytes, same copies).
+pub fn parkPlacement(g: Geometry, context: usize, granularity: u64) !ParkPlacement {
+    if (g.park_rows == 0) return .{ .slot = 0, .own_arena = false };
+    if (g.park_tail_slot == 0) return .{ .slot = 0, .own_arena = true };
+    const slots = planeBytes(context, g.layers, g.full_index_layers, g.cache_format).slots;
+    const park_slots = g.park_rows / 2;
+    if (!parkTailFits(g.park_tail_slot, park_slots, slots, null)) return error.LongTierParkTail;
+    if (g.expert_rows_adapt == 0) return .{ .slot = g.park_tail_slot, .own_arena = false };
+    const limit = try adaptLimit(g, context, granularity);
+    if (parkHole(g) != null) return .{ .slot = g.park_tail_slot, .own_arena = false, .adapt_from = limit.slot };
+    if (parkTailFits(g.park_tail_slot, park_slots, slots, limit.slot)) return .{ .slot = g.park_tail_slot, .own_arena = false, .adapt_from = limit.slot };
+    return .{ .slot = 0, .own_arena = true, .adapt_from = limit.slot };
+}
+
+/// adaptPool with the parked slots skipped (`hole` null is exactly adaptPool).
+pub fn adaptPoolHole(slots: usize, bases: [3]u64, counts: [3]u64, rows: [3]u64, plane_slots: usize, gran: u64, hole: ?[2]usize) u64 {
+    if (hole == null) return adaptPool(slots, bases, counts, rows, plane_slots, gran);
+    var sum: u64 = 0;
+    for (0..3) |i| {
+        if (counts[i] == 0) continue;
+        const stride = @as(u64, @intCast(plane_slots)) * rows[i];
+        for (0..@intCast(counts[i])) |l| {
+            const lb = bases[i] + @as(u64, @intCast(l)) * stride;
+            for (layerTails(lb, rows[i], slots, plane_slots, gran, hole)) |t| sum += t.len;
+        }
+    }
+    return sum;
 }
 
 /// Bytes leasable past `slots` across every layer of the three KV planes (granularity-aligned per layer tail).
@@ -883,6 +980,15 @@ pub fn validExpertRows(g: Geometry) bool {
     if (er > g.chunk_rows) return false;
     if (er > pr) return pr != 0 and er % pr == 0;
     return er % 16 == 0;
+}
+
+/// The adapt shape a planner can size before admission lowers the base expert rows: the prompt batch must be a
+/// grouped multiple of the piece rows and fit the chunk. The base `expert_rows` is deliberately not consulted.
+pub fn adaptGeometrySane(g: Geometry) bool {
+    if (g.expert_rows_adapt == 0 or g.expert_rows_adapt > 8192 or g.expert_rows_adapt % 16 != 0) return false;
+    if (g.expert_rows_adapt > g.chunk_rows) return false;
+    if (g.piece_rows == 0 or g.piece_rows >= g.expert_rows_adapt or g.expert_rows_adapt % g.piece_rows != 0) return false;
+    return groupedExperts(g.expert_rows_adapt, g.piece_rows);
 }
 
 /// Parse TF_GLM53_PIECE_ROWS: 512 (the default), 1024 or 2048. Anything else is refused before admission.
@@ -1667,11 +1773,17 @@ pub const State = struct {
         if (admission.context != context or admission.state_bytes != stateBytes(geometry, context) or admission.state_logical != breakdown(geometry, context, .{}).logicalState() or admission.breakdown.graphs != geometry.graphs_bytes or admission.breakdown.runtime != geometry.runtime_bytes) return error.AdmissionMismatch;
         try validateMoePipeGeometry(geometry);
         if (fresh_mem_available -| admission.reserve.bytes < admission.state_bytes + geometry.graphs_bytes) {
-            if (!builtin.is_test) std.log.err("GLM-5.3 after load: MemAvailable {d:.2} GiB less reserve {d:.2} GiB cannot hold State {d:.2} + graphs {d:.2} GiB", .{ gib(fresh_mem_available), gib(admission.reserve.bytes), gib(admission.state_bytes), gib(geometry.graphs_bytes) });
+            if (!builtin.is_test) {
+                std.log.err("GLM-5.3 after load: MemAvailable {d:.2} GiB less reserve {d:.2} GiB cannot hold State {d:.2} + graphs {d:.2} GiB", .{ gib(fresh_mem_available), gib(admission.reserve.bytes), gib(admission.state_bytes), gib(geometry.graphs_bytes) });
+                if (geometry.park_rows != 0 and geometry.park_tail_slot == 0 and geometry.expert_rows_adapt != 0) std.log.err("GLM-5.3: the long tier's {d} side rows cannot share the KV tail beside an adaptive borrow; their own arena is {d:.2} GiB. Clear TF_GLM53_SIDE_ROWS or TF_GLM53_EXPERT_ROWS_ADAPT on both ranks.", .{ geometry.park_rows, gib(arenaBytes(parkBytes(geometry.layers, geometry.full_index_layers, geometry.park_rows))) });
+            }
             return error.MemoryBudgetAfterLoad;
         }
         const plane = planeBytes(context, geometry.layers, geometry.full_index_layers, geometry.cache_format);
-        if (geometry.park_tail_slot != 0 and !parkTailFits(geometry.park_tail_slot, geometry.park_rows / 2, plane.slots, null)) return error.LongTierParkTail;
+        if (geometry.park_tail_slot != 0 and !parkTailFits(geometry.park_tail_slot, geometry.park_rows / 2, plane.slots, null)) {
+            if (!builtin.is_test) std.log.err("GLM-5.3: TF_GLM53_SIDE_ROWS={d} parks {d} slots at KV slot {d}, past the {d}-slot planes", .{ geometry.park_rows, geometry.park_rows / 2, geometry.park_tail_slot, plane.slots });
+            return error.LongTierParkTail;
+        }
         const layout = workspaceLayout(geometry, context);
         try validatePromptExpertsCarve(geometry.prompt_experts, &layout);
         const empty: cuda.DeviceBuffer = .{ .d = driver, .ptr = 0, .len = 0 };
@@ -1704,9 +1816,14 @@ pub const State = struct {
             out.kv_arena = try cuda.DeviceBuffer.alloc(driver, @intCast(arenas.kv));
         } else {
             var vmm = maybe_vmm.?;
-            const plan = try planAdapt(std.heap.page_allocator, geometry, context, vmm.granularity);
+            const plan = planAdaptBorrowed(std.heap.page_allocator, geometry, context, vmm.granularity) catch |err| {
+                if (err == error.LongTierParkTail) {
+                    const maybe_bound: ?AdaptLimit = adaptLimit(geometry, context, vmm.granularity) catch null;
+                    if (maybe_bound) |bound| if (!builtin.is_test) std.log.err("GLM-5.3: the long tier parks {d} side rows at KV slots {d}..{d}, but TF_GLM53_EXPERT_ROWS_ADAPT={d} borrows the KV tails from slot {d}; the borrow would overwrite the park. Clear TF_GLM53_SIDE_ROWS or TF_GLM53_EXPERT_ROWS_ADAPT, or let the park move to its own arena.", .{ geometry.park_rows, geometry.park_tail_slot, geometry.park_tail_slot + geometry.park_rows / 2, geometry.expert_rows_adapt, bound.slot });
+                }
+                return err;
+            };
             defer std.heap.page_allocator.free(plan.tails);
-            if (geometry.park_tail_slot != 0 and !parkTailFits(geometry.park_tail_slot, geometry.park_rows / 2, plane.slots, plan.limit_slot)) return error.LongTierParkTail;
             if (vmm.va_len < arenas.kv + plan.pool) return error.AdaptVmmRangeTooSmall;
             const kv_va = vmm.va;
             const b = kv_va + arenas.kv;
@@ -1996,6 +2113,90 @@ test "adaptive expert tail planner chooses the largest fitting KV slot" {
     const clipped = try planAdapt(gpa, .{ .expert_rows = 1024, .chunk_rows = 4096, .piece_rows = 512, .expert_rows_adapt = 2048, .expert_rows_adapt_maxpos = 1024 }, 262144, 2 << 20);
     defer gpa.free(clipped.tails);
     try std.testing.expectEqual(@as(usize, 1024), clipped.limit_position);
+}
+
+test "the long tier's KV-tail park yields to an 8192-row adapt borrow" {
+    const gpa = std.testing.allocator;
+    const requested: usize = 200000 / 2;
+    var g: Geometry = .{ .expert_rows = 1024, .chunk_rows = 8192, .piece_rows = 512, .expert_rows_adapt = 8192, .prompt_experts = true };
+    g.park_rows = 32768;
+    g.park_tail_slot = requested;
+    const placement = try parkPlacement(g, 262144, 2 << 20);
+    try std.testing.expect(placement.own_arena);
+    try std.testing.expectEqual(@as(usize, 0), placement.slot);
+    try std.testing.expect(placement.adapt_from < requested);
+    g.park_tail_slot = placement.slot;
+    const plan = try planAdaptBorrowed(gpa, g, 262144, 2 << 20);
+    defer gpa.free(plan.tails);
+    try std.testing.expect(plan.pool >= plan.need);
+    try std.testing.expect(plan.limit_slot < requested);
+    try std.testing.expectEqual(arenaBytes(parkBytes(g.layers, g.full_index_layers, g.park_rows)), stateArenas(g, 262144).park);
+    const weights: WeightClasses = .{};
+    const reserve = reserveForWithMargin(0, false, 3 << 30, 0);
+    const total = breakdown(g, 262144, weights).total();
+    const admitted = try admitRank(g, 262144, weights, total + reserve.bytes, reserve);
+    try std.testing.expectEqual(total + reserve.bytes, admitted.mem_available);
+    try std.testing.expectError(error.MemoryBudget, admitRank(g, 262144, weights, total + reserve.bytes - 1, reserve));
+}
+
+test "an adapt borrow that would overwrite the parked KV tail is refused before it allocates" {
+    var g: Geometry = .{ .expert_rows = 1024, .chunk_rows = 8192, .piece_rows = 512, .expert_rows_adapt = 8192, .prompt_experts = true };
+    g.park_rows = 32768;
+    g.park_tail_slot = 100000;
+    try std.testing.expectError(error.LongTierParkTail, planAdaptBorrowed(std.testing.allocator, g, 262144, 2 << 20));
+    const limit = try adaptLimit(g, 262144, 2 << 20);
+    try std.testing.expect(!parkTailFits(g.park_tail_slot, g.park_rows / 2, planeBytes(262144, g.layers, g.full_index_layers, g.cache_format).slots, limit.slot));
+}
+
+test "TF_GLM53_PARK_HOLE keeps the long tier's park in the KV tail beside an 8192-row adapt borrow" {
+    const gpa = std.testing.allocator;
+    var g: Geometry = .{ .expert_rows = 1024, .chunk_rows = 8192, .piece_rows = 512, .expert_rows_adapt = 8192, .prompt_experts = true };
+    g.park_rows = 16384;
+    g.park_tail_slot = 100000;
+    g.park_hole = true;
+    const placement = try parkPlacement(g, 262144, 2 << 20);
+    try std.testing.expect(!placement.own_arena);
+    try std.testing.expectEqual(@as(usize, 100000), placement.slot);
+    try std.testing.expectEqual(@as(u64, 0), stateArenas(g, 262144).park);
+    const plan = try planAdaptBorrowed(gpa, g, 262144, 2 << 20);
+    defer gpa.free(plan.tails);
+    try std.testing.expect(plan.pool >= plan.need);
+    // Without the hole the same borrow starts higher: skipping the park costs low slots only.
+    var nohole = g;
+    nohole.park_hole = false;
+    const plain = try adaptLimit(nohole, 262144, 2 << 20);
+    try std.testing.expect(plan.limit_slot < plain.slot);
+    // No leased byte overlaps any layer's parked rows, and tails ascend (the VMM map walks them in order).
+    const p = planeBytes(262144, g.layers, g.full_index_layers, g.cache_format);
+    const elem: u64 = if (g.cache_format == .bf16) 2 else 1;
+    const row_bytes = [_]u64{ @as(u64, mla.latent_dim) * elem, @as(u64, mla.rope_dim) * elem, @as(u64, index.dim) * elem };
+    const bases = [_]u64{ 0, std.mem.alignForward(u64, p.latent, tensor_alignment), std.mem.alignForward(u64, std.mem.alignForward(u64, p.latent, tensor_alignment) + p.rope, tensor_alignment) };
+    const counts = [_]u64{ @intCast(g.layers), @intCast(g.layers), @intCast(g.full_index_layers) };
+    var prev_end: u64 = 0;
+    for (plan.tails) |t| {
+        try std.testing.expect(t.kv_offset >= prev_end);
+        prev_end = t.kv_offset + t.len;
+        for (0..3) |i| {
+            const stride = @as(u64, @intCast(p.slots)) * row_bytes[i];
+            for (0..@intCast(counts[i])) |l| {
+                const lb = bases[i] + @as(u64, @intCast(l)) * stride;
+                const park_lo = lb + @as(u64, @intCast(g.park_tail_slot)) * row_bytes[i];
+                const park_hi = park_lo + @as(u64, @intCast(g.park_rows / 2)) * row_bytes[i];
+                try std.testing.expect(t.kv_offset + t.len <= park_lo or t.kv_offset >= park_hi);
+            }
+        }
+    }
+    // Hole off keeps the old answer exactly.
+    try std.testing.expectEqual(adaptPool(plain.slot, bases, counts, row_bytes, p.slots, 2 << 20), adaptPoolHole(plain.slot, bases, counts, row_bytes, p.slots, 2 << 20, null));
+}
+
+test "the long tier keeps its KV-tail park when no adapt borrow competes" {
+    var g: Geometry = .{ .expert_rows = 1024, .chunk_rows = 8192, .piece_rows = 512 };
+    g.park_rows = 32768;
+    g.park_tail_slot = 100000;
+    const placement = try parkPlacement(g, 262144, 2 << 20);
+    try std.testing.expect(!placement.own_arena);
+    try std.testing.expectEqual(@as(usize, 100000), placement.slot);
 }
 
 test "adaptive workspace only replaces prompt batch regions" {

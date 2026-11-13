@@ -206,6 +206,16 @@ pub fn expertRows() !usize {
     return parseExpertRows(if (raw) |v| std.mem.span(v) else null);
 }
 
+var park_hole_cache: ?bool = null;
+/// TF_GLM53_PARK_HOLE=1 (cached): see state.Geometry.park_hole.
+fn parkHoleEnabled() bool {
+    if (park_hole_cache) |v| return v;
+    const raw = std.c.getenv("TF_GLM53_PARK_HOLE");
+    const v = if (raw) |r| std.mem.eql(u8, std.mem.span(r), "1") else false;
+    park_hole_cache = v;
+    return v;
+}
+
 pub fn parseExpertRowsAdapt(raw: ?[]const u8) !usize {
     const value = raw orelse return 0;
     if (std.mem.eql(u8, value, "0")) return 0;
@@ -1248,7 +1258,31 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     if (side_rows != 0 and !residentEnabled()) return error.SideRowsNeedResident;
     if (side_rows != 0 and geometry.cache_format != .bf16) return error.SideRowsNeedBf16Cache;
     geometry.park_rows = side_rows;
-    if (long_from != 0 and side_rows != 0) geometry.park_tail_slot = long_from / 2;
+    var adapt_gran: u64 = 0;
+    var park_own_arena = false;
+    var park_own_bytes: u64 = 0;
+    if (adapt_rows != 0) {
+        var probe = try cuda.arena.Vmm.open(ctx.d, ctx.device, 2 << 20);
+        adapt_gran = @intCast(probe.granularity);
+        probe.close();
+    }
+    if (long_from != 0 and side_rows != 0 and adapt_rows != 0 and state.adaptGeometrySane(geometry)) {
+        geometry.park_tail_slot = long_from / 2;
+        geometry.park_hole = parkHoleEnabled();
+        if (p.rank == 0 and geometry.park_hole) std.log.info("TF_GLM53_PARK_HOLE=1: the adapt borrow skips the long tier's parked KV-tail slots {d}..{d}; the park stays in the KV tail", .{ long_from / 2, long_from / 2 + side_rows / 2 });
+        const placement = state.parkPlacement(geometry, o.context, adapt_gran) catch |err| {
+            if (err == error.LongTierParkTail and p.rank == 0) std.log.err("GLM-5.3: TF_GLM53_SIDE_ROWS={d} parks {d} slots at KV slot {d}, past the {d}-slot planes; lower TF_GLM53_SIDE_ROWS or TF_GLM53_LONG_CTX_ROWS", .{ side_rows, side_rows / 2, long_from / 2, state.planeBytes(o.context, geometry.layers, geometry.full_index_layers, geometry.cache_format).slots });
+            return err;
+        };
+        geometry.park_tail_slot = placement.slot;
+        park_own_arena = placement.own_arena;
+        if (placement.own_arena) {
+            park_own_bytes = state.arenaBytes(state.parkBytes(geometry.layers, geometry.full_index_layers, side_rows));
+            if (p.rank == 0) std.log.warn("TF_GLM53_LONG_CTX_ROWS={d} with TF_GLM53_EXPERT_ROWS_ADAPT={d}: the adapt borrow starts at KV slot {d}, below the park at {d}; the {d} side rows move to their own {d:.2} GiB arena and admission includes it. Clear TF_GLM53_SIDE_ROWS to keep the long tier's KV-tail saving, or TF_GLM53_EXPERT_ROWS_ADAPT to keep the park there.", .{ long_from, adapt_rows, placement.adapt_from, long_from / 2, side_rows, state.gib(park_own_bytes) });
+        }
+    } else if (long_from != 0 and side_rows != 0) {
+        geometry.park_tail_slot = long_from / 2;
+    }
     if (p.rank == 0 and side_rows != 0) std.log.info("glm53 side rows: {d} (park {d:.2} GiB per rank)", .{ side_rows, state.gib(state.parkBytes(geometry.layers, geometry.full_index_layers, side_rows)) });
     try state.validatePieceRows(geometry);
     try state.validateMoePipeGeometry(geometry);
@@ -1293,7 +1327,10 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     const reserve = try state.reserveFromEnv(before.total);
     const graph_room_bytes = try std.math.mul(u64, try state.graphMiBFromEnv(), 1 << 20);
     try uma.configureGraphRoom(reserve.guard_floor, reserve.serve_margin / 2, graph_room_bytes);
-    const choice = try admissionChoice(geometry, rows, o.context, plan.weights, before.available, reserve, state.admitRank);
+    const choice = admissionChoice(geometry, rows, o.context, plan.weights, before.available, reserve, state.admitRank) catch |err| {
+        if ((err == error.MemoryBudget or err == error.ExpertRowsDoNotFit) and park_own_arena and p.rank == 0) std.log.err("GLM-5.3: the long tier's side park cannot stay in the KV tail beside TF_GLM53_EXPERT_ROWS_ADAPT={d}; its own arena needs {d:.2} GiB and this rank does not fit under the reserve. Clear TF_GLM53_SIDE_ROWS, lower TF_GLM53_EXPERT_ROWS_ADAPT, or raise the memory budget.", .{ adapt_rows, state.gib(park_own_bytes) });
+        return err;
+    };
     geometry.expert_rows = choice.rows;
     try validateExpertRowsAdapt(geometry);
     const admission = choice.admission;
@@ -1529,10 +1566,8 @@ fn openInner(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     var state_vmm: ?cuda.arena.Vmm = null;
     var adapt_limit_position: usize = 0;
     if (adapt_rows != 0) {
-        var probe = try cuda.arena.Vmm.open(ctx.d, ctx.device, 2 << 20);
-        const gran: u64 = @intCast(probe.granularity);
-        probe.close();
-        const ap = try state.planAdapt(gpa, geometry, o.context, gran);
+        if (adapt_gran == 0) return error.ExpertRowsAdaptNeedsVmm;
+        const ap = try state.planAdapt(gpa, geometry, o.context, adapt_gran);
         defer gpa.free(ap.tails);
         adapt_limit_position = ap.limit_position;
         state_vmm = try cuda.arena.Vmm.open(ctx.d, ctx.device, @intCast(ap.kv_bytes + ap.pool));
@@ -2275,6 +2310,7 @@ fn settingsDigest(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, o: Option
         hash.update("TF_GLM53_SIDE_ROWS=");
         hash.update(std.mem.asBytes(&side_rows));
     }
+    if (side_rows != 0 and parkHoleEnabled()) hash.update("TF_GLM53_PARK_HOLE=1");
     try hashPrefixCacheSwitch(&hash, prefixCacheSwitch(), if (adapt_rows != 0) adapt_rows else try expertRows(), try state.pieceRowsFromEnv());
     hashPromptExperts(&hash, prompt_experts);
     if (prompt_mla != .off) {
