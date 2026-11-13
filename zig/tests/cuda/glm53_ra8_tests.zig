@@ -121,7 +121,7 @@ const Call = struct {
     scale1: u64 = 0,
 };
 
-const Which = enum { rot_in, gu, rot_a8, gu_a8, gu_w8, rot_w8s, rot_dd, gu_w8s, gu_w8s_pf, down, xd_w8s, down_w8s };
+const Which = enum { rot_in, gu, rot_a8, gu_a8, gu_w8, rot_w8s, rot_dd, gu_w8s, gu_w8s_pf, gu_w8s_m, down, xd_w8s, down_w8s };
 
 const Metrics = struct {
     max_abs: f64 = 0,
@@ -337,6 +337,10 @@ fn launchGuW8sPf(c: *const Call) !void {
     return launchGuCodes(c, c.pmx.gu_w8s_pf);
 }
 
+fn launchGuW8sM(c: *const Call) !void {
+    return launchGuCodes(c, c.pmx.gu_w8s_m);
+}
+
 fn launchGuCodes(c: *const Call, fun: anytype) !void {
     const items = cuda.grouped.maxItems(c.rows * SLOTS, E, exl3e.prompt.wide_tile);
     var args: cuda.launch.Args = .{};
@@ -520,6 +524,7 @@ fn once(c: *const Call, which: Which) !void {
         .rot_dd => try launchRotW8sDd(c),
         .gu_w8s => try launchGuW8s(c),
         .gu_w8s_pf => try launchGuW8sPf(c),
+        .gu_w8s_m => try launchGuW8sM(c),
         .down => try launchDown(c),
         .xd_w8s => try launchXdW8s(c),
         .down_w8s => try launchDownW8s(c),
@@ -789,6 +794,18 @@ fn oneRow(r: *Rig, c: *const Call, ev: *const [2]cuda.Event) !Outcome {
         std.debug.print("FAIL glm53-ra8 rows={d} w8s nonfinite={d}\n", .{ c.rows, ms.nonfinite });
         failed = true;
     }
+    // TF_GLM53_GU_M: same args and smem as gu_w8s, so every live xd half must be byte-equal.
+    try wipe(r, c.sc.xd, xd_len);
+    try launchRotW8s(c);
+    try launchGuW8sM(c);
+    const got_m = try fetchHalves(r, c.sc.xd, xd_len);
+    defer r.gpu.gpa.free(got_m);
+    if (firstMismatch(set.rows, got_m, got_s)) |at| {
+        std.debug.print("FAIL glm53-gum rows={d} differs at {d}\n", .{ c.rows, at });
+        failed = true;
+    } else {
+        std.debug.print("INFO glm53-gum rows={d} xd byte=equal\n", .{c.rows});
+    }
     // TF_GLM53_ROT_DD: the row kernel must write the pair kernel's code and scale bytes. benchPicks has no negative
     // ids, so every pair of this run is live.
     {
@@ -874,6 +891,8 @@ fn oneRow(r: *Rig, c: *const Call, ev: *const [2]cuda.Event) !Outcome {
     std.debug.print("BENCH glm53-ra8 rows={d} | w8s {d:.1} + {d:.1} = {d:.1} us {d:.2}x of release {d:.1} us\n", .{ c.rows, us_rot_w8s, us_gu_w8s, w8s_us, w8s_speed, release_us });
     const us_gu_w8s_pf = try timed(c, ev, .gu_w8s_pf);
     std.debug.print("BENCH glm53-ra8 rows={d} | gu_w8s {d:.1} | gu_w8s_pf {d:.1} us {d:.3}x\n", .{ c.rows, us_gu_w8s, us_gu_w8s_pf, us_gu_w8s / us_gu_w8s_pf });
+    const us_gu_w8s_m = try timed(c, ev, .gu_w8s_m);
+    std.debug.print("BENCH glm53-gum rows={d} | gu_w8s {d:.1} | gu_m {d:.1} us {d:.3}x\n", .{ c.rows, us_gu_w8s, us_gu_w8s_m, us_gu_w8s / us_gu_w8s_m });
     if (try downCheck(r, c, ev, set.rows)) failed = true;
     var slow = false;
     if (c.rows == 4096 and w8s_speed < 1.25) {
@@ -1025,7 +1044,7 @@ pub fn runKo(gpu: anytype) !void {
 }
 
 /// Timing only: the release rotation and gate/up run once to fill fp16 xd, then xd_w8s, the full
-/// down_w8s, every down KO ablation and the p5a small-item down (full and no-epilogue). No checks:
+/// down_w8s, every down KO ablation and the p5a small-item down (full, no-epilogue, epi and epi_sw). No checks:
 /// the KO variants write wrong output by design.
 pub fn runDnKo(gpu: anytype) !void {
     if (!cuda.kernels.available or cuda.kernels.exl3_experts.len == 0 or cuda.kernels.glm53_pmx.len == 0 or cuda.kernels.glm53_p5a.len == 0) return error.KernelsNotEmbedded;
@@ -1096,8 +1115,10 @@ pub fn runDnKo(gpu: anytype) !void {
         const us_p5a_noepi = try timedP5aDown(&call, &ev, p5a_noepi);
         const us_epi = try timedDownFun(&call, &ev, call.pmx.down_w8s_epi);
         const us_p5a_epi = try timedP5aDown(&call, &ev, small.down_epi);
+        const us_p5a_epi_sw = try timedP5aDown(&call, &ev, small.down_epi_sw);
         std.debug.print("BENCH glm53-dn-ko rows={d} | xd {d:.1} | full {d:.1} | ko1 nodecode {d:.1} | ko2 nomma {d:.1} | ko4 noload {d:.1} | ko16 noepi {d:.1} | ko32 noldsm {d:.1} | ko64 nobar {d:.1} | ko35 nodecode+nomma+noldsm {d:.1} | ko39 nodecode+nomma+noload+noldsm {d:.1} | empty {d:.1} | p5a {d:.1} | p5a noepi {d:.1} us\n", .{ rows, us_xd, us_full, ko1, ko2, ko4, ko16, ko32, ko64, ko35, ko39, us_empty, us_p5a, us_p5a_noepi });
         std.debug.print("BENCH glm53-dn-epi rows={d} | down {d:.1} | down_epi {d:.1} | p5a {d:.1} | p5a_epi {d:.1} us\n", .{ rows, us_full, us_epi, us_p5a, us_p5a_epi });
+        std.debug.print("BENCH glm53-p5sw rows={d} | p5a_epi {d:.1} | p5a_epi_sw {d:.1} us\n", .{ rows, us_p5a_epi, us_p5a_epi_sw });
         const y_len = pairs * D * 4;
         var row_failed = false;
         {
@@ -1127,6 +1148,14 @@ pub fn runDnKo(gpu: anytype) !void {
             defer rig.gpu.gpa.free(y_p5a_epi);
             if (firstDownMismatch(live.small, y_p5a, y_p5a_epi, D)) |m| {
                 std.debug.print("FAIL glm53-dn-epi rows={d} p5a pair={d} col={d}\n", .{ rows, m.pair, m.col });
+                row_failed = true;
+            }
+            try wipe(rig, call.sc.y, y_len);
+            try launchP5aDownFun(&call, small.down_epi_sw);
+            const y_p5a_epi_sw = try fetch(rig, call.sc.y, y_len);
+            defer rig.gpu.gpa.free(y_p5a_epi_sw);
+            if (firstDownMismatch(live.small, y_p5a_epi, y_p5a_epi_sw, D)) |m| {
+                std.debug.print("FAIL glm53-p5sw rows={d} pair={d} col={d}\n", .{ rows, m.pair, m.col });
                 row_failed = true;
             }
         }

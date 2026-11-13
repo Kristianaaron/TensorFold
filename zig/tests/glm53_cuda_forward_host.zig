@@ -47,6 +47,10 @@ const names = [_][]const u8{
     "tf_glm53_topk_fit", "tf_glm53_merge2_fast",
     "tf_glm53_residual_rmsnorm_6144_sum", "tf_glm53_moe_residual_add_sum",
     "tf_glm53_residual_rmsnorm_6144_reg", "tf_glm53_residual_rmsnorm_6144_sum_reg",
+    "tf_glm53_p5a_down_epi_sw_e4m3",
+    "tf_glm53_pmx_gu_w8s_m_e4m3",
+    "tf_exl3_experts_rot_in_w8s", "tf_exl3_experts_rot_in_w4s",
+    "tf_glm53_pmx_gu_w8s_e4m3", "tf_glm53_pmx_xd_w8s", "tf_glm53_pmx_down_w8s_e4m3", "tf_glm53_pmx_down_w8s_epi_e4m3",
 };
 
 fn id(comptime name: []const u8) usize {
@@ -128,9 +132,9 @@ fn layout(name: usize) ?[]const u8 {
         .{ "tf_glm53_index_scores_qs2_k64_s2", "ppiipppiiiiiii" },
         .{ "tf_glm53_index_scores_qs2_k32_s2", "ppiipppiiiiiii" },
         .{ "tf_glm53_index_scores_qs2_k32_s3", "ppiipppiiiiiii" },
-        .{ "tf_glm53_merge", "ppppppiiii" },
-        .{ "tf_glm53_merge2", "ppppppiiiii" },
-        .{ "tf_glm53_merge2_fast", "ppppppiiiii" },
+        .{ "tf_glm53_merge", "ppppppiiiii" },
+        .{ "tf_glm53_merge2", "ppppppiiiiii" },
+        .{ "tf_glm53_merge2_fast", "ppppppiiiiii" },
         .{ "tf_glm_rmsnorm_6144", "plpplpfi" },
         .{ "tf_glm53_residual_rmsnorm_6144", "ppppif" },
         .{ "tf_glm53_residual_rmsnorm_6144_sum", "ppppif" },
@@ -402,12 +406,19 @@ fn fakeExperts() cuda.exl3_experts.Experts {
     e.rot_in = func("exl3_rot_in");
     e.rot_in_w8s_row = func("tf_exl3_experts_rot_in_w8s_row");
     e.rot_dd = false;
+    e.w8s = false;
+    e.w8s_all = false;
+    e.down_w8s = false;
+    e.down_epi = false;
+    e.p5_sw = false;
+    e.rot_in_w8s = func("tf_exl3_experts_rot_in_w8s");
+    e.rot_in_w4s = func("tf_exl3_experts_rot_in_w4s");
     e.grouped = @splat(func("exl3_grouped"));
     e.gateup = func("exl3_gateup");
     e.down_combine = func("exl3_down_combine");
     e.prompt = .{ .rotate = func("tf_exl3_prompt_rotate"), .gateup = func("tf_exl3_prompt_gu"), .down = func("tf_exl3_prompt_down"), .gateup_e4m3 = func("tf_exl3_prompt_gu_e4m3"), .down_e4m3 = func("tf_exl3_prompt_down_e4m3"), .wide = .{ .gu_small = .{ func("tf_exl3_prompt_gu_s"), func("tf_exl3_prompt_gu_s_e4m3") }, .down_small = .{ func("tf_exl3_prompt_down_s"), func("tf_exl3_prompt_down_s_e4m3") }, .up = .{ func("tf_exl3_prompt_wup"), func("tf_exl3_prompt_wup_e4m3") }, .gate = .{ func("tf_exl3_prompt_wgate"), func("tf_exl3_prompt_wgate_e4m3") }, .down = .{ func("tf_exl3_prompt_wdown"), func("tf_exl3_prompt_wdown_e4m3") } } };
-    e.pmx = .{ .mod = .{ .d = &driver, .handle = @ptrFromInt(0x6000) }, .plan_mod = .{ .d = &driver, .handle = @ptrFromInt(0x5000) }, .router = e.router, .gu = .{ func("tf_glm53_pmx_gu_mcg"), func("tf_glm53_pmx_gu_e4m3") }, .dn = .{ undefined, undefined }, .dequant = @splat(undefined) };
-    e.p5a = .{ .mod = .{ .d = &driver, .handle = @ptrFromInt(0x7000) }, .gu = .{ func("tf_glm53_p5a_gu_mcg"), func("tf_glm53_p5a_gu_e4m3") }, .down = .{ func("tf_glm53_p5a_down_mcg"), func("tf_glm53_p5a_down_e4m3") }, .down_epi = func("tf_glm53_p5a_down_epi_e4m3") };
+    e.pmx = .{ .mod = .{ .d = &driver, .handle = @ptrFromInt(0x6000) }, .plan_mod = .{ .d = &driver, .handle = @ptrFromInt(0x5000) }, .router = e.router, .gu = .{ func("tf_glm53_pmx_gu_mcg"), func("tf_glm53_pmx_gu_e4m3") }, .gu_w8s_m = func("tf_glm53_pmx_gu_w8s_m_e4m3"), .dn = .{ undefined, undefined }, .dequant = @splat(undefined), .gu_w8s = func("tf_glm53_pmx_gu_w8s_e4m3"), .xd_w8s = func("tf_glm53_pmx_xd_w8s"), .down_w8s = func("tf_glm53_pmx_down_w8s_e4m3"), .down_w8s_epi = func("tf_glm53_pmx_down_w8s_epi_e4m3") };
+    e.p5a = .{ .mod = .{ .d = &driver, .handle = @ptrFromInt(0x7000) }, .gu = .{ func("tf_glm53_p5a_gu_mcg"), func("tf_glm53_p5a_gu_e4m3") }, .down = .{ func("tf_glm53_p5a_down_mcg"), func("tf_glm53_p5a_down_e4m3") }, .down_epi = func("tf_glm53_p5a_down_epi_e4m3"), .down_epi_sw = func("tf_glm53_p5a_down_epi_sw_e4m3") };
     e.plan_rotate = func("group_plan_small");
     e.plan_finish = func("group_plan_scatter");
     return e;
@@ -1687,6 +1698,52 @@ test "prompt experts: flags from promptExpertsFlags launch each mode's kernels (
     try std.testing.expectError(error.PromptExpertsP5aNeedsPmx, invalid.validateSetup());
 }
 
+test "TF_GLM53_P5_SW runs the small-item down on the conflict-free stage, not the epi one" {
+    var g = geometry();
+    g.layers = 2;
+    g.full_index_layers = 0;
+    g.prompt_experts = true;
+    var pos: [64]usize = undefined;
+    var ids: [64]u32 = undefined;
+    for (&pos, &ids, 0..) |*p, *t, i| {
+        p.* = i;
+        t.* = @intCast(i);
+    }
+    var fx: Fixture = undefined;
+    try fx.init(g, 4096);
+    defer fx.deinit();
+    fx.layer_store[0] = glmLayer(0, true, false);
+    fx.layer_store[1] = glmLayer(1, false, false);
+    fx.model.layers = fx.layer_store[0..2];
+    // The runtime gate needs DOWN_W8S, DN_EPI and P5_SW together; the fixture sets the same three flags.
+    fx.ex.w8s = true;
+    fx.ex.down_w8s = true;
+    fx.ex.down_epi = true;
+    fx.ex.p5_sw = true;
+    var f = fx.fwd(0);
+    f.prompt_experts = true;
+    f.prompt_experts_wide = true;
+    f.prompt_experts_pmx = true;
+    f.prompt_experts_p5a = true;
+    try f.validateSetup();
+    Rec.reset();
+    try f.pieced(.{ .positions = &pos, .tokens = &ids });
+    const items128: u32 = @intCast(cuda.grouped.maxItems(64 * state.routed_slots, 256, cuda.exl3_experts.prompt.wide_tile));
+    var sw_seen = false;
+    var epi_seen = false;
+    for (Rec.launches.items) |launch| {
+        if (launch.name == id("tf_glm53_p5a_down_epi_sw_e4m3")) {
+            sw_seen = true;
+            try std.testing.expectEqual([3]u32{ 24, items128, 1 }, launch.grid);
+            try std.testing.expectEqual([3]u32{ 256, 1, 1 }, launch.block);
+            try std.testing.expectEqual(@as(u32, 0), launch.shared);
+        }
+        epi_seen = epi_seen or launch.name == id("tf_glm53_p5a_down_epi_e4m3");
+    }
+    try std.testing.expect(sw_seen);
+    try std.testing.expect(!epi_seen);
+}
+
 test "prompt MLA opt-in changes only prefill absorb and expand launches" {
     try std.testing.expectEqual(forward.PromptMlaMode.off, forward.promptMlaSelected(null));
     try std.testing.expectEqual(forward.PromptMlaMode.off, forward.promptMlaSelected("0"));
@@ -2695,10 +2752,13 @@ fn checkContracts(fx: *const Fixture, mode: forward.Mode, max_position: usize) !
             id("tf_glm53_merge") => {
                 const rows = a[8];
                 const k = a[9];
+                const stride = a[10];
+                try std.testing.expectEqual(@as(u64, forward.index.top_k), stride);
+                try std.testing.expect(k > 0 and k <= stride);
                 try inRegion(ws, "gathered_candidates", a[0], 2 * rows * k * 8);
-                try inRegion(ws, "global_tokens", a[1], rows * k * 4);
+                try inRegion(ws, "global_tokens", a[1], rows * stride * 4);
                 try inRegion(ws, "global_counts", a[2], rows * 4);
-                try inRegion(ws, "local_slots", a[3], rows * k * 4);
+                try inRegion(ws, "local_slots", a[3], rows * stride * 4);
                 try inRegion(ws, "local_counts", a[4], rows * 4);
             },
             id("tf_glm_residual_add") => try inRegion(ws, "gathered", a[2], 2 * a[3] * 4),
@@ -2876,6 +2936,37 @@ test "prefill in 1024-row pieces: buffers fit, exchanges equal the plan per piec
     try expectPlan(p);
     try std.testing.expectEqual(@as(usize, 2 * 4), recorded(.moe_partial)[1]); // 2 layers x 4 pieces
     try std.testing.expectEqual(@as(usize, 4), recorded(.embed)[1]);
+}
+
+test "TF_GLM53_PREFILL_TOPK reaches prefill selection and decode keeps 2048" {
+    var fx: Fixture = undefined;
+    try fx.init(geometry(), 16384);
+    defer fx.deinit();
+    var f = fx.fwd(1);
+    f.prefill_top_k = 1536;
+    var pos: [2048]usize = undefined;
+    var ids: [2048]u32 = undefined;
+    for (&pos, &ids, 0..) |*p, *t, i| {
+        p.* = 4096 + i;
+        t.* = @intCast((i * 7919) % 154880);
+    }
+    try f.pieced(.{ .positions = &pos, .tokens = &ids });
+    var prefill_merges: usize = 0;
+    for (Rec.launches.items) |launch| if (launch.name == id("tf_glm53_merge")) {
+        try std.testing.expectEqual(@as(u64, 1536), launch.args[9]);
+        try std.testing.expectEqual(@as(u64, forward.index.top_k), launch.args[10]);
+        prefill_merges += 1;
+    };
+    try std.testing.expect(prefill_merges > 0);
+    Rec.reset();
+    try f.whole(.{ .positions = &.{ 100, 3000 }, .tokens = &.{ 7, 77441 } });
+    var decode_merges: usize = 0;
+    for (Rec.launches.items) |launch| if (launch.name == id("tf_glm53_merge")) {
+        try std.testing.expectEqual(@as(u64, forward.index.top_k), launch.args[9]);
+        try std.testing.expectEqual(@as(u64, forward.index.top_k), launch.args[10]);
+        decode_merges += 1;
+    };
+    try std.testing.expect(decode_merges > 0);
 }
 
 test "one 4096-row prefill group halves the per-piece expert calls at 1024 rows" {

@@ -875,12 +875,12 @@ __device__ __forceinline__ bool before(Candidate a, Candidate b) {
 // Shared historical sort and output path, also used for the rare NaN ordering fallback in merge2.
 __device__ __forceinline__ void tf_glm53_merge_bitonic_task(Candidate* values, int* global, int* global_counts,
                                             int* local, int* counts, const long long* pos,
-                                            int rank, int world, int k) {
+                                            int rank, int world, int k, int stride) {
     const int r = TF_VBID.x, t = threadIdx.x;
     for (int size = 2; size <= 4096; size <<= 1) {
-        for (int stride = size >> 1; stride; stride >>= 1) {
+        for (int half = size >> 1; half; half >>= 1) {
             for (int i = t; i < 4096; i += 512) {
-                const int partner = i ^ stride;
+                const int partner = i ^ half;
                 if (partner > i) {
                     const bool up = (i & size) == 0;
                     const Candidate a = values[i], b = values[partner];
@@ -903,9 +903,9 @@ __device__ __forceinline__ void tf_glm53_merge_bitonic_task(Candidate* values, i
     TF_TASK_SYNC();
     // Sort the selected prefix by token ascending. Scores are now irrelevant.
     for (int size = 2; size <= 4096; size <<= 1) {
-        for (int stride = size >> 1; stride; stride >>= 1) {
+        for (int half = size >> 1; half; half >>= 1) {
             for (int i = t; i < 4096; i += 512) {
-                const int partner = i ^ stride;
+                const int partner = i ^ half;
                 if (partner > i) {
                     const bool up = (i & size) == 0;
                     Candidate a = values[i], b = values[partner];
@@ -919,7 +919,7 @@ __device__ __forceinline__ void tf_glm53_merge_bitonic_task(Candidate* values, i
     }
     for (int i = t; i < k; i += 512) {
         const int token = i < nvalid ? values[i].token : -1;
-        global[static_cast<long long>(r) * k + i] = token;
+        global[static_cast<long long>(r) * stride + i] = token;
     }
     __shared__ int scan_ws[2 * NW], selected_count;
     int total = 0;
@@ -928,19 +928,19 @@ __device__ __forceinline__ void tf_glm53_merge_bitonic_task(Candidate* values, i
         const int keep = pos[r] + 1 > 2048 && token != 0x7fffffff && token % world == rank;
         int pass_total = 0;
         const int dst = block_scan(keep, scan_ws, &pass_total);
-        if (keep) local[static_cast<long long>(r) * k + total + dst] = token / world;
+        if (keep) local[static_cast<long long>(r) * stride + total + dst] = token / world;
         total += pass_total;
     }
     if (t == 0) selected_count = pos[r] + 1 > 2048 ? total : 0;
     TF_TASK_SYNC();
-    for (int i = selected_count + t; i < k; i += 512) local[static_cast<long long>(r) * k + i] = -1;
+    for (int i = selected_count + t; i < k; i += 512) local[static_cast<long long>(r) * stride + i] = -1;
     if (t == 0 && counts) counts[r] = selected_count;
 }
 
 // One packed [rank][row][k] exchange; global top-k, sparse filter and rank-slot remap in one CTA.
 __device__ __forceinline__ void tf_glm53_merge_task(const Candidate* packed, int* global, int* global_counts,
                                             int* local, int* counts, const long long* pos,
-                                            int rank, int world, int rows, int k, unsigned char* storage) {
+                                            int rank, int world, int rows, int k, int stride, unsigned char* storage) {
     const int r = TF_VBID.x, t = threadIdx.x;
     const int candidates = 2 * k;
     Candidate* values = reinterpret_cast<Candidate*>(storage);
@@ -952,22 +952,22 @@ __device__ __forceinline__ void tf_glm53_merge_task(const Candidate* packed, int
     }
     for (int i = candidates + t; i < 4096; i += 512) values[i] = { -CUDART_INF_F, 0x7fffffff };
     TF_TASK_SYNC();
-    tf_glm53_merge_bitonic_task(values, global, global_counts, local, counts, pos, rank, world, k);
+    tf_glm53_merge_bitonic_task(values, global, global_counts, local, counts, pos, rank, world, k, stride);
 }
 
 extern "C" __global__ void tf_glm53_merge(const Candidate* packed, int* global, int* global_counts,
                                             int* local, int* counts, const long long* pos,
-                                            int rank, int world, int rows, int k) {
+                                            int rank, int world, int rows, int k, int stride) {
     TF_VBLOCK_ENTER();
     extern __shared__ unsigned char storage[];
-    tf_glm53_merge_task(packed, global, global_counts, local, counts, pos, rank, world, rows, k, storage);
+    tf_glm53_merge_task(packed, global, global_counts, local, counts, pos, rank, world, rows, k, stride, storage);
 }
 
 // Exact threshold select followed by stable compaction and a merge-path rank calculation. Input lists are
 // already token-ascending; only the selected prefix is compacted, so the historical output order is preserved.
 __device__ __forceinline__ void tf_glm53_merge2_task(const Candidate* packed, int* global, int* global_counts,
                                             int* local, int* counts, const long long* pos,
-                                            int rank, int world, int rows, int k, int block_rows,
+                                            int rank, int world, int rows, int k, int block_rows, int stride,
                                             unsigned char* storage) {
     const int r = TF_VBID.x, t = threadIdx.x;
     Candidate* values = reinterpret_cast<Candidate*>(storage);
@@ -1000,7 +1000,7 @@ __device__ __forceinline__ void tf_glm53_merge2_task(const Candidate* packed, in
     if (negative_nan) {
         for (int i = 2 * k + t; i < 4096; i += NT) values[i] = { -CUDART_INF_F, 0x7fffffff };
         TF_TASK_SYNC();
-        tf_glm53_merge_bitonic_task(values, global, global_counts, local, counts, pos, rank, world, k);
+        tf_glm53_merge_bitonic_task(values, global, global_counts, local, counts, pos, rank, world, k, stride);
         return;
     }
     if (t == 0) tie_token = 0xffffffffu;
@@ -1103,29 +1103,29 @@ __device__ __forceinline__ void tf_glm53_merge2_task(const Candidate* packed, in
         const int token = values[i].token;
         int lo = 0, hi = n_b;
         while (lo < hi) { const int mid = (lo + hi) >> 1; if (values[k + mid].token < token) lo = mid + 1; else hi = mid; }
-        global[static_cast<long long>(r) * k + i + lo] = token;
+        global[static_cast<long long>(r) * stride + i + lo] = token;
     }
     for (int j = t; j < n_b; j += NT) {
         const int token = values[k + j].token;
         int lo = 0, hi = n_a;
         while (lo < hi) { const int mid = (lo + hi) >> 1; if (values[mid].token < token) lo = mid + 1; else hi = mid; }
-        global[static_cast<long long>(r) * k + j + lo] = token;
+        global[static_cast<long long>(r) * stride + j + lo] = token;
     }
-    for (int i = t; i < k; i += NT) if (i >= n_a + n_b) global[static_cast<long long>(r) * k + i] = -1;
+    for (int i = t; i < k; i += NT) if (i >= n_a + n_b) global[static_cast<long long>(r) * stride + i] = -1;
     TF_TASK_SYNC();
     const int own_n = rank == 0 ? n_a : n_b;
     const int own_base = rank == 0 ? 0 : k;
     const int selected_count = pos[r] + 1 > 2048 ? own_n : 0;
-    for (int i = t; i < k; i += NT) local[static_cast<long long>(r) * k + i] = i < selected_count ? values[own_base + i].token / world : -1;
+    for (int i = t; i < k; i += NT) local[static_cast<long long>(r) * stride + i] = i < selected_count ? values[own_base + i].token / world : -1;
     if (t == 0 && counts) counts[r] = selected_count;
 }
 
 extern "C" __global__ void tf_glm53_merge2(const Candidate* packed, int* global, int* global_counts,
                                             int* local, int* counts, const long long* pos,
-                                            int rank, int world, int rows, int k, int block_rows) {
+                                            int rank, int world, int rows, int k, int block_rows, int stride) {
     TF_VBLOCK_ENTER();
     extern __shared__ unsigned char storage[];
-    tf_glm53_merge2_task(packed, global, global_counts, local, counts, pos, rank, world, rows, k, block_rows, storage);
+    tf_glm53_merge2_task(packed, global, global_counts, local, counts, pos, rank, world, rows, k, block_rows, stride, storage);
 }
 
 // One warp scans the 256 bins as eight a lane; both helpers pick the bin that holds the target rank.
@@ -1178,7 +1178,7 @@ __device__ __forceinline__ void radix_pick_asc(const unsigned* h, int target, in
 // Missing records keep their raw score so the NaN fallback sees exactly the input merge2 saw.
 __device__ __forceinline__ void tf_glm53_merge2_fast_task(const Candidate* packed, int* global, int* global_counts,
                                             int* local, int* counts, const long long* pos,
-                                            int rank, int world, int rows, int k, int block_rows,
+                                            int rank, int world, int rows, int k, int block_rows, int stride,
                                             unsigned char* storage) {
     const int r = TF_VBID.x, t = threadIdx.x, lane = t & 31;
     Candidate* values = reinterpret_cast<Candidate*>(storage);
@@ -1233,7 +1233,7 @@ __device__ __forceinline__ void tf_glm53_merge2_fast_task(const Candidate* packe
         }
         for (int i = 2 * k + t; i < 4096; i += NT) values[i] = { -CUDART_INF_F, 0x7fffffff };
         TF_TASK_SYNC();
-        tf_glm53_merge_bitonic_task(values, global, global_counts, local, counts, pos, rank, world, k);
+        tf_glm53_merge_bitonic_task(values, global, global_counts, local, counts, pos, rank, world, k, stride);
         return;
     }
     if (t == 0) tie_token = 0xffffffffu;
@@ -1339,29 +1339,29 @@ __device__ __forceinline__ void tf_glm53_merge2_fast_task(const Candidate* packe
         const int token = values[i].token;
         int lo = 0, hi = n_b;
         while (lo < hi) { const int mid = (lo + hi) >> 1; if (values[k + mid].token < token) lo = mid + 1; else hi = mid; }
-        global[static_cast<long long>(r) * k + i + lo] = token;
+        global[static_cast<long long>(r) * stride + i + lo] = token;
     }
     for (int j = t; j < n_b; j += NT) {
         const int token = values[k + j].token;
         int lo = 0, hi = n_a;
         while (lo < hi) { const int mid = (lo + hi) >> 1; if (values[mid].token < token) lo = mid + 1; else hi = mid; }
-        global[static_cast<long long>(r) * k + j + lo] = token;
+        global[static_cast<long long>(r) * stride + j + lo] = token;
     }
-    for (int i = t; i < k; i += NT) if (i >= n_a + n_b) global[static_cast<long long>(r) * k + i] = -1;
+    for (int i = t; i < k; i += NT) if (i >= n_a + n_b) global[static_cast<long long>(r) * stride + i] = -1;
     TF_TASK_SYNC();
     const int own_n = rank == 0 ? n_a : n_b;
     const int own_base = rank == 0 ? 0 : k;
     const int selected_count = pos[r] + 1 > 2048 ? own_n : 0;
-    for (int i = t; i < k; i += NT) local[static_cast<long long>(r) * k + i] = i < selected_count ? values[own_base + i].token / world : -1;
+    for (int i = t; i < k; i += NT) local[static_cast<long long>(r) * stride + i] = i < selected_count ? values[own_base + i].token / world : -1;
     if (t == 0 && counts) counts[r] = selected_count;
 }
 
 extern "C" __global__ void tf_glm53_merge2_fast(const Candidate* packed, int* global, int* global_counts,
                                             int* local, int* counts, const long long* pos,
-                                            int rank, int world, int rows, int k, int block_rows) {
+                                            int rank, int world, int rows, int k, int block_rows, int stride) {
     TF_VBLOCK_ENTER();
     extern __shared__ unsigned char storage[];
-    tf_glm53_merge2_fast_task(packed, global, global_counts, local, counts, pos, rank, world, rows, k, block_rows, storage);
+    tf_glm53_merge2_fast_task(packed, global, global_counts, local, counts, pos, rank, world, rows, k, block_rows, stride, storage);
 }
 
 }  // namespace glm53_topk

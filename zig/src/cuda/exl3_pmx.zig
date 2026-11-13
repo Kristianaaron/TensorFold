@@ -198,6 +198,11 @@ pub const Pmx = struct {
     gu_w8s: Function = undefined,
     /// gu_w8s with the k32 decode split into two pairs, interleaved with the MMA sweep. Same bits and smem.
     gu_w8s_pf: Function = undefined,
+    /// TF_GLM53_GU_M: gu_w8s with the stage copies and MMA addressing from compile-time counts.
+    /// Same bits, args, launch shape and smem.
+    gu_w8s_m: Function = undefined,
+    /// TF_GLM53_GU_M=1 (needs TF_GLM53_GU_W8S=2): gateUpW8s launches gu_w8s_m.
+    gu_w8s_m_on: bool = false,
     /// gu_w8s timing ablations indexed by gu_w8s_ko_masks: KO1, KO2, KO4, KO8, KO16, KO3, KO9,
     /// KO32 (NOLDSM), KO35, KO39, KO64 (NOBAR), KO103, KO119, KO128 (NOLOOPADDR).
     gu_w8s_ko: [gu_w8s_ko_masks.len]Function = undefined,
@@ -230,6 +235,8 @@ pub const Pmx = struct {
         try p.gu_w8s.allowDynamicShared(@as(u32, @intCast(gu_w8_smem)));
         p.gu_w8s_pf = try p.mod.function("tf_glm53_pmx_gu_w8s_pf_e4m3");
         try p.gu_w8s_pf.allowDynamicShared(@as(u32, @intCast(gu_w8_smem)));
+        p.gu_w8s_m = try p.mod.function("tf_glm53_pmx_gu_w8s_m_e4m3");
+        try p.gu_w8s_m.allowDynamicShared(@as(u32, @intCast(gu_w8_smem)));
         for (gu_w8s_ko_syms, 0..) |sym, i| {
             p.gu_w8s_ko[i] = try p.mod.function(sym);
             try p.gu_w8s_ko[i].allowDynamicShared(@as(u32, @intCast(gu_w8_smem)));
@@ -264,6 +271,11 @@ pub const Pmx = struct {
         try f.allowDynamicShared(gu_mb5_smem);
         p.gu[1] = f;
         p.gu_shared[1] = gu_mb5_smem;
+    }
+
+    /// TF_GLM53_GU_M=1: gateUpW8s launches the compile-time-count gu_w8s_m (same bits, args and smem).
+    pub fn useGuM(p: *Pmx) void {
+        p.gu_w8s_m_on = true;
     }
 
     pub fn unload(p: *Pmx) void {

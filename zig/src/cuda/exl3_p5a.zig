@@ -14,13 +14,17 @@ pub const P5a = struct {
     down: [2]module.Function,
     /// TF_GLM53_DN_EPI=1: the e4m3 down with paired FWHT chains and vector stores (same bytes).
     down_epi: module.Function,
+    /// TF_GLM53_P5_SW=1: down_epi with the X stage conflict-free at the cp.async writes and the ldmatrix reads
+    /// (32-half rows, 16-B chunk XOR), the lane's scale word and row entries hoisted (same bytes).
+    down_epi_sw: module.Function,
     pub fn load(d: *const driver.Driver) !P5a {
         if (!kernels.available or kernels.glm53_p5a.len == 0) return error.BuiltWithoutKernels;
-        var p: P5a = .{ .mod = try module.Module.load(d, kernels.glm53_p5a), .gu = undefined, .down = undefined, .down_epi = undefined };
+        var p: P5a = .{ .mod = try module.Module.load(d, kernels.glm53_p5a), .gu = undefined, .down = undefined, .down_epi = undefined, .down_epi_sw = undefined };
         errdefer p.mod.unload();
         p.gu = .{ try p.mod.function("tf_glm53_p5a_gu_mcg"), try p.mod.function("tf_glm53_p5a_gu_e4m3") };
         p.down = .{ try p.mod.function("tf_glm53_p5a_down_mcg"), try p.mod.function("tf_glm53_p5a_down_e4m3") };
         p.down_epi = try p.mod.function("tf_glm53_p5a_down_epi_e4m3");
+        p.down_epi_sw = try p.mod.function("tf_glm53_p5a_down_epi_sw_e4m3");
         return p;
     }
     pub fn unload(p: *P5a) void { p.mod.unload(); }

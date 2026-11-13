@@ -162,6 +162,9 @@ pub const Experts = struct {
     /// TF_GLM53_DN_EPI=1 (needs down_w8s): the down epilogue pairs two rows' FWHTs, loads the four fp16 scales as one
     /// 8-B word and stores each block as one 16-B vector. Same output bytes.
     down_epi: bool = false,
+    /// TF_GLM53_P5_SW=1 (needs down_epi and down_w8s): that epilogue on the 32-half X stage, whose 16-B chunk slot is
+    /// XORed by bits 1-2 of the row, so the cp.async writes and the ldmatrix reads are conflict-free. Same bytes.
+    p5_sw: bool = false,
     rot_in_w4s: Function = undefined,
     grouped: [4]Function, // one per codebook
     gateup: Function,

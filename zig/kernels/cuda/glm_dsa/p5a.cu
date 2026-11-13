@@ -28,6 +28,17 @@ static_assert(TT == 256 && TMT == 2 && TKT == 2 && TSTAGES == 3 && TPH == 32, "t
 static_assert(16 * TKT * 8 == TT, "one weight cp.async slot a thread");
 __host__ __device__ constexpr bool pipe_for(int nb8) { return nb8 > 0; }
 
+// TF_GLM53_P5_SW: an X stage row is TXS_SW = TBK halves (64 B), the 16-B chunk slot XORed by bits 1-2 of the row.
+// One CP.ASYNC.128 and one ldmatrix wavefront each cover a row span of 8 with all 8 bank groups of 16 B, and the
+// padding the old 40-half row needed for ldmatrix is gone. See the report's bank arithmetic.
+constexpr int TXS_SW = TBK;
+static_assert(TXS_SW == 32 && TXS_SW * (int)sizeof(half) == 64, "an X row is 64 B: two rows are one 128-B phase");
+template <bool SW> __host__ __device__ constexpr int xstride() { return SW ? TXS_SW : TXS; }
+template <bool SW> __host__ __device__ constexpr int xslot(int row, int chunk) { return SW ? (chunk ^ ((row >> 1) & 3)) : chunk; }
+template <bool SW> __device__ __forceinline__ int xoff(int row, int chunk) {
+    return row * xstride<SW>() + xslot<SW>(row, chunk) * 8;
+}
+
 template <int CB> __device__ __forceinline__ uint32_t decode2_nv(uint32_t s0, uint32_t s1) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     if constexpr (CB == CB_MCG_E4M3) {
@@ -63,7 +74,7 @@ template <int K2, int CB> __device__ __forceinline__ void decode_w(const uint32_
         default: a[0] = a[1] = a[2] = a[3] = 0;
     }
 }
-template <int K2, int NB8, int CB> __device__ __forceinline__ void pstage(const half* xs, const uint32_t* ws, int k2, int lane, float (&acc)[TMT][NB8][4]) {
+template <int K2, int NB8, int CB, bool SW> __device__ __forceinline__ void pstage(const half* xs, const uint32_t* ws, int k2, int lane, float (&acc)[TMT][NB8][4]) {
     constexpr int NB16 = (NB8 + 1) / 2; constexpr bool PIPE = pipe_for(NB8);
     const int row = (lane & 7) + ((lane >> 4) & 1) * 8, col = ((lane >> 3) & 1) * 8;
     uint32_t a[2][TMT][4];
@@ -71,14 +82,15 @@ template <int K2, int NB8, int CB> __device__ __forceinline__ void pstage(const 
     for (int i = 0; i < TMT; ++i) decode_w<K2, CB>(ws + (size_t)(i * TKT) * 32, k2, lane, a[0][i]);
 #pragma unroll
     for (int kk = 0; kk < TKT; ++kk) {
-        uint32_t b[2][4]; ldmatrix_x4(b[0], xs + (size_t)row * TXS + kk * 16 + col);
+        const int kc = kk * 2 + (col >> 3);
+        uint32_t b[2][4]; ldmatrix_x4(b[0], xs + (size_t)(xoff<SW>(row, kc)));
         if (PIPE && kk + 1 < TKT) {
 #pragma unroll
             for (int i = 0; i < TMT; ++i) decode_w<K2, CB>(ws + (size_t)(i * TKT + kk + 1) * 32, k2, lane, a[(kk + 1) & 1][i]);
         }
 #pragma unroll
         for (int jb = 0; jb < NB16; ++jb) {
-            if (jb + 1 < NB16) ldmatrix_x4(b[(jb + 1) & 1], xs + (size_t)((jb + 1) * 16 + row) * TXS + kk * 16 + col);
+            if (jb + 1 < NB16) ldmatrix_x4(b[(jb + 1) & 1], xs + (size_t)(xoff<SW>((jb + 1) * 16 + row, kc)));
             const uint32_t bl[2] = {b[jb & 1][0], b[jb & 1][1]}, bh[2] = {b[jb & 1][2], b[jb & 1][3]};
 #pragma unroll
             for (int i = 0; i < TMT; ++i) {
@@ -93,29 +105,46 @@ template <int K2, int NB8, int CB> __device__ __forceinline__ void pstage(const 
     }
 }
 
-template <int MATS, int XR, int NB8, int CB> __device__ __forceinline__ void pmain(const half* __restrict__ X0, const half* __restrict__ X1, const uint32_t* __restrict__ T0, const uint32_t* __restrict__ T1, const int* rows_sh, int K, int NTILES, int cb, int k2a, int k2b, half* stage, float (&acc)[TMT][NB8][4]) {
-    static_assert(XR == TPM || XR == 2 * TPM); constexpr int SH = tstage_halves<XR>(); constexpr int NB16 = (NB8 + 1) / 2;
+template <int MATS, int XR, int NB8, int CB, bool SW = false> __device__ __forceinline__ void pmain(const half* __restrict__ X0, const half* __restrict__ X1, const uint32_t* __restrict__ T0, const uint32_t* __restrict__ T1, const int* rows_sh, int K, int NTILES, int cb, int k2a, int k2b, half* stage, float (&acc)[TMT][NB8][4]) {
+    static_assert(XR == TPM || XR == 2 * TPM); constexpr int SH = SW ? XR * TXS_SW + 2 * TWORDS : tstage_halves<XR>(); constexpr int NB16 = (NB8 + 1) / 2;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, tid = threadIdx.x; int mat, nt_own;
     ttile<MATS>(warp * TMT, cb, mat, nt_own); const int k2w = mat ? k2b : k2a; const int chunks = K / TBK;
 #pragma unroll
     for (int i = 0; i < TMT; ++i) for (int j = 0; j < NB8; ++j) for (int c = 0; c < 4; ++c) acc[i][j][c] = 0.f;
     const int xi = tid >> 2, xj = tid & 3; const bool xload = xi < NB16 * 16; const int xr = rows_sh[xi]; const bool xvalid = xr >= 0;
-    const uint32_t xoff = (uint32_t)(xvalid ? xr : 0) * (uint32_t)K + (uint32_t)(xj * 8); const int xdst = xi * TXS + xj * 8;
+    const uint32_t xoff_g = (uint32_t)(xvalid ? xr : 0) * (uint32_t)K + (uint32_t)(xj * 8); const int xdst = xoff<SW>(xi, xj);
     const int wq = tid / (TKT * 8), wkk = (tid / 8) % TKT, wpart = tid % 8; int wm, wnt; ttile<MATS>(wq, cb, wm, wnt);
     const int wk2 = wm ? k2b : k2a; const bool wload = wpart < wk2;
     const uint32_t* wsrc = (wm ? T1 : T0) + ((size_t)wkk * NTILES + wnt) * (4 * wk2) + wpart * 4;
     const size_t wstep = (size_t)TKT * NTILES * (4 * wk2); const int wdst = (wq * TKT + wkk) * 32 + wpart * 4;
     auto load = [&](int chunk) { half* dst = stage + (size_t)(chunk % TSTAGES) * SH;
-        if (xload) { const size_t k0 = (size_t)chunk * TBK; cp_async16(dst + xdst, X0 + xoff + k0, xvalid); if constexpr (XR == 2 * TPM) cp_async16(dst + TPM * TXS + xdst, X1 + xoff + k0, xvalid); }
-        if (wload) cp_async16(reinterpret_cast<uint32_t*>(dst + (size_t)XR * TXS) + wdst, wsrc + (size_t)chunk * wstep, true);
+        if (xload) { const size_t k0 = (size_t)chunk * TBK; cp_async16(dst + xdst, X0 + xoff_g + k0, xvalid); if constexpr (XR == 2 * TPM) cp_async16(dst + (size_t)TPM * xstride<SW>() + xdst, X1 + xoff_g + k0, xvalid); }
+        if (wload) cp_async16(reinterpret_cast<uint32_t*>(dst + (size_t)XR * xstride<SW>()) + wdst, wsrc + (size_t)chunk * wstep, true);
     };
 #pragma unroll
     for (int c = 0; c < TSTAGES - 1; ++c) { if (c < chunks) load(c); cp_async_commit(); }
+    if constexpr (SW) {
+        auto body = [&](int c) {
+            half* base = stage + (size_t)(c % TSTAGES) * SH; const half* xs = base + (XR == TPM ? 0 : mat) * xstride<SW>();
+            const uint32_t* ws = reinterpret_cast<const uint32_t*>(base + (size_t)XR * xstride<SW>()) + warp * TMT * TKT * 32;
+            if (k2w == 4) pstage<4, NB8, CB, true>(xs, ws, 4, lane, acc); else if (k2w == 6) pstage<6, NB8, CB, true>(xs, ws, 6, lane, acc); else pstage<0, NB8, CB, true>(xs, ws, k2w, lane, acc);
+        };
+        // The prefetch guard moves out of the loop: the last TSTAGES - 1 chunks are a drain with the same waits,
+        // commits and step order, so no uniform branch sits between a barrier and the first decode.
+        const int split = chunks > TSTAGES - 1 ? chunks - (TSTAGES - 1) : 0;
+        for (int c = 0; c < split; ++c) {
+            cp_async_wait<TSTAGES - 2>(); TF_TASK_SYNC(); load(c + TSTAGES - 1); cp_async_commit(); body(c);
+        }
+        for (int c = split; c < chunks; ++c) {
+            cp_async_wait<TSTAGES - 2>(); TF_TASK_SYNC(); cp_async_commit(); body(c);
+        }
+    } else {
     for (int c = 0; c < chunks; ++c) {
         cp_async_wait<TSTAGES - 2>(); TF_TASK_SYNC(); if (c + TSTAGES - 1 < chunks) load(c + TSTAGES - 1); cp_async_commit();
-        half* base = stage + (size_t)(c % TSTAGES) * SH; const half* xs = base + (XR == TPM ? 0 : mat) * TPM * TXS;
+        half* base = stage + (size_t)(c % TSTAGES) * SH; const half* xs = base + (XR == TPM ? 0 : mat) * TXS;
         const uint32_t* ws = reinterpret_cast<const uint32_t*>(base + XR * TXS) + warp * TMT * TKT * 32;
-        if (k2w == 4) pstage<4, NB8, CB>(xs, ws, 4, lane, acc); else if (k2w == 6) pstage<6, NB8, CB>(xs, ws, 6, lane, acc); else pstage<0, NB8, CB>(xs, ws, k2w, lane, acc);
+        if (k2w == 4) pstage<4, NB8, CB, false>(xs, ws, 4, lane, acc); else if (k2w == 6) pstage<6, NB8, CB, false>(xs, ws, 6, lane, acc); else pstage<0, NB8, CB, false>(xs, ws, k2w, lane, acc);
+    }
     }
     cp_async_wait<0>(); TF_TASK_SYNC();
 }
@@ -147,7 +176,7 @@ template <int NB8, int CB> __device__ __forceinline__ void gu_body(const half* X
     float* Eg = reinterpret_cast<float*>(smem_raw); int mat, nt; ttile<2>(warp * TMT, cb, mat, nt); const int col0 = (nt - cb * 8) * 16, n = cb * 128 + 4 * lane;
     gu_half<0, NB8>(acc, Eg, mat, col0, cnt, e, n, rows_sh, svh_g, svh_u, suh_d, xd, N, limit, act_mode); if (TPH < cnt) gu_half<1, NB8>(acc, Eg, mat, col0, cnt, e, n, rows_sh, svh_g, svh_u, suh_d, xd, N, limit, act_mode);
 }
-template <int HF, int NB8, int EPI> __device__ __forceinline__ void down_half(const float (&acc)[TMT][NB8][4], float* Ed, int cb, int cnt, int e, const int* rows_sh, const half* svh_d, float* y, int D) {
+template <int HF, int NB8, int EPI, bool SW = false> __device__ __forceinline__ void down_half(const float (&acc)[TMT][NB8][4], float* Ed, int cb, int cnt, int e, const int* rows_sh, const half* svh_d, float* y, int D) {
     static_assert(EPI == 0 || EPI == 1, "down epilogue variant");
     if constexpr (EPI == 0) {
     if (HF) TF_TASK_SYNC(); const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31; pspill<NB8, HF>(Ed, DN_ES, warp * TMT * 16, acc); TF_TASK_SYNC();
@@ -160,6 +189,52 @@ template <int HF, int NB8, int EPI> __device__ __forceinline__ void down_half(co
             for (int j = 0; j < 4; ++j) o[j] = v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]);
         }
     }
+    } else if constexpr (SW) {
+        // TF_GLM53_P5_SW: the scale word this lane stores and the two rows it reads are the same for every row of the
+        // CTA, so both come from registers: one 8-B scale load and four row-table reads a CTA, not a step.
+        static_assert(DN_ES % 4 == 0 && (DN_ES * (int)sizeof(float)) % 16 == 0, "epilogue rows are 16-byte aligned");
+        if ((D & 3) != 0) __trap();
+        if ((reinterpret_cast<uintptr_t>(svh_d) & 7u) != 0) __trap();
+        if ((reinterpret_cast<uintptr_t>(y) & 15u) != 0) __trap();
+        if (HF) TF_TASK_SYNC();
+        const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+        pspill<NB8, HF>(Ed, DN_ES, warp * TMT * 16, acc);
+        TF_TASK_SYNC();
+        uint2 sq[2];
+        {
+            const int n = cb * 256 + 4 * lane;
+#pragma unroll
+            for (int blk = 0; blk < 2; ++blk) sq[blk] = *reinterpret_cast<const uint2*>(svh_d + (size_t)e * D + n + blk * 128);
+        }
+        int p0[2], p1[2];
+#pragma unroll
+        for (int it = 0; it < 2; ++it) {
+            const int i = warp + it * 2 * TNW;
+            p0[it] = rows_sh[HF * TPH + i];
+            p1[it] = i + TNW < TPH && HF * TPH + i + TNW < cnt ? rows_sh[HF * TPH + i + TNW] : -1;
+        }
+#pragma unroll
+        for (int it = 0; it < 2; ++it) {
+            const int i = warp + it * 2 * TNW;
+            if (i >= TPH || HF * TPH + i >= cnt) break;
+            const bool has1 = i + TNW < TPH && HF * TPH + i + TNW < cnt;
+            const int r0 = p0[it], r1 = p1[it];
+#pragma unroll
+            for (int blk = 0; blk < 2; ++blk) {
+                float v0[4], v1[4];
+                *reinterpret_cast<float4*>(v0) = *reinterpret_cast<const float4*>(Ed + (size_t)i * DN_ES + blk * 128 + 4 * lane);
+                if (has1) *reinterpret_cast<float4*>(v1) = *reinterpret_cast<const float4*>(Ed + (size_t)(i + TNW) * DN_ES + blk * 128 + 4 * lane);
+                else { v1[0] = 0.0f; v1[1] = 0.0f; v1[2] = 0.0f; v1[3] = 0.0f; }
+                fwht128x2(v0, v1, lane);
+                const int n = cb * 256 + blk * 128 + 4 * lane;
+                const float2 t0 = __half22float2(*reinterpret_cast<const __half2*>(&sq[blk].x));
+                const float2 t1 = __half22float2(*reinterpret_cast<const __half2*>(&sq[blk].y));
+                if (r0 >= 0) *reinterpret_cast<float4*>(y + (size_t)r0 * D + n) =
+                    make_float4(v0[0] * HAD_SCALE * t0.x, v0[1] * HAD_SCALE * t0.y, v0[2] * HAD_SCALE * t1.x, v0[3] * HAD_SCALE * t1.y);
+                if (r1 >= 0) *reinterpret_cast<float4*>(y + (size_t)r1 * D + n) =
+                    make_float4(v1[0] * HAD_SCALE * t0.x, v1[1] * HAD_SCALE * t0.y, v1[2] * HAD_SCALE * t1.x, v1[3] * HAD_SCALE * t1.y);
+            }
+        }
     } else {
         // Two rows at a time and the same barriers as EPI=0: SMEM is 43,008 B, and two 32-row
         // 260-float tiles need 66,560 B, so this path keeps one tile and both barriers.
@@ -195,10 +270,10 @@ template <int HF, int NB8, int EPI> __device__ __forceinline__ void down_half(co
         }
     }
 }
-template <int NB8, int CB, int KO = 0, int EPI = 0> __device__ __forceinline__ void down_body(const half* Xd, const uint64_t* Td, int cnt, int e, const half* svh_d, float* y, int K, int D, int k2, unsigned char* smem_raw, const int* rows_sh) {
+template <int NB8, int CB, int KO = 0, int EPI = 0, bool SW = false> __device__ __forceinline__ void down_body(const half* Xd, const uint64_t* Td, int cnt, int e, const half* svh_d, float* y, int K, int D, int k2, unsigned char* smem_raw, const int* rows_sh) {
     const int cb = TF_VBID.x, warp = threadIdx.x >> 5; float acc[TMT][NB8][4];
     const uint32_t* T = reinterpret_cast<const uint32_t*>(Td[e]);
-    pmain<1, TPM, NB8, CB>(Xd, Xd, T, T, rows_sh, K, D >> 4, cb, k2, k2, reinterpret_cast<half*>(smem_raw), acc);
+    pmain<1, TPM, NB8, CB, SW>(Xd, Xd, T, T, rows_sh, K, D >> 4, cb, k2, k2, reinterpret_cast<half*>(smem_raw), acc);
     // KO16 NOEPI: fold every accumulator word so the GEMM stays live, then skip the spill and the
     // fp16/fp32 stores. Timing only; output is wrong by design.
     if constexpr ((KO & 16) != 0) {
@@ -213,7 +288,7 @@ template <int NB8, int CB, int KO = 0, int EPI = 0> __device__ __forceinline__ v
         return;
     }
     float* Ed = reinterpret_cast<float*>(smem_raw);
-    down_half<0, NB8, EPI>(acc, Ed, cb, cnt, e, rows_sh, svh_d, y, D); if (TPH < cnt) down_half<1, NB8, EPI>(acc, Ed, cb, cnt, e, rows_sh, svh_d, y, D);
+    down_half<0, NB8, EPI, SW>(acc, Ed, cb, cnt, e, rows_sh, svh_d, y, D); if (TPH < cnt) down_half<1, NB8, EPI, SW>(acc, Ed, cb, cnt, e, rows_sh, svh_d, y, D);
 }
 template <int CB> __device__ __forceinline__ void gu_entry(const half* __restrict__ Xg, const half* __restrict__ Xu, const uint64_t* __restrict__ Tg, const uint64_t* __restrict__ Tu,
         const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d,
@@ -231,14 +306,14 @@ template <int CB> __device__ __forceinline__ void gu_entry(const half* __restric
         default: break;
     }
 }
-template <int CB, int KO = 0, int EPI = 0> __device__ __forceinline__ void down_entry(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
+template <int CB, int KO = 0, int EPI = 0, bool SW = false> __device__ __forceinline__ void down_entry(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
         const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
         float* __restrict__ y, int K, int D, int ys, const int* __restrict__ k2d) {
     (void)ys; __shared__ __align__(16) unsigned char smem_raw[SMEM]; __shared__ int rows_sh[TPM];
     const int item = TF_VBID.y; if (item >= counts[0]) return; const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2]; if (cnt > SMALL_MAX) return;
     if (threadIdx.x < TPM) rows_sh[threadIdx.x] = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1; TF_TASK_SYNC(); const int k2 = k2d[e];
     switch ((cnt + 7) >> 3) {
-#define P5A_DN_CASE(NB) case NB: down_body<NB, CB, KO, EPI>(Xd, Td, cnt, e, svh_d, y, K, D, k2, smem_raw, rows_sh); break
+#define P5A_DN_CASE(NB) case NB: down_body<NB, CB, KO, EPI, SW>(Xd, Td, cnt, e, svh_d, y, K, D, k2, smem_raw, rows_sh); break
         P5A_DN_CASE(1); P5A_DN_CASE(2); P5A_DN_CASE(3); P5A_DN_CASE(4); P5A_DN_CASE(5); P5A_DN_CASE(6); P5A_DN_CASE(7); P5A_DN_CASE(8);
 #undef P5A_DN_CASE
         default: break;
@@ -271,4 +346,11 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_glm53_p5a_down_e4m3_noep
 extern "C" __global__ void __launch_bounds__(256, 2) tf_glm53_p5a_down_epi_e4m3(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
         const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d, float* __restrict__ y, int K, int D, int ys, const int* __restrict__ k2d) {
     TF_VBLOCK_ENTER(); tf_glm53_p5a::down_entry<tf_exl3::CB_MCG_E4M3, 0, 1>(Xd, Td, items, counts, members, svh_d, y, K, D, ys, k2d);
+}
+// TF_GLM53_P5_SW=1: same values as tf_glm53_p5a_down_epi_e4m3. The X stage rows are 32 halves with their 16-B chunk
+// slot XORed by bits 1-2 of the row, so one cp.async phase (two rows x four chunks) and one ldmatrix wavefront (eight
+// rows at one chunk) each hit all eight 16-B bank groups; the lane's scale word and row-table entries load once a CTA.
+extern "C" __global__ void __launch_bounds__(256, 2) tf_glm53_p5a_down_epi_sw_e4m3(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
+        const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d, float* __restrict__ y, int K, int D, int ys, const int* __restrict__ k2d) {
+    TF_VBLOCK_ENTER(); tf_glm53_p5a::down_entry<tf_exl3::CB_MCG_E4M3, 0, 1, true>(Xd, Td, items, counts, members, svh_d, y, K, D, ys, k2d);
 }

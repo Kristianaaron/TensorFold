@@ -357,6 +357,8 @@ pub const Geometry = struct {
     /// Index MMA query rows grouped into one CTA (4, 8, or 16), captured once at setup.
     index_mma_rows: usize = 4,
     index_qs: u8 = 0,
+    /// TF_GLM53_PREFILL_TOPK: sparse prefill rows select this many keys; decode keeps index.top_k.
+    prefill_top_k: usize = index.top_k,
     /// Routed-expert rows per WP4 grouped call (EXL3 scratch scales with it).
     expert_rows: usize = 128,
     /// Borrowed KV tails temporarily host larger prompt expert batches; zero disables it.

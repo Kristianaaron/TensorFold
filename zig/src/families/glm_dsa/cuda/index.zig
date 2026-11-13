@@ -13,6 +13,25 @@ pub const dim = 128;
 pub const rope_dim = 64;
 pub const top_k = 2048;
 pub const dense_limit = 2048;
+
+/// TF_GLM53_PREFILL_TOPK: the sparse prefill indexer selects this many keys a row (decode keeps top_k). Unset keeps
+/// 2048; only the measured sweep values are accepted.
+pub fn parsePrefillTopk(raw: ?[]const u8) !usize {
+    const value = raw orelse return top_k;
+    const k = std.fmt.parseInt(usize, value, 10) catch return error.BadPrefillTopk;
+    if (!prefillTopkAllowed(k)) return error.BadPrefillTopk;
+    return k;
+}
+
+fn prefillTopkAllowed(k: usize) bool {
+    return k == 1024 or k == 1536 or k == 1792;
+}
+
+/// Unset (top_k) or one of the three sweep values; a host-built Forward may only carry these.
+pub fn validPrefillTopk(k: usize) bool {
+    return k == top_k or prefillTopkAllowed(k);
+}
+
 pub const max_local_keys = contract.max_local_keys;
 pub const max_global_keys = 262144;
 pub const score_tile = 256;
@@ -582,7 +601,8 @@ pub const Index = struct {
         try cuda.launch.launch(k.score, .{ .grid = .{ .x = @intCast((nkeys + 15) / 16), .y = @intCast(rows), .z = 1 }, .block = .{ .x = score_tile }, .shared = score_smem }, stream, &a);
     }
 
-    /// Local exact radix top-k; local cache slots are emitted as global positions (`slot * world + rank`).
+    /// Local exact radix top-k; local cache slots are emitted as global positions (`slot * world + rank`). `topk_count`
+    /// is the selection count; token rows keep their `top_k` stride so decode and prefill share one list layout.
     pub fn topk(k: *const Index, stream: cuda.Stream, scores_ptr: u64, score_stride: usize, tokens: u64, counts: u64, candidate_records: u64, positions: u64, rows: usize, nkeys: usize, topk_count: usize, rank: usize, world: usize) !void {
         if (rows == 0) return;
         if (world == 0 or rank >= world or nkeys > max_local_keys or topk_count == 0 or topk_count > top_k or score_stride < nkeys) return error.KeyCapacity;
@@ -590,7 +610,7 @@ pub const Index = struct {
         const fit = k.topk_fit and topkFitPlan(nkeys) != null;
         const ept: usize = if (fit) topkEpt(nkeys, p.grid_x) else contract.topk_entries_per_thread;
         const shared: u32 = @intCast(try topkSmem(ept));
-        const job: Job = .{ .scores = scores_ptr, .score_stride = @intCast(score_stride), .positions = 0, .position_stride = 0, .tokens = tokens, .token_stride = @intCast(topk_count), .counts = counts, .candidate_records = candidate_records, .nkeys = @intCast(nkeys), .k = @intCast(topk_count), .mode = 0, .entries_per_thread = @intCast(ept) };
+        const job: Job = .{ .scores = scores_ptr, .score_stride = @intCast(score_stride), .positions = 0, .position_stride = 0, .tokens = tokens, .token_stride = @intCast(top_k), .counts = counts, .candidate_records = candidate_records, .nkeys = @intCast(nkeys), .k = @intCast(topk_count), .mode = 0, .entries_per_thread = @intCast(ept) };
         const args: TopkArgs = .{ .jobs = .{ job, job }, .positions = positions, .ratio = @intCast(world), .block_size = 1, .owner = @intCast(rank) };
         var a: cuda.Args = .{};
         a.add(args);
@@ -613,6 +633,7 @@ pub const Index = struct {
         a.add(@as(i32, @intCast(world)));
         a.add(@as(i32, @intCast(rows)));
         a.add(@as(i32, @intCast(topk_count)));
+        a.add(@as(i32, top_k));
         try cuda.launch.launch(k.merge_fn, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = 512 }, .shared = 4096 * @sizeOf(Pick) }, stream, &a);
     }
 
@@ -632,6 +653,7 @@ pub const Index = struct {
         a.add(@as(i32, @intCast(rows)));
         a.add(@as(i32, @intCast(topk_count)));
         a.add(@as(i32, @intCast(block_rows)));
+        a.add(@as(i32, top_k));
         const m2_fn = if (k.merge2_fast) k.merge2_fast_fn else k.merge2_fn;
         try cuda.launch.launch(m2_fn, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = 512 }, .shared = 4096 * @sizeOf(Pick) }, stream, &a);
     }
@@ -886,6 +908,19 @@ test "K5 launch plans include the full DCP2 verify shard and smem budget" {
     try std.testing.expectEqual(@as(usize, 262143), try slotToGlobal(131071, 1, 2));
     try std.testing.expectEqual(@as(usize, 262142), try slotToGlobal(131071, 0, 2));
     try std.testing.expectError(error.DcpShape, slotToGlobal(0, 2, 2));
+}
+
+test "prefill top-k switch accepts the three sweep values and defaults to 2048" {
+    try std.testing.expectEqual(@as(usize, top_k), try parsePrefillTopk(null));
+    inline for (.{ "1024", "1536", "1792" }) |raw| {
+        try std.testing.expectEqual(@as(usize, try std.fmt.parseInt(usize, raw, 10)), try parsePrefillTopk(raw));
+    }
+    try std.testing.expectError(error.BadPrefillTopk, parsePrefillTopk("2048"));
+    try std.testing.expectError(error.BadPrefillTopk, parsePrefillTopk("1793"));
+    try std.testing.expectError(error.BadPrefillTopk, parsePrefillTopk("abc"));
+    try std.testing.expect(validPrefillTopk(top_k));
+    try std.testing.expect(validPrefillTopk(1024));
+    try std.testing.expect(!validPrefillTopk(1100));
 }
 
 test "top-k fit sizes the entry tile only when one CTA owns the row" {

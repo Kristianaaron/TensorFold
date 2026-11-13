@@ -196,7 +196,7 @@ pub const Kernels = struct {
             try k.gateUpP5a(pmx, small, s, l, rows, sc, p);
         }
         if (e.w8s and e.down_w8s and l.codebook == .mcg_e4m3) {
-            try k.downW8s(pmx, small, s, l, picks, rows, sc, p, e.down_epi);
+            try k.downW8s(pmx, small, s, l, picks, rows, sc, p, e.down_epi, e.p5_sw);
         } else {
             try k.downP5a(small, s, l, rows, sc, p, e.down_epi);
         }
@@ -205,12 +205,12 @@ pub const Kernels = struct {
     /// TF_GLM53_DOWN_W8S: p5a down for items <= 64 members (fp16 xd, =10's bits), then xd_w8s writes every local pair's
     /// e4m3 codes and fp32 scale into its sc.xg slot (free once gate/up is done: 2 * dims bytes a pair, codes at bytes
     /// 0..width, scale at byte width) and down_w8s runs the items > 64 members, 256 model columns a CTA.
-    pub fn downW8s(k: Kernels, pmx: *const pmx_mod.Pmx, small: *const p5a_mod.P5a, s: Stream, l: ex.Layer, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan, dn_epi: bool) !void {
+    pub fn downW8s(k: Kernels, pmx: *const pmx_mod.Pmx, small: *const p5a_mod.P5a, s: Stream, l: ex.Layer, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan, dn_epi: bool, p5_sw: bool) !void {
         _ = k;
         if (l.width % 128 != 0 or l.width > 4096 or l.dims % 256 != 0 or l.width + 4 > 2 * l.dims) return error.Exl3Shape;
         const pairs = rows * sc.slots;
         const items = grouped.maxItems(pairs, l.experts, wide_tile);
-        const small_down = if (dn_epi) small.down_epi else small.down[1];
+        const small_down = if (p5_sw) small.down_epi_sw else if (dn_epi) small.down_epi else small.down[1];
         try go(small_down, s, .{ l.dims / 256, items, 1 }, p5a_mod.threads, downArgs(l, sc, p));
         var q: launch.Args = .{};
         inline for (.{ sc.xd, picks, sc.xg, i(l.width), i(2 * l.dims) }) |v| q.add(v);
@@ -255,7 +255,9 @@ pub const Kernels = struct {
         if (!all) try go(small.gu[1], s, .{ l.width / 128, items, 1 }, p5a_mod.threads, guArgs(l, sc, p));
         var args: launch.Args = .{};
         args.add(pmx_mod.PmxA8Args{ .x0 = sc.xg, .x1 = sc.xu, .s0 = sc.xg + l.dims, .s1 = sc.xu + l.dims, .tp0 = l.gate, .tp1 = l.up, .k2_0 = l.gate_k2, .k2_1 = l.up_k2, .items = p.items, .counts = p.counts, .members = p.members, .sv0 = l.svh_g, .sv1 = l.svh_u, .sd = l.suh_d, .xd = sc.xd, .y = sc.y, .K = i(l.dims), .N = i(l.width), .E = i(l.experts), .limit = l.limit, .act_mode = l.act_mode, .xs = i(2 * l.dims), .all = @intFromBool(all) });
-        try launch.launch(pmx.gu_w8s, .{ .grid = .{ .x = @intCast(l.width / 128), .y = @intCast(items), .z = 1 }, .block = .{ .x = 512 }, .shared = @intCast(pmx_mod.gu_w8_smem) }, s, &args);
+        // TF_GLM53_GU_M=1: same args and smem, the compile-time-count body (same bits).
+        const gu_fn = if (pmx.gu_w8s_m_on) pmx.gu_w8s_m else pmx.gu_w8s;
+        try launch.launch(gu_fn, .{ .grid = .{ .x = @intCast(l.width / 128), .y = @intCast(items), .z = 1 }, .block = .{ .x = 512 }, .shared = @intCast(pmx_mod.gu_w8_smem) }, s, &args);
     }
 
     /// Phase 1 of both paths: shape checks, the plan at `route_tile`, the rotated gate/up inputs.

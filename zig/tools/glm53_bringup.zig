@@ -659,6 +659,9 @@ const Setup = struct {
         const smla_fp8 = forward.smlaFp8Switch();
         const smla_p3 = forward.smlaP3Switch();
         const smla_k8 = try forward.smlaK8Switch();
+        const prefill_topk_raw = std.c.getenv("TF_GLM53_PREFILL_TOPK");
+        const prefill_top_k = try forward.index.parsePrefillTopk(if (prefill_topk_raw) |v| std.mem.span(v) else null);
+        if (prefill_top_k != forward.index.top_k) std.log.info("TF_GLM53_PREFILL_TOPK={d}: sparse prefill rows select {d} keys per row; decode keeps {d} (changes bits)", .{ prefill_top_k, prefill_top_k, forward.index.top_k });
         const moe_pipe = forward.moePipeSwitch();
         const moe_ring = try forward.moeRingSwitch();
         if (!moe_pipe and moe_ring != 2) return error.MoeRingWithoutMoePipe;
@@ -721,7 +724,7 @@ const Setup = struct {
             std.log.err("expert_rows {d} exceeds chunk_rows {d}; set TF_GLM53_CHUNK_ROWS >= expert_rows on both ranks", .{ o.expert_rows, o.chunk_rows });
             return error.ExpertRowsExceedChunkRows;
         }
-        s.geometry = .{ .layers = n, .full_index_layers = full, .vocab_local = c.vocab / 2, .candidate_k = o.head_k orelse 64, .cand_fast = cand_fast, .prefetch = o.prefetch, .tbo = tbo_enabled, .piece_pipe = piece_pipe, .moe_pipe = moe_pipe, .moe_ring = moe_ring, .ws_trim = ws_trim, .moe_post = moe_post, .moe_ep = moe_ep, .comm_prio = comm_prio, .index_merge = index_merge, .index_pipe = index_pipe, .prompt_mla = prompt_mla, .smla_p = smla_p, .smla_fp8 = smla_fp8, .smla_p3 = smla_p3, .smla_k8 = smla_k8, .shard_qkv_a = forward.shardQkvASwitch(), .prefill_bf16 = try state.prefillGemmFromEnv() == .bf16, .scratch_overlay = scratch_overlay, .decode_side = forward.decodeSideSwitch(), .decode_mla = decode_mla_mode != .off, .decode_mla_v2 = decode_mla_mode == .v2 or decode_mla_mode == .v3, .decode_mla_v3 = decode_mla_mode == .v3, .prompt_experts = pe_flags.on, .prompt_experts_wide = pe_flags.wide, .prompt_experts_pmx = pe_flags.pmx, .expert_rows = o.expert_rows, .chunk_rows = o.chunk_rows, .piece_rows = o.piece_rows, .index_mma_rows = o.index_mma_rows, .index_qs = o.index_qs, .qmmf_var = o.qmmf_var, .gather_ovl = o.gather_ovl, .gather_sum = o.gather_sum, .rms_reg = o.rms_reg, .expert_rows_adapt = adapt_rows, .expert_rows_adapt_maxpos = adapt_maxpos, .prompt_experts_p5a = pe_flags.p5a, .l2pf = l2pf_options.on };
+        s.geometry = .{ .layers = n, .full_index_layers = full, .vocab_local = c.vocab / 2, .candidate_k = o.head_k orelse 64, .cand_fast = cand_fast, .prefetch = o.prefetch, .tbo = tbo_enabled, .piece_pipe = piece_pipe, .moe_pipe = moe_pipe, .moe_ring = moe_ring, .ws_trim = ws_trim, .moe_post = moe_post, .moe_ep = moe_ep, .comm_prio = comm_prio, .index_merge = index_merge, .index_pipe = index_pipe, .prompt_mla = prompt_mla, .smla_p = smla_p, .smla_fp8 = smla_fp8, .smla_p3 = smla_p3, .smla_k8 = smla_k8, .shard_qkv_a = forward.shardQkvASwitch(), .prefill_bf16 = try state.prefillGemmFromEnv() == .bf16, .scratch_overlay = scratch_overlay, .decode_side = forward.decodeSideSwitch(), .decode_mla = decode_mla_mode != .off, .decode_mla_v2 = decode_mla_mode == .v2 or decode_mla_mode == .v3, .decode_mla_v3 = decode_mla_mode == .v3, .prompt_experts = pe_flags.on, .prompt_experts_wide = pe_flags.wide, .prompt_experts_pmx = pe_flags.pmx, .expert_rows = o.expert_rows, .chunk_rows = o.chunk_rows, .piece_rows = o.piece_rows, .index_mma_rows = o.index_mma_rows, .index_qs = o.index_qs, .prefill_top_k = prefill_top_k, .qmmf_var = o.qmmf_var, .gather_ovl = o.gather_ovl, .gather_sum = o.gather_sum, .rms_reg = o.rms_reg, .expert_rows_adapt = adapt_rows, .expert_rows_adapt_maxpos = adapt_maxpos, .prompt_experts_p5a = pe_flags.p5a, .l2pf = l2pf_options.on };
         s.l2pf_options = l2pf_options;
         s.geometry.qa_shard = forward.qaShardSwitch();
         if (s.geometry.qa_shard and s.geometry.shard_qkv_a) return error.QaShardWithShardQkvA;
@@ -1075,6 +1078,14 @@ const Gpu = struct {
                 std.log.info("TF_GLM53_GU_W8S=1: prompt routed gate/up of large items on e4m3 activations (changes output bits)", .{});
             } else if (!std.mem.eql(u8, w8s_setting, "0")) return error.BadGuW8s;
         }
+        if (std.c.getenv("TF_GLM53_GU_M")) |gm_value| {
+            const gm_setting = std.mem.span(gm_value);
+            if (std.mem.eql(u8, gm_setting, "1")) {
+                if (!g.ex.w8s_all) return error.GuMNeedsGuW8s;
+                if (g.ex.pmx) |*px| px.useGuM() else return error.GuMNeedsPmx;
+                std.log.info("TF_GLM53_GU_M=1: prompt routed gate/up through the compile-time-count gu_w8s_m (same output bits)", .{});
+            } else if (!std.mem.eql(u8, gm_setting, "0")) return error.BadGuM;
+        }
         if (std.c.getenv("TF_GLM53_ROT_DD")) |rd_value| {
             const rd_setting = std.mem.span(rd_value);
             if (std.mem.eql(u8, rd_setting, "1")) {
@@ -1098,6 +1109,14 @@ const Gpu = struct {
                 g.ex.down_epi = true;
                 std.log.info("TF_GLM53_DN_EPI=1: prompt routed down epilogue with paired FWHTs, 8-byte scale loads and 16-byte stores (same bits)", .{});
             } else if (!std.mem.eql(u8, de_setting, "0")) return error.BadDnEpi;
+        }
+        if (std.c.getenv("TF_GLM53_P5_SW")) |sw_value| {
+            const sw_setting = std.mem.span(sw_value);
+            if (std.mem.eql(u8, sw_setting, "1")) {
+                if (!g.ex.down_epi or !g.ex.down_w8s) return error.P5SwNeedsDnEpi;
+                g.ex.p5_sw = true;
+                std.log.info("TF_GLM53_P5_SW=1: prompt routed down on the conflict-free 32-half X stage, scales and rows hoisted (same bits)", .{});
+            } else if (!std.mem.eql(u8, sw_setting, "0")) return error.BadP5Sw;
         }
         g.mods[0] = try cuda.Module.load(g.d, cuda.kernels.glm_glue);
         g.module_count = 1;
@@ -1238,7 +1257,7 @@ const Gpu = struct {
     }
 
     fn forwardFor(g: *Gpu, o: Opts) forward.Forward {
-        return .{ .gpa = g.gpa, .k = &g.k, .w = &g.w, .st = &g.st, .stream = g.stream, .decode_mla16 = g.setup.decode_mla16, .coll = forward.Collective.group(&g.group), .prompt_experts_p5a = g.setup.geometry.prompt_experts_p5a, .pre_fuse = g.setup.geometry.pre_fuse, .prep_fuse = g.setup.geometry.prep_fuse, .ws_trim = g.setup.geometry.ws_trim, .moe_post = g.setup.geometry.moe_post, .moe_ep = g.setup.geometry.moe_ep, .comm_prio = g.setup.geometry.comm_prio, .pipe_coll = if (g.pipe) |*p| p.collective() else null, .rank = o.rank, .chunk_rows = g.setup.geometry.chunk_rows, .index_mma_rows = g.setup.geometry.index_mma_rows, .index_qs = g.setup.geometry.index_qs, .prompt_mla = g.setup.geometry.prompt_mla, .smla_p = g.setup.geometry.smla_p, .smla_fp8 = g.setup.geometry.smla_fp8, .smla_p3 = g.setup.geometry.smla_p3, .smla_k8 = g.setup.geometry.smla_k8, .decode_union = g.setup.decode_union, .route_compact = g.setup.geometry.route_compact, .own_attend = g.setup.geometry.own_attend, .q_one_gather = g.setup.geometry.q_one_gather, .partial_roce = g.setup.geometry.partial_roce, .decode_union_rows = g.setup.decode_union_rows, .shard_qkv_a = g.setup.geometry.shard_qkv_a, .qa_shard = g.setup.geometry.qa_shard, .prefill_w8a8 = g.setup.geometry.prefill_w8a8, .prefill_w8a8_all = g.setup.geometry.prefill_w8a8_all, .iq_fold = g.setup.geometry.iq_fold, .qmmf_var = g.setup.geometry.qmmf_var != 0, .gather_ovl = g.setup.geometry.gather_ovl, .gather_sum = g.setup.geometry.gather_sum, .rms_reg = g.setup.geometry.rms_reg, .decode_side = g.setup.geometry.decode_side, .prompt_experts = g.setup.geometry.prompt_experts, .prompt_experts_wide = g.setup.geometry.prompt_experts_wide, .prompt_experts_pmx = g.setup.geometry.prompt_experts_pmx, .prefetch = if (g.setup.geometry.prefetch) &g.pf else null, .l2pf = if (g.l2pf) |*pf| pf else null, .prefetch_enabled = g.setup.geometry.prefetch, .tbo_enabled = g.setup.geometry.tbo, .piece_pipe = g.setup.geometry.piece_pipe, .moe_pipe = g.setup.geometry.moe_pipe, .index_merge = g.setup.geometry.index_merge, .index_pipe = g.setup.geometry.index_pipe, .add_norm_fuse = g.setup.geometry.add_norm_fuse, .qpe_absorb_fuse = g.setup.geometry.qpe_absorb_fuse, .prefill_gemms = if (g.prefill_gemms) |*gemms| gemms else null };
+        return .{ .gpa = g.gpa, .k = &g.k, .w = &g.w, .st = &g.st, .stream = g.stream, .decode_mla16 = g.setup.decode_mla16, .coll = forward.Collective.group(&g.group), .prompt_experts_p5a = g.setup.geometry.prompt_experts_p5a, .pre_fuse = g.setup.geometry.pre_fuse, .prep_fuse = g.setup.geometry.prep_fuse, .ws_trim = g.setup.geometry.ws_trim, .moe_post = g.setup.geometry.moe_post, .moe_ep = g.setup.geometry.moe_ep, .comm_prio = g.setup.geometry.comm_prio, .pipe_coll = if (g.pipe) |*p| p.collective() else null, .rank = o.rank, .chunk_rows = g.setup.geometry.chunk_rows, .index_mma_rows = g.setup.geometry.index_mma_rows, .index_qs = g.setup.geometry.index_qs, .prefill_top_k = g.setup.geometry.prefill_top_k, .prompt_mla = g.setup.geometry.prompt_mla, .smla_p = g.setup.geometry.smla_p, .smla_fp8 = g.setup.geometry.smla_fp8, .smla_p3 = g.setup.geometry.smla_p3, .smla_k8 = g.setup.geometry.smla_k8, .decode_union = g.setup.decode_union, .route_compact = g.setup.geometry.route_compact, .own_attend = g.setup.geometry.own_attend, .q_one_gather = g.setup.geometry.q_one_gather, .partial_roce = g.setup.geometry.partial_roce, .decode_union_rows = g.setup.decode_union_rows, .shard_qkv_a = g.setup.geometry.shard_qkv_a, .qa_shard = g.setup.geometry.qa_shard, .prefill_w8a8 = g.setup.geometry.prefill_w8a8, .prefill_w8a8_all = g.setup.geometry.prefill_w8a8_all, .iq_fold = g.setup.geometry.iq_fold, .qmmf_var = g.setup.geometry.qmmf_var != 0, .gather_ovl = g.setup.geometry.gather_ovl, .gather_sum = g.setup.geometry.gather_sum, .rms_reg = g.setup.geometry.rms_reg, .decode_side = g.setup.geometry.decode_side, .prompt_experts = g.setup.geometry.prompt_experts, .prompt_experts_wide = g.setup.geometry.prompt_experts_wide, .prompt_experts_pmx = g.setup.geometry.prompt_experts_pmx, .prefetch = if (g.setup.geometry.prefetch) &g.pf else null, .l2pf = if (g.l2pf) |*pf| pf else null, .prefetch_enabled = g.setup.geometry.prefetch, .tbo_enabled = g.setup.geometry.tbo, .piece_pipe = g.setup.geometry.piece_pipe, .moe_pipe = g.setup.geometry.moe_pipe, .index_merge = g.setup.geometry.index_merge, .index_pipe = g.setup.geometry.index_pipe, .add_norm_fuse = g.setup.geometry.add_norm_fuse, .qpe_absorb_fuse = g.setup.geometry.qpe_absorb_fuse, .prefill_gemms = if (g.prefill_gemms) |*gemms| gemms else null };
     }
 
     fn downloadFor(g: *const Gpu) engine.Download {

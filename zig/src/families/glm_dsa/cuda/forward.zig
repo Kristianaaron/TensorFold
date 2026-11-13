@@ -1102,9 +1102,13 @@ pub const Bytes = struct {
     pub const attention_partial_row = state.decode_partial_row_bytes;
     pub const reduce_row = hidden * 4;
     pub const moe_partial_row = hidden * 2;
-    pub const index_candidates_row = index.top_k * 8;
     pub const stage_row = state.kv_row_bytes;
 };
+
+/// Keys a sparse row selects this step: the prefill switch's K in prefill, the full 2048 in decode.
+pub fn selectionKeys(mode: Mode, prefill_top_k: usize) usize {
+    return if (mode == .prefill) prefill_top_k else index.top_k;
+}
 
 /// What one forward step exchanges, from its shape: rows and absolute positions, the layers, the head, the pieces.
 pub const StepShape = struct {
@@ -1117,6 +1121,8 @@ pub const StepShape = struct {
     score_rows: usize = 128,
     /// Attention/FFN piece rows inside a prefill chunk (cuts at absolute multiples); decode is one piece.
     piece_rows: usize = 1024,
+    /// TF_GLM53_PREFILL_TOPK: selection count for prefill sparse rows; decode stays index.top_k.
+    prefill_top_k: usize = index.top_k,
     /// This rank (the stage fetch sends this rank's own rows below chunk_start).
     rank: usize = 0,
     /// Models the opt-in decode plan for host collective-count assertions.
@@ -1191,7 +1197,7 @@ pub fn plan(s: StepShape) !ExchangePlan {
     for (&p.entries, 0..) |*e, i| e.* = .{ .phase = @fromBackingInt(@intCast(i)) };
     p.entries[@backingInt(Phase.embed)].when = "per piece, after local vocab-row embedding: bf16 [world][piece][6144], owner pick";
     p.entries[@backingInt(Phase.stage_fetch)] = .{ .phase = .stage_fetch, .all_gather = false, .when = "prefill, before each layer's attention: peer latent+rope rows below chunk_start into stage[p/2]" };
-    p.entries[@backingInt(Phase.index_candidates)].when = "full layers with sparse rows: packed local top-2048 {score, position} per score block";
+    p.entries[@backingInt(Phase.index_candidates)].when = "full layers with sparse rows: packed local top-K {score, position} per score block";
     p.entries[@backingInt(Phase.absorbed_query)].when = "decode: qa [world][R][32][512] and q_pe [world][R][32][64]";
     p.entries[@backingInt(Phase.shard_qkv_a)].when = "prefill and decode: packed per-rank q_a and kv_a rows";
     const partial_gather = s.mode == .decode and (s.coll_fuse or s.partial_roce);
@@ -1220,7 +1226,7 @@ pub fn plan(s: StepShape) !ExchangePlan {
                 var b: usize = 0;
                 while (b < n) : (b += s.score_rows) {
                     const m = @min(s.score_rows, n - b);
-                    if (sparseIn(pos[b..][0..m])) p.add(.index_candidates, m * Bytes.index_candidates_row, 1);
+                    if (sparseIn(pos[b..][0..m])) p.add(.index_candidates, m * selectionKeys(s.mode, s.prefill_top_k) * 8, 1);
                 }
             }
             if (s.mode == .decode) {
@@ -1941,6 +1947,9 @@ pub const Forward = struct {
     /// Captured once during setup and carried in Geometry for the index MMA CTA row tile.
     index_mma_rows: usize = 4,
     index_qs: u8 = 0,
+    /// TF_GLM53_PREFILL_TOPK, captured once at setup (Geometry.prefill_top_k): sparse prefill rows select this many
+    /// keys; decode keeps index.top_k. The selected lists keep their top_k stride, so no workspace changes.
+    prefill_top_k: usize = index.top_k,
     /// Captured once during setup and carried in Geometry; decode-only collective and query fusion.
     coll_fuse: bool = false,
     /// TF_GLM53_ROUTE_COMPACT=1 writes side decode picks and weights in eight-slot rows.
@@ -1988,6 +1997,7 @@ pub const Forward = struct {
     }
 
     pub fn validateSetup(f: *const Forward) !void {
+        if (!index.validPrefillTopk(f.prefill_top_k)) return error.BadPrefillTopk;
         if (f.promptExpertsP5a() and (!f.promptExpertsPmx() or !f.promptExpertsWide() or !f.promptExpertsEnabled())) return error.PromptExpertsP5aNeedsPmx;
         if (f.smlaPEnabled() and f.k.mla.attend_kernel == .scalar) return error.SmlaPWithScalarAttend;
         if (f.smlaFp8Enabled() and !f.smlaPEnabled()) return error.SmlaFp8WithoutSmlaP;
@@ -3187,8 +3197,9 @@ pub const Forward = struct {
     }
 
     /// DSA selection on a full layer for one piece (rows `lo`.. of the window): local scores over this rank's
-    /// keys, local exact top-2048 packed {score, position} records, one all-gather, then fused global merge/filter/
-    /// remap into prefill tokens and DCP local slots. Scored in score_rows blocks.
+    /// keys, local exact top-K (2048 decode, TF_GLM53_PREFILL_TOPK prefill) packed {score, position} records, one
+    /// all-gather, then fused global merge/filter/remap into prefill tokens and DCP local slots. Scored in
+    /// score_rows blocks.
     fn select(f: *const Forward, mode: Mode, layer: usize, positions: []const usize, lo: usize, plane: u64) !void {
         if (mode == .prefill and f.indexPipeEnabled()) return f.selectIndexPipe(mode, layer, positions, lo, plane);
         const ws = &f.st.ws;
@@ -3203,6 +3214,7 @@ pub const Forward = struct {
         // positions inside its bucket; prefill scores exactly the keys below the piece's last row.
         const nkeys = if (mode == .decode) @min(decodeKeyBucket(top) / world, ws.index_slots) else if (top >= f.rank) (top - f.rank) / world + 1 else 0;
         if (nkeys == 0 or nkeys > ws.index_slots or nkeys > index.max_local_keys) return error.IndexCapacity;
+        const sel_k = selectionKeys(mode, f.prefill_top_k);
         var at: usize = 0;
         while (at < rows) : (at += ws.score_rows) {
             const n = @min(ws.score_rows, rows - at);
@@ -3212,9 +3224,9 @@ pub const Forward = struct {
             try index_k.scores(s, ws.qi + at * index.heads * index.dim * 2, ws.iw + at * index.heads * 2, index.heads, 0, plane, pos, ws.scores, n, nkeys, nkeys, f.rank, world);
             try f.profileSubEnd(mode, layer, .attn_pre_indexer_scoring);
             try f.profileSubBegin(mode, layer, .attn_pre_indexer_topk);
-            try k.index.topk(s, ws.scores, nkeys, ws.topk_tokens, ws.topk_counts, ws.candidate_records, pos, n, nkeys, index.top_k, f.rank, world);
+            try k.index.topk(s, ws.scores, nkeys, ws.topk_tokens, ws.topk_counts, ws.candidate_records, pos, n, nkeys, sel_k, f.rank, world);
             try f.profileSubEnd(mode, layer, .attn_pre_indexer_topk);
-            const bytes = n * index.top_k * 8;
+            const bytes = n * sel_k * 8;
             try f.profileEnd(mode, layer, .attn_pre);
             try f.profileBegin(mode, layer, .attn_comm);
             try f.profileSubBegin(mode, layer, .attn_pre_indexer_gather);
@@ -3224,9 +3236,9 @@ pub const Forward = struct {
             try f.profileBegin(mode, layer, .attn_pre);
             try f.profileSubBegin(mode, layer, .attn_pre_indexer_merge);
             if (f.index_merge == 2) {
-                try k.index.merge2(s, ws.gathered_candidates, ws.global_tokens + (lo + at) * index.top_k * 4, ws.global_counts + (lo + at) * 4, ws.local_slots + (lo + at) * index.top_k * 4, ws.local_counts + (lo + at) * 4, pos, f.rank, world, n, index.top_k, n);
+                try k.index.merge2(s, ws.gathered_candidates, ws.global_tokens + (lo + at) * index.top_k * 4, ws.global_counts + (lo + at) * 4, ws.local_slots + (lo + at) * index.top_k * 4, ws.local_counts + (lo + at) * 4, pos, f.rank, world, n, sel_k, n);
             } else {
-                try k.index.merge(s, ws.gathered_candidates, ws.global_tokens + (lo + at) * index.top_k * 4, ws.global_counts + (lo + at) * 4, ws.local_slots + (lo + at) * index.top_k * 4, ws.local_counts + (lo + at) * 4, pos, f.rank, world, n, index.top_k);
+                try k.index.merge(s, ws.gathered_candidates, ws.global_tokens + (lo + at) * index.top_k * 4, ws.global_counts + (lo + at) * 4, ws.local_slots + (lo + at) * index.top_k * 4, ws.local_counts + (lo + at) * 4, pos, f.rank, world, n, sel_k);
             }
             try f.profileSubEnd(mode, layer, .attn_pre_indexer_merge);
         }
@@ -3246,6 +3258,7 @@ pub const Forward = struct {
         const nkeys = if (top >= f.rank) (top - f.rank) / world + 1 else 0;
         if (nkeys == 0 or nkeys > ws.index_slots or nkeys > index.max_local_keys) return error.IndexCapacity;
         if (!sparseIn(positions)) return;
+        const sel_k = selectionKeys(mode, f.prefill_top_k);
         const blocks = (rows + ws.score_rows - 1) / ws.score_rows;
         if (blocks > state.Workspace.max_index_blocks) return error.IndexPipeTooManyBlocks;
         var at: usize = 0;
@@ -3261,19 +3274,19 @@ pub const Forward = struct {
                 continue;
             }
             const pos = ws.positions + (lo + at) * 8;
-            const mine = ws.candidate_records + block * ws.score_rows * index.top_k * 8;
-            const gathered = ws.gathered_candidates + block * 2 * ws.score_rows * index.top_k * 8;
+            const mine = ws.candidate_records + block * ws.score_rows * sel_k * 8;
+            const gathered = ws.gathered_candidates + block * 2 * ws.score_rows * sel_k * 8;
             try f.profileSubBegin(mode, layer, .attn_pre_indexer_scoring);
             try index_k.scores(main, ws.qi + at * index.heads * index.dim * 2, ws.iw + at * index.heads * 2, index.heads, 0, plane, pos, ws.scores, n, nkeys, nkeys, f.rank, world);
             try f.profileSubEnd(mode, layer, .attn_pre_indexer_scoring);
             try f.profileSubBegin(mode, layer, .attn_pre_indexer_topk);
-            try k.index.topk(main, ws.scores, nkeys, ws.topk_tokens, ws.topk_counts, mine, pos, n, nkeys, index.top_k, f.rank, world);
+            try k.index.topk(main, ws.scores, nkeys, ws.topk_tokens, ws.topk_counts, mine, pos, n, nkeys, sel_k, f.rank, world);
             try f.profileSubEnd(mode, layer, .attn_pre_indexer_topk);
             const ready = try wsEvent(f.st.index_pipe_ready[block]);
             try ready.record(main);
             try comm.wait(ready);
             try f.profileSubBeginStream(mode, layer, .attn_pre_indexer_gather, comm);
-            try f.commColl().allGather(comm, mine, gathered, n * index.top_k * 8, .index_candidates);
+            try f.commColl().allGather(comm, mine, gathered, n * sel_k * 8, .index_candidates);
             try f.profileSubEndStream(mode, layer, .attn_pre_indexer_gather, comm);
             at += n;
         }
@@ -3284,7 +3297,7 @@ pub const Forward = struct {
         try f.profileBegin(mode, layer, .attn_pre);
         try f.profileSubBegin(mode, layer, .attn_pre_indexer_merge);
         const skipped_rows = b0 * ws.score_rows;
-        try k.index.merge2(main, ws.gathered_candidates + b0 * 2 * ws.score_rows * index.top_k * 8, ws.global_tokens + (lo + skipped_rows) * index.top_k * 4, ws.global_counts + (lo + skipped_rows) * 4, ws.local_slots + (lo + skipped_rows) * index.top_k * 4, ws.local_counts + (lo + skipped_rows) * 4, ws.positions + (lo + skipped_rows) * 8, f.rank, world, rows - skipped_rows, index.top_k, ws.score_rows);
+        try k.index.merge2(main, ws.gathered_candidates + b0 * 2 * ws.score_rows * sel_k * 8, ws.global_tokens + (lo + skipped_rows) * index.top_k * 4, ws.global_counts + (lo + skipped_rows) * 4, ws.local_slots + (lo + skipped_rows) * index.top_k * 4, ws.local_counts + (lo + skipped_rows) * 4, ws.positions + (lo + skipped_rows) * 8, f.rank, world, rows - skipped_rows, sel_k, ws.score_rows);
         try f.profileSubEnd(mode, layer, .attn_pre_indexer_merge);
     }
 
@@ -3783,6 +3796,19 @@ test "decode and prefill exchange plans: per-row bytes, gather-on-prefill and th
     try std.testing.expectEqual(Chunk{ .start = 0, .end = 24 }, pieceAt(.prefill, &tail, 1024, 0));
     try std.testing.expectEqual(Chunk{ .start = 24, .end = 1048 }, pieceAt(.prefill, &tail, 1024, 24));
     try std.testing.expectEqual(Chunk{ .start = 0, .end = 1100 }, pieceAt(.decode, &tail, 1024, 0));
+}
+
+test "prefill sparse rows select TF_GLM53_PREFILL_TOPK and decode keeps 2048" {
+    try std.testing.expectEqual(@as(usize, 1024), selectionKeys(.prefill, 1024));
+    try std.testing.expectEqual(@as(usize, 1792), selectionKeys(.prefill, 1792));
+    try std.testing.expectEqual(@as(usize, index.top_k), selectionKeys(.decode, 1024));
+    try std.testing.expectEqual(@as(usize, index.top_k), selectionKeys(.decode, index.top_k));
+    const layers = [_]Layer{.{ .index = 0, .kind = .dense, .index_full = true }};
+    const one = [_]usize{4096};
+    const prefill = try plan(.{ .mode = .prefill, .positions = &one, .layers = &layers, .head_rows = 1, .prefill_top_k = 1536 });
+    try std.testing.expectEqual(@as(usize, 1536 * 8), prefill.of(.index_candidates).bytes);
+    const decode = try plan(.{ .mode = .decode, .positions = &one, .layers = &layers, .head_rows = 1, .prefill_top_k = 1536 });
+    try std.testing.expectEqual(@as(usize, index.top_k * 8), decode.of(.index_candidates).bytes);
 }
 
 test "partial RoCE plans attention gather without fusing the absorbed query" {
